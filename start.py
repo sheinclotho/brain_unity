@@ -73,7 +73,7 @@ async def start_websocket_server(model_path: Optional[Path], output_dir: Path) -
             port=WS_PORT,
         )
 
-        await server.start()
+        await server.start_async()
 
     except ImportError as exc:
         logger.error(f"依赖缺失: {exc}")
