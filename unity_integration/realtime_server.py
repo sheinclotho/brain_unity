@@ -142,7 +142,13 @@ class BrainVisualizationServer:
     async def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Process client request and return response."""
         request_type = request.get("type", "unknown")
-        
+
+        # Type aliases: accept legacy and alternative naming conventions
+        if request_type in ("get_brain_state",):
+            request_type = "get_state"
+        elif request_type in ("simulate_stimulation",):
+            request_type = "simulate"
+
         # Log the request
         self.logger.info(f"Processing request: {request_type}")
         
@@ -164,6 +170,9 @@ class BrainVisualizationServer:
             
             elif request_type == "convert_cache":
                 return await self.handle_convert_cache(request)
+
+            elif request_type == "load_cache":
+                return await self.handle_load_cache(request)
             
             else:
                 self.logger.warning(f"Unknown request type: {request_type}")
@@ -181,55 +190,40 @@ class BrainVisualizationServer:
             }
     
     async def handle_get_state(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle request for current brain state."""
-        try:
-            # Generate example brain state
-            import torch
-            import numpy as np
-            
-            n_regions = 200
-            # Generate example fMRI data
-            fmri_data = torch.randn(n_regions, 1, 1)
-            eeg_data = torch.randn(n_regions, 1, 1)
-            
-            brain_activity = {
-                'fmri': fmri_data,
-                'eeg': eeg_data
-            }
-            
-            # Generate connectivity
-            connectivity_matrix = np.random.rand(n_regions, n_regions)
-            connectivity_matrix = (connectivity_matrix + connectivity_matrix.T) / 2
-            connectivity_matrix[connectivity_matrix < 0.7] = 0
-            connectivity = {'structural': connectivity_matrix}
-            
-            # Export to JSON format
-            if self.exporter:
-                brain_state = self.exporter.export_brain_state(
-                    brain_activity=brain_activity,
-                    connectivity=connectivity,
-                    time_point=0,
-                    subject_id="realtime"
-                )
-                
-                return {
-                    "type": "brain_state",
-                    "success": True,
-                    "data": brain_state
-                }
-            else:
-                return {
-                    "type": "brain_state",
-                    "success": False,
-                    "message": "Exporter not available"
-                }
-                
-        except Exception as e:
-            self.logger.error(f"Error getting state: {e}")
-            return {
-                "type": "error",
-                "message": f"Failed to get state: {str(e)}"
-            }
+        """Return current brain state with flat activity array.
+
+        Uses a 7-network (Schaefer) oscillation model for demo mode so that
+        different brain networks show distinct, correlated dynamics rather than
+        pure white noise.
+        """
+        import numpy as np
+        import time
+
+        n_regions  = 200
+        t          = time.time()
+
+        # Schaefer 7-network approximate frequency/phase profile
+        # Visual, Somatomotor, DorsAttn, VentAttn, Limbic, FrontPar, Default
+        net_freqs  = [0.012, 0.020, 0.035, 0.028, 0.008, 0.025, 0.010]
+        net_phases = [0.0,   1.0,   2.1,   0.7,   3.2,   1.8,   0.4  ]
+        net_size   = n_regions // 7
+
+        rng      = np.random.default_rng(int(t * 200) % 65536)
+        activity = []
+        for i in range(n_regions):
+            n  = min(i // net_size, 6)
+            v  = 0.36 + 0.22 * np.sin(2 * np.pi * net_freqs[n] * t + net_phases[n] + i * 0.08)
+            v += 0.04 * np.sin(2 * np.pi * 0.005 * t + i * 0.25)  # slow global wave
+            v += float(rng.normal(0, 0.025))                        # per-region noise
+            activity.append(float(np.clip(v, 0, 1)))
+
+        return {
+            "type":     "brain_state",
+            "activity": activity,       # flat [0,1] array, length = n_regions
+            "success":  True,
+        }
+
+
     
     async def handle_predict(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -474,18 +468,15 @@ class BrainVisualizationServer:
                 
                 self.logger.info(f"✓ Stimulation results auto-saved to: {stim_output_dir}")
                 
+                frames = [{"activity": self._extract_activity_array(r)} for r in responses]
                 return {
-                    "type": "simulation",
+                    "type": "simulation_result",
                     "success": True,
-                    "n_steps": len(responses),
-                    "stimulation": stimulation,
-                    "responses": responses,
+                    "n_frames": len(frames),
+                    "frames": frames,
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
-                    "auto_saved": True
                 }
-            
-            # Fallback to using simulator
             from .stimulation_simulator import StimulationConfig
             
             # Create stimulation config
@@ -563,16 +554,14 @@ class BrainVisualizationServer:
                 
                 self.logger.info(f"✓ Stimulation results auto-saved to: {stim_output_dir}")
                 
+                frames = [{"activity": self._extract_activity_array(r)} for r in responses]
                 return {
-                    "type": "simulation",
+                    "type": "simulation_result",
                     "success": True,
-                    "n_steps": n_steps,
-                    "stimulation": stimulation,
-                    "responses": responses,
-                    "metrics": metrics,
+                    "n_frames": len(frames),
+                    "frames": frames,
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
-                    "auto_saved": True
                 }
             else:
                 # Simple simulation without simulator
@@ -626,15 +615,14 @@ class BrainVisualizationServer:
                 
                 self.logger.info(f"✓ Stimulation results auto-saved to: {stim_output_dir}")
                 
+                frames = [{"activity": self._extract_activity_array(r)} for r in responses]
                 return {
-                    "type": "simulation",
+                    "type": "simulation_result",
                     "success": True,
-                    "n_steps": n_steps,
-                    "stimulation": stimulation,
-                    "responses": responses,
+                    "n_frames": len(frames),
+                    "frames": frames,
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
-                    "auto_saved": True
                 }
                 
         except Exception as e:
@@ -773,7 +761,154 @@ class BrainVisualizationServer:
                 "success": False,
                 "message": str(e)
             }
-    
+
+    # ------------------------------------------------------------------ #
+    #  New: load a .pt cache file and stream all time frames               #
+    # ------------------------------------------------------------------ #
+
+    async def handle_load_cache(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Load a .pt cache file and return its full time series as frames.
+
+        Accepted request fields:
+          path (str, optional): path to the .pt file; if omitted, auto-detects
+                                the first suitable file under the project tree.
+
+        Response:
+          { "type": "cache_loaded", "path": "…", "n_frames": N,
+            "frames": [{"activity": [200 floats]}, …] }
+        """
+        import torch
+        import numpy as np
+
+        raw_path = request.get("path")
+        cache_path = Path(raw_path) if raw_path else self._find_cache_file()
+
+        if cache_path is None or not cache_path.exists():
+            return {
+                "type": "error",
+                "message": f"找不到缓存文件: {raw_path or '(自动检测失败)'}",
+            }
+
+        try:
+            data = torch.load(str(cache_path), map_location="cpu", weights_only=False)
+        except Exception as exc:
+            return {"type": "error", "message": f"文件加载失败: {exc}"}
+
+        frames = self._extract_time_series(data)
+        if not frames:
+            return {"type": "error", "message": "无法从文件中提取脑区时间序列"}
+
+        self.logger.info(f"✓ 缓存加载完成: {cache_path} → {len(frames)} 帧")
+        return {
+            "type":     "cache_loaded",
+            "path":     str(cache_path),
+            "n_frames": len(frames),
+            "frames":   frames,
+            "success":  True,
+        }
+
+    def _find_cache_file(self) -> Optional[Path]:
+        """Auto-detect the first suitable .pt cache file in common locations."""
+        search_dirs = [Path("."), Path("test_file3"), Path("Unity_TwinBrain"), Path("..")]
+        preferred   = ["hetero_graphs.pt", "eeg_data.pt"]
+        for d in search_dirs:
+            if not d.exists():
+                continue
+            for name in preferred:
+                for f in d.glob(f"**/{name}"):
+                    if f.stat().st_size > 1024:
+                        return f
+            for f in d.glob("**/*.pt"):
+                if "__pycache__" not in str(f) and f.stat().st_size > 1024:
+                    return f
+        return None
+
+    def _find_hetero_data(self, data):
+        """Recursively find the first HeteroData in a nested structure."""
+        if hasattr(data, "node_types"):
+            return data
+        if isinstance(data, (list, tuple)) and len(data) > 0:
+            return self._find_hetero_data(data[0])
+        if isinstance(data, dict):
+            for v in data.values():
+                result = self._find_hetero_data(v)
+                if result is not None:
+                    return result
+        return None
+
+    def _extract_time_series(self, data) -> list:
+        """Extract per-time-point activity frames from a cache .pt object.
+
+        Looks for ``fmri.x_seq`` (shape N×T×F) inside the first HeteroData
+        found in *data*, then returns T dicts each containing a normalised
+        activity list of length 200.
+        """
+        import numpy as np
+
+        graph = self._find_hetero_data(data)
+        if graph is None:
+            return []
+
+        n_regions = 200
+        frames    = []
+        try:
+            if "fmri" not in graph.node_types:
+                return []
+            node  = graph["fmri"]
+            x_seq = getattr(node, "x_seq", None)
+            if x_seq is None:
+                return []
+
+            x = x_seq.cpu().float()
+            if x.ndim == 2:
+                x = x.unsqueeze(-1)      # (N, T) → (N, T, 1)
+            N, T, _ = x.shape
+
+            # Global percentile normalisation (robust to outliers)
+            flat = x[:, :, 0].numpy().ravel()
+            p5, p95 = np.percentile(flat, 5), np.percentile(flat, 95)
+            scale   = max(p95 - p5, 1e-6)
+
+            for t in range(T):
+                sig  = x[:, t, 0].numpy()
+                norm = np.clip((sig - p5) / scale, 0, 1)
+                arr  = np.full(n_regions, 0.5, dtype=np.float32)
+                n    = min(N, n_regions)
+                arr[:n] = norm[:n]
+                frames.append({"activity": arr.tolist()})
+        except Exception as exc:
+            self.logger.error(f"_extract_time_series error: {exc}")
+
+        return frames
+
+    def _extract_activity_array(self, result: Dict) -> list:
+        """Extract a flat [0,1] activity list from various result-dict formats.
+
+        Handles both:
+          A) model_server._state_to_json():
+             {"regions": [{"activity": float, …}, …], …}
+          B) BrainStateExporter.export_brain_state():
+             {"brain_state": {"regions": [{"activity": {"fmri": {"amplitude": float}}}}]}}
+        """
+        # Format A: model_server output
+        if "regions" in result:
+            return [float(r.get("activity", 0.5)) for r in result["regions"]]
+
+        # Format B: exporter output
+        if "brain_state" in result:
+            out = []
+            for r in result["brain_state"].get("regions", []):
+                act = r.get("activity", {})
+                if isinstance(act, dict):
+                    fmri = act.get("fmri", {})
+                    out.append(float(fmri.get("amplitude", 0.5))
+                               if isinstance(fmri, dict) else 0.5)
+                else:
+                    out.append(float(act))
+            return out
+
+        return []
+
     def _extract_brain_activity_from_hetero(self, hetero_data):
         """
         Extract brain activity tensors from HeteroData objects.

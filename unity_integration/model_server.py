@@ -276,29 +276,29 @@ class ModelServer:
         
         results = []
         current_state = initial_state.clone()
-        
+
+        # Coupled-oscillator simulation
+        # (used when no trained model is loaded; gives physiologically plausible
+        #  propagation instead of pure random noise)
+        connectivity = self._get_connectivity_matrix()
+
         # 模拟时间演化
         for t in range(duration):
             # 应用刺激到目标脑区
-            stim = torch.zeros(n_regions, 1)
+            stim = torch.zeros(n_regions)
             for region_id in target_regions:
                 if 0 <= region_id < n_regions:
-                    stim[region_id, 0] = stimulation_signal[t]
-            
-            # 简化的动力学模型
-            # 真实模型应该使用训练好的神经网络
-            noise = torch.randn_like(current_state) * 0.05
-            current_state = current_state * 0.9 + stim * 0.3 + noise
-            
-            # 空间扩散效应（简化）
-            if t % 5 == 0:  # 每5步应用一次扩散
-                diffusion = torch.randn_like(current_state) * 0.02
-                for region_id in target_regions:
-                    # 影响邻近脑区
-                    for neighbor in range(max(0, region_id-3), min(n_regions, region_id+4)):
-                        if neighbor != region_id:
-                            diffusion[neighbor, 0] += current_state[region_id, 0] * 0.1
-                current_state = current_state + diffusion
+                    stim[region_id] = stimulation_signal[t]
+
+            # Connectivity-mediated input from neighbouring regions
+            state_1d = current_state.squeeze(-1)           # (n_regions,)
+            net_input = connectivity @ state_1d             # (n_regions,)
+
+            # Wilson–Cowan-like update: tanh activation, slow decay
+            excitation = torch.tanh(state_1d + stim * 0.6 + net_input * 0.25)
+            noise      = torch.randn(n_regions) * 0.025
+            state_1d   = state_1d * 0.82 + excitation * 0.18 + noise
+            current_state = state_1d.unsqueeze(-1)          # back to (n_regions, 1)
             
             # 转换为JSON
             brain_state = self._state_to_json(
@@ -415,7 +415,9 @@ class ModelServer:
             "time_second": time_second,
             "timestamp": datetime.now().isoformat(),
             "n_regions": n_regions,
-            "regions": regions
+            "regions": regions,
+            # Flat activity array for direct frontend consumption
+            "activity": activity_normalized.tolist(),
         }
         
         # 添加刺激信息（如果有）
@@ -450,7 +452,33 @@ class ModelServer:
         ]
         
         return networks[min(network_id, len(networks)-1)]
-    
+
+    def _get_connectivity_matrix(self) -> "torch.Tensor":
+        """Return a cached simplified structural connectivity matrix (200×200).
+
+        Local connections decay exponentially with region distance; homotopic
+        (cross-hemisphere) connections link each region to its contralateral
+        counterpart.  Rows are L1-normalised so state magnitude stays bounded.
+        """
+        if getattr(self, "_connectivity", None) is None:
+            import torch, numpy as np
+            n   = 200
+            rng = np.random.default_rng(42)
+            C   = np.zeros((n, n), dtype=np.float32)
+            # Localconnections (exponential decay with distance along region index)
+            for i in range(n):
+                for j in range(max(0, i - 5), min(n, i + 6)):
+                    if i != j:
+                        C[i, j] = 0.30 * float(np.exp(-abs(i - j) * 0.45))
+            # Homotopic long-range connections
+            for i in range(100):
+                C[i, i + 100] = C[i + 100, i] = 0.38
+            # L1 row-normalise (preserves directional scaling, prevents explosion)
+            row_sum = C.sum(axis=1, keepdims=True)
+            C = np.where(row_sum > 0, C / row_sum, C)
+            self._connectivity = torch.tensor(C)
+        return self._connectivity
+
     def _save_predictions(
         self,
         predictions: List[Dict[str, Any]],

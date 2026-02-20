@@ -3,12 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>TwinBrain — 大脑可视化</title>
+  <title>TwinBrain — 3D 大脑可视化</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
     body {
-      background: #0a0a1a;
+      background: #07081a;
       color: #e0e0ff;
       font-family: 'Segoe UI', system-ui, sans-serif;
       height: 100vh;
@@ -16,133 +15,138 @@
       flex-direction: column;
       overflow: hidden;
     }
-
     header {
-      padding: 12px 24px;
+      padding: 10px 20px;
       background: rgba(255,255,255,0.04);
       border-bottom: 1px solid rgba(255,255,255,0.08);
       display: flex;
       align-items: center;
-      gap: 16px;
+      gap: 14px;
+      flex-shrink: 0;
     }
-    header h1 { font-size: 1.2rem; font-weight: 600; letter-spacing: 0.5px; }
+    header h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.3px; }
     header h1 span { color: #7eb8ff; }
-
     #status-dot {
-      width: 10px; height: 10px; border-radius: 50%;
-      background: #ff4466;
-      box-shadow: 0 0 6px #ff4466;
+      width: 9px; height: 9px; border-radius: 50%;
+      background: #ff4466; box-shadow: 0 0 6px #ff4466;
       transition: background .4s, box-shadow .4s;
     }
     #status-dot.connected { background: #44ff88; box-shadow: 0 0 8px #44ff88; }
-    #status-text { font-size: 0.82rem; color: #888; }
-
+    #status-text { font-size: 0.8rem; color: #888; }
+    .hint { margin-left: auto; font-size: 0.73rem; color: #444; }
     main {
       flex: 1;
       display: flex;
       overflow: hidden;
+      min-height: 0;
     }
-
     #canvas-wrap {
       flex: 1;
-      display: flex;
-      align-items: center;
-      justify-content: center;
       position: relative;
+      overflow: hidden;
     }
-
-    canvas {
-      cursor: crosshair;
-      border-radius: 50%;
-      box-shadow: 0 0 60px rgba(100, 150, 255, 0.15);
+    #brain-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
     }
-
+    #brain-canvas:active { cursor: grabbing; }
     aside {
-      width: 260px;
-      padding: 20px 16px;
+      width: 252px;
+      padding: 14px 13px;
       background: rgba(255,255,255,0.03);
       border-left: 1px solid rgba(255,255,255,0.07);
       display: flex;
       flex-direction: column;
-      gap: 20px;
+      gap: 14px;
       overflow-y: auto;
+      flex-shrink: 0;
     }
-
     .card {
       background: rgba(255,255,255,0.05);
       border: 1px solid rgba(255,255,255,0.08);
       border-radius: 10px;
-      padding: 14px;
+      padding: 12px;
     }
-    .card h3 { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 1px; color: #888; margin-bottom: 12px; }
-
-    label { font-size: 0.85rem; display: block; margin-bottom: 4px; }
-    input[type=range] {
-      width: 100%; accent-color: #7eb8ff; cursor: pointer;
-      margin-bottom: 6px;
+    .card h3 {
+      font-size: 0.70rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #777;
+      margin-bottom: 10px;
+    }
+    label { font-size: 0.82rem; display: block; margin-bottom: 3px; }
+    input[type=range] { width: 100%; accent-color: #7eb8ff; cursor: pointer; margin-bottom: 4px; }
+    input[type=text] {
+      width: 100%; background: #111222;
+      border: 1px solid rgba(255,255,255,0.14);
+      color: #e0e0ff; padding: 6px 8px;
+      border-radius: 5px; font-size: 0.79rem; margin-bottom: 6px;
     }
     select {
-      width: 100%;
-      background: #1a1a2e;
-      border: 1px solid rgba(255,255,255,0.15);
-      color: #e0e0ff;
-      padding: 6px 8px;
-      border-radius: 6px;
-      font-size: 0.85rem;
+      width: 100%; background: #111222;
+      border: 1px solid rgba(255,255,255,0.14);
+      color: #e0e0ff; padding: 5px 7px;
+      border-radius: 6px; font-size: 0.82rem;
     }
-
     button {
-      width: 100%;
-      padding: 10px;
-      border: none;
-      border-radius: 8px;
-      font-size: 0.88rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: opacity .2s, transform .1s;
+      width: 100%; padding: 8px;
+      border: none; border-radius: 7px;
+      font-size: 0.84rem; font-weight: 600;
+      cursor: pointer; transition: opacity .2s, transform .1s;
     }
     button:active { transform: scale(0.97); }
-
-    #btn-stim {
-      background: linear-gradient(135deg, #4466ff, #7eb8ff);
-      color: #fff;
-    }
-    #btn-reset {
-      background: rgba(255,255,255,0.08);
-      color: #ccc;
-    }
-
-    #info-panel {
-      font-size: 0.82rem;
-      line-height: 1.7;
-      color: #aaa;
-    }
-    #info-panel strong { color: #e0e0ff; }
-
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary  { background: linear-gradient(135deg, #3355ff, #7eb8ff); color: #fff; }
+    .btn-secondary{ background: rgba(255,255,255,0.08); color: #ccc; }
+    .btn-success  { background: linear-gradient(135deg, #1e9455, #44ff88); color: #fff; }
+    .gap6 { height: 6px; }
     .legend {
-      display: flex;
-      gap: 6px;
-      align-items: center;
-      font-size: 0.78rem;
+      display: flex; gap: 5px; align-items: center; font-size: 0.74rem;
     }
     .legend-bar {
-      flex: 1;
-      height: 10px;
-      border-radius: 4px;
-      background: linear-gradient(to right, #0033cc, #0088ff, #00ffcc, #ffff00, #ff4400);
+      flex: 1; height: 8px; border-radius: 3px;
+      background: linear-gradient(to right, #0020c8,#0080ff,#00e8cc,#ffd800,#ff2200);
     }
-
+    #info-body { font-size: 0.79rem; line-height: 1.9; color: #aaa; }
+    #info-body strong { color: #e0e0ff; }
+    /* Timeline */
+    #timeline-bar {
+      height: 52px;
+      background: rgba(255,255,255,0.03);
+      border-top: 1px solid rgba(255,255,255,0.07);
+      display: flex;
+      align-items: center;
+      padding: 0 14px;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    #btn-play {
+      width: 34px; height: 34px; padding: 0;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.09);
+      color: #e0e0ff; font-size: 0.95rem; border: none;
+      cursor: pointer; flex-shrink: 0;
+    }
+    #timeline-slider { flex: 1; accent-color: #7eb8ff; cursor: pointer; }
+    #frame-label { font-size: 0.76rem; color: #666; min-width: 72px; text-align: right; flex-shrink: 0; }
+    /* Tooltip */
     #tooltip {
-      position: absolute;
-      pointer-events: none;
-      background: rgba(10,10,30,0.92);
-      border: 1px solid rgba(255,255,255,0.15);
-      border-radius: 8px;
-      padding: 8px 12px;
-      font-size: 0.82rem;
+      position: absolute; pointer-events: none;
+      background: rgba(7,8,26,0.94);
+      border: 1px solid rgba(255,255,255,0.13);
+      border-radius: 8px; padding: 7px 11px;
+      font-size: 0.79rem; display: none; z-index: 20;
+      white-space: nowrap; line-height: 1.6;
+    }
+    /* No-Three.js fallback */
+    #no-webgl {
       display: none;
-      white-space: nowrap;
-      z-index: 10;
+      position: absolute; inset: 0;
+      align-items: center; justify-content: center;
+      flex-direction: column; gap: 12px;
+      color: #ff8866; font-size: 0.9rem; text-align: center;
     }
   </style>
 </head>
@@ -150,24 +154,30 @@
 
 <header>
   <div id="status-dot"></div>
-  <h1>Twin<span>Brain</span></h1>
-  <span id="status-text">正在连接后端…</span>
+  <h1>Twin<span>Brain</span> — 3D 大脑可视化</h1>
+  <span id="status-text">正在连接…</span>
+  <span class="hint">鼠标拖动旋转 · 滚轮缩放 · 点击脑区选中</span>
 </header>
 
 <main>
   <div id="canvas-wrap">
-    <canvas id="brain" width="560" height="560"></canvas>
+    <canvas id="brain-canvas"></canvas>
     <div id="tooltip"></div>
+    <div id="no-webgl">
+      <div>⚠ 无法加载 Three.js (需要网络连接)</div>
+      <div style="color:#888;font-size:0.8rem">请确认 cdnjs.cloudflare.com 可访问</div>
+    </div>
   </div>
 
   <aside>
+    <!-- Stimulation -->
     <div class="card">
-      <h3>刺激设置</h3>
-
-      <label>刺激强度：<span id="amp-val">0.5</span></label>
+      <h3>刺激参数</h3>
+      <label>强度：<span id="amp-val">0.50</span></label>
       <input type="range" id="amplitude" min="0.01" max="1" step="0.01" value="0.5" />
-
-      <label style="margin-top:8px">刺激模式</label>
+      <label>频率 (Hz)：<span id="freq-val">10</span></label>
+      <input type="range" id="frequency" min="1" max="50" step="1" value="10" />
+      <label style="margin-top:6px">波形</label>
       <select id="pattern">
         <option value="sine">正弦波（tACS）</option>
         <option value="pulse">脉冲</option>
@@ -178,10 +188,17 @@
 
     <div class="card">
       <h3>操作</h3>
-      <p style="font-size:0.8rem;color:#777;margin-bottom:10px">点击脑区选中，再施加刺激</p>
-      <button id="btn-stim">⚡ 施加刺激</button>
-      <div style="height:8px"></div>
-      <button id="btn-reset">↺ 重置</button>
+      <p style="font-size:0.75rem;color:#555;margin-bottom:8px">点击脑区选中 → 施加刺激</p>
+      <button id="btn-stim" class="btn-primary">⚡ 施加刺激</button>
+      <div class="gap6"></div>
+      <button id="btn-reset" class="btn-secondary">↺ 重置视图</button>
+    </div>
+
+    <div class="card">
+      <h3>加载缓存数据</h3>
+      <p style="font-size:0.75rem;color:#555;margin-bottom:7px">支持 hetero_graphs.pt / eeg_data.pt</p>
+      <input type="text" id="cache-path" placeholder="文件路径（空 = 自动检测）" />
+      <button id="btn-load" class="btn-success">�� 加载 .pt 文件</button>
     </div>
 
     <div class="card">
@@ -193,16 +210,27 @@
       </div>
     </div>
 
-    <div class="card" id="info-panel">
-      <h3>当前状态</h3>
+    <div class="card">
+      <h3>状态</h3>
       <div id="info-body">
-        已选中：<strong id="sel-count">0</strong> 个脑区<br/>
-        后端：<strong id="backend-status">未连接</strong>
+        已选：<strong id="sel-count">0</strong> 个脑区<br/>
+        后端：<strong id="backend-status">未连接</strong><br/>
+        数据：<strong id="frame-info">演示模式</strong>
       </div>
     </div>
   </aside>
 </main>
 
+<!-- Timeline bar -->
+<div id="timeline-bar">
+  <button id="btn-play" title="播放 / 暂停">▶</button>
+  <input type="range" id="timeline-slider" min="0" max="0" value="0" />
+  <span id="frame-label">—</span>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"
+        crossorigin="anonymous"
+        onerror="document.getElementById('no-webgl').style.display='flex'"></script>
 <script src="app.js"></script>
 </body>
 </html>

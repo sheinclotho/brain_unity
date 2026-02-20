@@ -49,23 +49,37 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 
 *Entries are added here when important lessons are learned during development.*
 
+### [2026-02-20] 前端/后端协议不匹配反模式
+- **问题**: 前端发送 `get_brain_state` / `simulate_stimulation`，后端只处理 `get_state` / `simulate`。消息类型名称不一致导致所有实时请求静默失败（返回 "Unknown request type"）。响应格式也不匹配：后端嵌套 5 层才能取到活动值，前端期望平铺的 `activity` 数组。
+- **修复**: 在 `process_request()` 加入类型别名映射；所有响应统一携带 `"activity": [float×200]`；新消息类型 `simulation_result` 携带 `frames` 数组。
+- **规则**: 前后端消息协议必须显式文档化。新增消息类型时先在此文件记录，再同步更新前后端。
+
+### [2026-02-20] 3D 可视化 — Three.js 替代 2D Canvas
+- **问题**: 前端只有 200 个蓝色圆圈排列在椭圆上，无深度感，无解剖学意义，无时间轴。
+- **修复**: 用 Three.js（r128，CDN）完全重写前端。脑区球体用 Fibonacci 算法分布在脑形半椭球面（左右半球分离，颞叶侧面突出）；玻璃脑轮廓；轨道相机；时间轴。
+- **规则**: 前端可视化必须能体现三维解剖结构；任何脑区颜色编码必须使用 blue→cyan→green→yellow→red 热图。
+
+### [2026-02-20] 缓存文件加载
+- **问题**: 无法从训练产生的 `.pt` 文件（`hetero_graphs.pt` / `eeg_data.pt`）加载时序数据。
+- **修复**: 新增 `handle_load_cache` 路由；递归搜索 HeteroData 对象；从 `fmri.x_seq` (N×T×F) 提取每帧活动值；百分位归一化后推送给前端时间轴。
+
 ### [2026-02-20] Startup Complexity Anti-Pattern
 - **Problem**: The original startup required multiple CLI flags (`--model`, `--demo`, `--output`, `--host`, `--port`). Users had to understand the system before using it.
 - **Fix**: `start.py` now auto-detects demo mode, uses sane defaults for everything, and starts immediately with no arguments needed.
 - **Rule**: Default behavior must always be "just works." Options are for power users only.
 
 ### [2026-02-20] Too Many Documentation Files
-- **Problem**: The repo accumulated 9+ MD files (README.md, CHANGELOG.md, CODE_REVIEW_REPORT.md, INFORMATION_REQUEST.md, REVIEW_SUMMARY.md, UNIFIED_GUIDE.md, Unity使用指南.md, API_DOCUMENTATION.md, 项目规范说明书.md), causing confusion and drift between documents.
+- **Problem**: The repo accumulated 9+ MD files, causing confusion and drift between documents.
 - **Fix**: Consolidated to exactly 4 MD files per the rules above.
 - **Rule**: Four files only. Merge, don't proliferate.
 
 ### [2026-02-20] Unity Barrier to Entry
-- **Problem**: The only frontend was a Unity project requiring Unity Hub, Unity 2019.1+, C# scripts, WebSocket configuration, and multiple manual editor steps.
-- **Fix**: Added a zero-dependency web frontend (`web_frontend/index.html`) that runs in any browser and connects to the Python backend automatically.
+- **Problem**: The only frontend was a Unity project requiring Unity Hub, Unity 2019.1+, etc.
+- **Fix**: Added a zero-dependency web frontend (`web_frontend/index.html`) that runs in any browser.
 - **Rule**: There must always be a path to using the project that requires no specialized software installation beyond Python.
 
 ### [2026-02-20] WebSocket Host Default
-- **Lesson**: Default host changed from `0.0.0.0` (all interfaces, security risk) to `127.0.0.1` (localhost only).
+- **Lesson**: Default host changed from `0.0.0.0` to `127.0.0.1` (localhost only).
 - **Rule**: Network services must default to localhost. Users who need remote access can reconfigure.
 
 ---
