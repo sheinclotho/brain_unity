@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TwinBrain — 大脑可视化</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0a0a1a;
+      color: #e0e0ff;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    header {
+      padding: 12px 24px;
+      background: rgba(255,255,255,0.04);
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    header h1 { font-size: 1.2rem; font-weight: 600; letter-spacing: 0.5px; }
+    header h1 span { color: #7eb8ff; }
+
+    #status-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #ff4466;
+      box-shadow: 0 0 6px #ff4466;
+      transition: background .4s, box-shadow .4s;
+    }
+    #status-dot.connected { background: #44ff88; box-shadow: 0 0 8px #44ff88; }
+    #status-text { font-size: 0.82rem; color: #888; }
+
+    main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    #canvas-wrap {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+
+    canvas {
+      cursor: crosshair;
+      border-radius: 50%;
+      box-shadow: 0 0 60px rgba(100, 150, 255, 0.15);
+    }
+
+    aside {
+      width: 260px;
+      padding: 20px 16px;
+      background: rgba(255,255,255,0.03);
+      border-left: 1px solid rgba(255,255,255,0.07);
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      overflow-y: auto;
+    }
+
+    .card {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .card h3 { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 1px; color: #888; margin-bottom: 12px; }
+
+    label { font-size: 0.85rem; display: block; margin-bottom: 4px; }
+    input[type=range] {
+      width: 100%; accent-color: #7eb8ff; cursor: pointer;
+      margin-bottom: 6px;
+    }
+    select {
+      width: 100%;
+      background: #1a1a2e;
+      border: 1px solid rgba(255,255,255,0.15);
+      color: #e0e0ff;
+      padding: 6px 8px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+    }
+
+    button {
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.88rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .2s, transform .1s;
+    }
+    button:active { transform: scale(0.97); }
+
+    #btn-stim {
+      background: linear-gradient(135deg, #4466ff, #7eb8ff);
+      color: #fff;
+    }
+    #btn-reset {
+      background: rgba(255,255,255,0.08);
+      color: #ccc;
+    }
+
+    #info-panel {
+      font-size: 0.82rem;
+      line-height: 1.7;
+      color: #aaa;
+    }
+    #info-panel strong { color: #e0e0ff; }
+
+    .legend {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      font-size: 0.78rem;
+    }
+    .legend-bar {
+      flex: 1;
+      height: 10px;
+      border-radius: 4px;
+      background: linear-gradient(to right, #0033cc, #0088ff, #00ffcc, #ffff00, #ff4400);
+    }
+
+    #tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: rgba(10,10,30,0.92);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 0.82rem;
+      display: none;
+      white-space: nowrap;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div id="status-dot"></div>
+  <h1>Twin<span>Brain</span></h1>
+  <span id="status-text">正在连接后端…</span>
+</header>
+
+<main>
+  <div id="canvas-wrap">
+    <canvas id="brain" width="560" height="560"></canvas>
+    <div id="tooltip"></div>
+  </div>
+
+  <aside>
+    <div class="card">
+      <h3>刺激设置</h3>
+
+      <label>刺激强度：<span id="amp-val">0.5</span></label>
+      <input type="range" id="amplitude" min="0.01" max="1" step="0.01" value="0.5" />
+
+      <label style="margin-top:8px">刺激模式</label>
+      <select id="pattern">
+        <option value="sine">正弦波（tACS）</option>
+        <option value="pulse">脉冲</option>
+        <option value="ramp">斜坡</option>
+        <option value="constant">持续</option>
+      </select>
+    </div>
+
+    <div class="card">
+      <h3>操作</h3>
+      <p style="font-size:0.8rem;color:#777;margin-bottom:10px">点击脑区选中，再施加刺激</p>
+      <button id="btn-stim">⚡ 施加刺激</button>
+      <div style="height:8px"></div>
+      <button id="btn-reset">↺ 重置</button>
+    </div>
+
+    <div class="card">
+      <h3>活动颜色图例</h3>
+      <div class="legend">
+        <span>低</span>
+        <div class="legend-bar"></div>
+        <span>高</span>
+      </div>
+    </div>
+
+    <div class="card" id="info-panel">
+      <h3>当前状态</h3>
+      <div id="info-body">
+        已选中：<strong id="sel-count">0</strong> 个脑区<br/>
+        后端：<strong id="backend-status">未连接</strong>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
