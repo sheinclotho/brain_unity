@@ -142,9 +142,11 @@ def main():
     logger.info("="*80)
     
     logger.info("\n📋 后续步骤:")
-    logger.info("1. 在Unity Hub中打开项目（Unity会自动下载依赖包）")
-    logger.info("2. 菜单: TwinBrain -> 自动设置场景")
-    logger.info("3. 点击'开始自动设置'按钮，完成后即可点击Play测试")
+    logger.info("1. 编辑 Unity项目/Packages/manifest.json，在 'dependencies' 下添加:")
+    logger.info('   "com.endel.nativewebsocket": "https://github.com/endel/NativeWebSocket.git#upm"')
+    logger.info("2. 在Unity Hub中打开项目（Unity会自动下载依赖包）")
+    logger.info("3. 菜单: TwinBrain -> Setup Scene")
+    logger.info("4. 点击'⚡ Build Scene'按钮，完成后即可点击Play测试")
     
     if args.freesurfer_dir:
         logger.info("\n✨ 已生成并复制OBJ文件，自动设置时会配置所有200+个OBJ文件")

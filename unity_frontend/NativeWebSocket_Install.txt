@@ -1,0 +1,35 @@
+TwinBrain — NativeWebSocket Installation Guide
+===============================================
+
+TwinBrain uses NativeWebSocket for real WebSocket communication (not HTTP polling).
+Without it the Unity frontend cannot connect to the Python backend.
+
+STEP 1: Locate your Unity project's Packages/manifest.json
+STEP 2: Add the following line inside the "dependencies" block:
+
+    "com.endel.nativewebsocket": "https://github.com/endel/NativeWebSocket.git#upm",
+
+Example:
+    {
+      "dependencies": {
+        "com.endel.nativewebsocket": "https://github.com/endel/NativeWebSocket.git#upm",
+        "com.unity.textmeshpro": "3.0.6",
+        ...
+      }
+    }
+
+STEP 3: Save the file and switch back to Unity — the package will auto-import.
+
+ALTERNATIVE (Unity Package Manager window):
+  1. Window → Package Manager
+  2. Click the [+] button → "Add package from git URL…"
+  3. Paste:  https://github.com/endel/NativeWebSocket.git#upm
+
+VERIFICATION:
+  After import, use the menu  TwinBrain → Check NativeWebSocket  to confirm.
+
+Why NativeWebSocket?
+  The old WebSocketClient.cs used UnityWebRequest over HTTP to connect to a
+  WebSocket server. This is fundamentally wrong — HTTP requests cannot receive
+  server-pushed messages. NativeWebSocket is the correct, cross-platform
+  (Standalone, WebGL, Android, iOS, VR) solution.
