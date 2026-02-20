@@ -1,0 +1,21 @@
+{
+    "name": "com.twinbrain.unity-frontend",
+    "version": "1.0.0",
+    "displayName": "TwinBrain Unity Frontend",
+    "description": "Real-time 3D brain visualization for TwinBrain. Connects to the Python WebSocket backend to display fMRI activity, run stimulation simulations, and load .pt cache files.",
+    "unity": "2020.3",
+    "unityRelease": "0f1",
+    "documentationUrl": "",
+    "changelogUrl": "",
+    "licensesUrl": "",
+    "dependencies": {
+        "com.unity.textmeshpro": "3.0.6"
+    },
+    "keywords": ["brain", "neuroscience", "visualization", "fmri", "websocket"],
+    "author": {
+        "name": "TwinBrain Project",
+        "email": "",
+        "url": ""
+    },
+    "_upmNote": "NativeWebSocket must be added separately. Add to your project's Packages/manifest.json:\n\"com.endel.nativewebsocket\": \"https://github.com/endel/NativeWebSocket.git#upm\""
+}

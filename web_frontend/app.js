@@ -1,315 +1,466 @@
 /**
- * TwinBrain Web Frontend
- * 简单、交互式的大脑活动可视化
+ * TwinBrain — 3D Brain Visualization
+ * Three.js interactive viewer: 200 cortical regions at anatomical positions,
+ * network-based activity coloring, orbit controls, timeline scrubber.
  */
 
-// ── 配置 ────────────────────────────────────────────────────────────────────
-const WS_URL      = "ws://127.0.0.1:8765";
-const N_REGIONS   = 200;          // 模拟脑区数量
-const RADIUS      = 260;          // 画布半径（脑轮廓）
-const REGION_R    = 12;           // 每个脑区圆的半径
-const RECONNECT_MS = 3000;        // 断线重连间隔
+// ── Constants ─────────────────────────────────────────────────────────────────
+const WS_URL       = "ws://127.0.0.1:8765";
+const N_REGIONS    = 200;
+const RECONNECT_MS = 3000;
+const SPHERE_R     = 4.0;   // base sphere radius (Three.js units ≈ mm)
 
-// ── 状态 ────────────────────────────────────────────────────────────────────
-const canvas  = document.getElementById("brain");
-const ctx     = canvas.getContext("2d");
-const tooltip = document.getElementById("tooltip");
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+const canvas      = document.getElementById('brain-canvas');
+const tooltip     = document.getElementById('tooltip');
+const canvasWrap  = document.getElementById('canvas-wrap');
+const slider      = document.getElementById('timeline-slider');
+const frameLabel  = document.getElementById('frame-label');
+const btnPlay     = document.getElementById('btn-play');
 
-let regions    = [];              // {x, y, id, activity, selected}
-let selected   = new Set();
+// ── State ─────────────────────────────────────────────────────────────────────
 let ws         = null;
-let animFrame  = null;
 let connected  = false;
-let demoTick   = 0;               // 演示模式帧计数器
+let demoTick   = 0;
+let selected   = new Set();
+let frameSeq   = [];      // [{activity:[…200 floats…]}, …]
+let curFrame   = 0;
+let isPlaying  = false;
+let playTimer  = null;
 
-// ── 颜色映射（蓝→青→绿→黄→红） ────────────────────────────────────────────
+// ── Guard: Three.js must be loaded ────────────────────────────────────────────
+if (typeof THREE === 'undefined') {
+  console.error('Three.js not loaded — falling back to demo-only mode');
+}
+
+// ── Three.js Scene ────────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = false;
+
+const scene  = new THREE.Scene();
+scene.background = new THREE.Color(0x07081a);
+
+const camera = new THREE.PerspectiveCamera(48, 1, 1, 2000);
+camera.position.set(0, 10, 320);
+camera.lookAt(0, 0, 0);
+
+// Lighting
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const dLight = new THREE.DirectionalLight(0xffffff, 0.85);
+dLight.position.set(1, 2, 2);
+scene.add(dLight);
+const dLight2 = new THREE.DirectionalLight(0x4466ff, 0.30);
+dLight2.position.set(-2, -1, -3);
+scene.add(dLight2);
+
+// ── Brain Region Positions ────────────────────────────────────────────────────
+// Fibonacci-sphere distribution per hemisphere, stretched to brain proportions.
+// X = left-right  (right +),  Y = inferior-superior,  Z = posterior-anterior
+function makeBrainPositions() {
+  const pos  = [];
+  const dAz  = 2 * Math.PI * (2 - (1 + Math.sqrt(5)) / 2); // golden angle ≈ 2.40 rad
+
+  for (let h = 0; h < 2; h++) {
+    const sign = h === 0 ? -1 : 1;   // -1 = left hemisphere, +1 = right
+
+    for (let i = 0; i < 100; i++) {
+      const t   = (i + 0.5) / 100;
+      // elevation: 1 (superior pole) → -0.85 (inferior, ~148°)
+      const el  = 1.0 - 1.85 * t;
+      const r   = Math.sqrt(Math.max(0, 1 - el * el));
+      const az  = dAz * i;
+
+      const ux  = r * Math.cos(az);   // lateral raw component
+      const uz  = r * Math.sin(az);   // anterior-posterior component
+
+      // Outer cortical surface: force lateral extent ≥ 15 %
+      const lateralExtent = Math.abs(ux) * 0.85 + 0.15;
+
+      // Temporal lobe bulge at mid-inferior height (el ≈ -0.22)
+      const bulge = 9 * Math.exp(-((el + 0.22) ** 2) * 5);
+
+      pos.push(new THREE.Vector3(
+        sign * (lateralExtent * 55 + bulge + 9),  // X:  ±17 … ±73 mm
+        el   * 63 - 4,                   // Y: −55 … +59 mm
+        uz   * 76 - 8                    // Z: −84 … +68 mm
+      ));
+    }
+  }
+  return pos;
+}
+
+const BRAIN_POS = makeBrainPositions();
+
+// ── Brain Outline (glass-brain effect) ───────────────────────────────────────
+(function buildOutline() {
+  const geo = new THREE.SphereGeometry(90, 20, 16);
+  geo.applyMatrix4(new THREE.Matrix4().makeScale(0.88, 0.82, 0.97));
+
+  // Semitransparent fill (inside faces so regions are visible through it)
+  scene.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
+    color: 0x1a2244, transparent: true, opacity: 0.07,
+    side: THREE.BackSide, depthWrite: false,
+  })));
+
+  // Wireframe edges
+  scene.add(new THREE.LineSegments(
+    new THREE.EdgesGeometry(geo),
+    new THREE.LineBasicMaterial({ color: 0x2244bb, transparent: true, opacity: 0.12 })
+  ));
+
+  // Sagittal midline hint
+  const div = new THREE.Mesh(
+    new THREE.CircleGeometry(76, 32),
+    new THREE.MeshBasicMaterial({ color: 0x3355cc, transparent: true, opacity: 0.045,
+      side: THREE.DoubleSide, depthWrite: false })
+  );
+  div.rotation.y = Math.PI / 2;
+  div.position.y = -4;
+  scene.add(div);
+})();
+
+// ── Region Spheres ────────────────────────────────────────────────────────────
+const regionGeo    = new THREE.SphereGeometry(SPHERE_R, 10, 8);
+const regionMeshes = [];
+
+for (let i = 0; i < N_REGIONS; i++) {
+  const mat  = new THREE.MeshPhongMaterial({
+    color:   new THREE.Color(0x0022cc),
+    emissive:new THREE.Color(0x001066),
+    shininess: 40,
+  });
+  const mesh = new THREE.Mesh(regionGeo, mat);
+  mesh.position.copy(BRAIN_POS[i]);
+  mesh.userData = { regionId: i, activity: 0.2, selected: false };
+  scene.add(mesh);
+  regionMeshes.push(mesh);
+}
+
+// ── Activity → Color ──────────────────────────────────────────────────────────
+const COLOR_STOPS = [
+  { t: 0.00, c: new THREE.Color(0x0020c8) },
+  { t: 0.25, c: new THREE.Color(0x0080ff) },
+  { t: 0.50, c: new THREE.Color(0x00e8cc) },
+  { t: 0.75, c: new THREE.Color(0xffd800) },
+  { t: 1.00, c: new THREE.Color(0xff2200) },
+];
+const _tc = new THREE.Color();
 function activityColor(v) {
-  // v in [0, 1]
-  const stops = [
-    [0.00, [0,  30, 200]],
-    [0.25, [0, 120, 255]],
-    [0.50, [0, 220, 180]],
-    [0.75, [255, 220, 0]],
-    [1.00, [255,  40,  0]],
-  ];
-  for (let i = 1; i < stops.length; i++) {
-    const [t0, c0] = stops[i - 1];
-    const [t1, c1] = stops[i];
-    if (v <= t1) {
-      const f = (v - t0) / (t1 - t0);
-      const r = Math.round(c0[0] + f * (c1[0] - c0[0]));
-      const g = Math.round(c0[1] + f * (c1[1] - c0[1]));
-      const b = Math.round(c0[2] + f * (c1[2] - c0[2]));
-      return `rgb(${r},${g},${b})`;
+  for (let i = 1; i < COLOR_STOPS.length; i++) {
+    if (v <= COLOR_STOPS[i].t) {
+      const f = (v - COLOR_STOPS[i-1].t) / (COLOR_STOPS[i].t - COLOR_STOPS[i-1].t);
+      return _tc.copy(COLOR_STOPS[i-1].c).lerp(COLOR_STOPS[i].c, f);
     }
   }
-  return "rgb(255,40,0)";
+  return _tc.copy(COLOR_STOPS[COLOR_STOPS.length - 1].c);
 }
 
-// ── 布局：将脑区排列成椭圆形 ────────────────────────────────────────────────
-function initRegions() {
-  const cx = canvas.width  / 2;
-  const cy = canvas.height / 2;
-  const rx = 220, ry = 195;  // 椭圆半轴
-
-  for (let i = 0; i < N_REGIONS; i++) {
-    const angle = (i / N_REGIONS) * 2 * Math.PI;
-    // 加入少量随机偏移，看起来更自然
-    const jitter = () => (Math.random() - 0.5) * 30;
-    regions.push({
-      id:       i,
-      x:        cx + rx * Math.cos(angle) + jitter(),
-      y:        cy + ry * Math.sin(angle) + jitter(),
-      activity: Math.random() * 0.3,   // 初始低活动
-      selected: false,
-      label:    `脑区 ${i + 1}`,
-    });
+function updateActivity(arr) {
+  for (let i = 0; i < regionMeshes.length; i++) {
+    const m  = regionMeshes[i];
+    const v  = Math.max(0, Math.min(1, arr[i] ?? 0.2));
+    m.userData.activity = v;
+    const c  = activityColor(v);
+    m.material.color.copy(c);
+    m.material.emissive.setRGB(c.r * 0.22, c.g * 0.22, c.b * 0.22);
+    m.scale.setScalar(m.userData.selected ? 1.6 : 0.65 + v * 0.60);
   }
 }
 
-// ── 绘制 ────────────────────────────────────────────────────────────────────
-function draw() {
-  const w = canvas.width, h = canvas.height;
-  ctx.clearRect(0, 0, w, h);
+// ── Orbit Controls ────────────────────────────────────────────────────────────
+const orbit = { theta: 0, phi: Math.PI * 0.44, radius: 320,
+                dragging: false, px: 0, py: 0 };
 
-  // 背景脑轮廓（简化椭圆）
-  const cx = w / 2, cy = h / 2;
-  ctx.save();
-  ctx.beginPath();
-  ctx.ellipse(cx, cy, 235, 210, 0, 0, Math.PI * 2);
-  ctx.strokeStyle = "rgba(100,140,255,0.12)";
-  ctx.lineWidth   = 2;
-  ctx.stroke();
-  // 内侧装饰圆
-  ctx.beginPath();
-  ctx.ellipse(cx, cy, 175, 155, 0, 0, Math.PI * 2);
-  ctx.strokeStyle = "rgba(100,140,255,0.06)";
-  ctx.stroke();
-  ctx.restore();
+canvas.addEventListener('mousedown', e => {
+  if (e.button === 0) { orbit.dragging = true; orbit.px = e.clientX; orbit.py = e.clientY; }
+});
+document.addEventListener('mouseup', () => { orbit.dragging = false; });
+document.addEventListener('mousemove', e => {
+  if (!orbit.dragging) return;
+  orbit.theta -= (e.clientX - orbit.px) * 0.007;
+  orbit.phi    = Math.max(0.15, Math.min(Math.PI - 0.15,
+                   orbit.phi - (e.clientY - orbit.py) * 0.007));
+  orbit.px = e.clientX; orbit.py = e.clientY;
+});
+canvas.addEventListener('wheel', e => {
+  orbit.radius = Math.max(150, Math.min(700, orbit.radius + e.deltaY * 0.45));
+}, { passive: true });
 
-  // 连线（选中脑区之间）
-  if (selected.size >= 2) {
-    const sel = [...selected].map(id => regions[id]);
-    ctx.save();
-    ctx.globalAlpha = 0.25;
-    ctx.strokeStyle = "#7eb8ff";
-    ctx.lineWidth   = 1;
-    for (let i = 0; i < sel.length; i++) {
-      for (let j = i + 1; j < sel.length; j++) {
-        ctx.beginPath();
-        ctx.moveTo(sel[i].x, sel[i].y);
-        ctx.lineTo(sel[j].x, sel[j].y);
-        ctx.stroke();
-      }
-    }
-    ctx.restore();
+// Touch
+canvas.addEventListener('touchstart', e => {
+  if (e.touches.length === 1) {
+    orbit.dragging = true; orbit.px = e.touches[0].clientX; orbit.py = e.touches[0].clientY;
   }
+}, { passive: true });
+canvas.addEventListener('touchend', () => { orbit.dragging = false; }, { passive: true });
+canvas.addEventListener('touchmove', e => {
+  if (!orbit.dragging || e.touches.length !== 1) return;
+  orbit.theta -= (e.touches[0].clientX - orbit.px) * 0.007;
+  orbit.phi    = Math.max(0.15, Math.min(Math.PI - 0.15,
+                   orbit.phi - (e.touches[0].clientY - orbit.py) * 0.007));
+  orbit.px = e.touches[0].clientX; orbit.py = e.touches[0].clientY;
+}, { passive: true });
 
-  // 脑区圆圈
-  for (const r of regions) {
-    const color = activityColor(r.activity);
-    const radius = r.selected ? REGION_R + 3 : REGION_R;
-
-    ctx.beginPath();
-    ctx.arc(r.x, r.y, radius, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.globalAlpha = 0.85;
-    ctx.fill();
-
-    if (r.selected) {
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth   = 2;
-      ctx.globalAlpha = 1;
-      ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
-  }
-
-  animFrame = requestAnimationFrame(draw);
+function applyOrbit() {
+  const { theta, phi, radius } = orbit;
+  camera.position.set(
+    radius * Math.sin(phi) * Math.sin(theta),
+    radius * Math.cos(phi),
+    radius * Math.sin(phi) * Math.cos(theta)
+  );
+  camera.lookAt(0, -4, 0);
 }
 
-// ── 演示动画（后端未连接时） ─────────────────────────────────────────────────
+// ── Resize ────────────────────────────────────────────────────────────────────
+function onResize() {
+  const w = canvasWrap.clientWidth, h = canvasWrap.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', onResize);
+onResize();
+
+// ── Raycasting ────────────────────────────────────────────────────────────────
+const raycaster = new THREE.Raycaster();
+const _mouse    = new THREE.Vector2();
+
+const NETWORK_NAMES = ['视觉','体感运动','背侧注意','腹侧注意','边缘','额顶','默认网络'];
+
+function pickRegion(cx, cy, doClick) {
+  const rect = canvas.getBoundingClientRect();
+  _mouse.x =  ((cx - rect.left) / rect.width ) * 2 - 1;
+  _mouse.y = -((cy - rect.top ) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(_mouse, camera);
+  const hits = raycaster.intersectObjects(regionMeshes);
+  if (!hits.length) return -1;
+  const id = hits[0].object.userData.regionId;
+  if (doClick) {
+    const m = regionMeshes[id];
+    m.userData.selected = !m.userData.selected;
+    m.userData.selected ? selected.add(id) : selected.delete(id);
+    document.getElementById('sel-count').textContent = selected.size;
+  }
+  return id;
+}
+
+canvas.addEventListener('click', e => {
+  if (!orbit.dragging) pickRegion(e.clientX, e.clientY, true);
+});
+
+canvas.addEventListener('mousemove', e => {
+  const id = pickRegion(e.clientX, e.clientY, false);
+  if (id >= 0) {
+    const m   = regionMeshes[id];
+    const pct = (m.userData.activity * 100).toFixed(1);
+    const net = NETWORK_NAMES[Math.min(Math.floor(id / (N_REGIONS / 7)), 6)];
+    tooltip.style.display = 'block';
+    tooltip.style.left    = `${e.offsetX + 14}px`;
+    tooltip.style.top     = `${e.offsetY - 10}px`;
+    tooltip.innerHTML =
+      `<strong>区域 ${id + 1}</strong>&nbsp;&nbsp;${net}<br/>` +
+      `活动: ${pct}%&nbsp;&nbsp;${id < 100 ? '左脑' : '右脑'}`;
+    canvas.style.cursor = 'pointer';
+  } else {
+    tooltip.style.display = 'none';
+    canvas.style.cursor   = orbit.dragging ? 'grabbing' : 'grab';
+  }
+});
+canvas.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+
+// ── Demo Mode (no backend) ────────────────────────────────────────────────────
+const NET_FREQS  = [0.012, 0.020, 0.035, 0.028, 0.008, 0.025, 0.010];
+const NET_PHASES = [0.0,   1.0,   2.1,   0.7,   3.2,   1.8,   0.4  ];
+const NET_SIZE   = N_REGIONS / 7;
+
 function demoUpdate() {
-  demoTick++;
-  for (const r of regions) {
-    // 各自独立的低频振荡
-    r.activity = 0.15 + 0.12 * Math.sin(demoTick * 0.03 + r.id * 0.4)
-               + 0.05 * Math.random();
-    r.activity = Math.max(0, Math.min(1, r.activity));
+  demoTick += 0.05;
+  const act = new Array(N_REGIONS);
+  for (let i = 0; i < N_REGIONS; i++) {
+    const n = Math.min(Math.floor(i / NET_SIZE), 6);
+    const v = 0.36 + 0.22 * Math.sin(NET_FREQS[n] * demoTick + NET_PHASES[n] + i * 0.08)
+                   + 0.04 * Math.sin(0.003 * demoTick + i * 0.25);
+    act[i] = Math.max(0, Math.min(1, v));
   }
+  updateActivity(act);
 }
 
-// ── WebSocket ────────────────────────────────────────────────────────────────
+// ── Render Loop ───────────────────────────────────────────────────────────────
+(function animate() {
+  requestAnimationFrame(animate);
+  if (!connected && frameSeq.length === 0) demoUpdate();
+  applyOrbit();
+  renderer.render(scene, camera);
+})();
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
 function connect() {
-  try {
-    ws = new WebSocket(WS_URL);
-  } catch {
-    scheduleReconnect();
-    return;
-  }
+  try { ws = new WebSocket(WS_URL); } catch { return setTimeout(connect, RECONNECT_MS); }
 
   ws.onopen = () => {
     connected = true;
     setStatus(true);
-    ws.send(JSON.stringify({ type: "get_brain_state" }));
+    ws.send(JSON.stringify({ type: "get_state" }));
   };
 
-  ws.onmessage = (ev) => {
-    try {
-      const msg = JSON.parse(ev.data);
-      if (msg.brain_state && msg.brain_state.activity) {
-        const act = msg.brain_state.activity;
-        for (let i = 0; i < Math.min(act.length, regions.length); i++) {
-          regions[i].activity = Math.max(0, Math.min(1, act[i]));
-        }
-      } else if (msg.stimulation_result && msg.stimulation_result.activity) {
-        const act = msg.stimulation_result.activity;
-        for (let i = 0; i < Math.min(act.length, regions.length); i++) {
-          regions[i].activity = Math.max(0, Math.min(1, act[i]));
-        }
-      }
-    } catch (e) {
-      console.warn("Failed to parse WebSocket message:", ev.data, e);
-    }
+  ws.onmessage = ev => {
+    try { handleMsg(JSON.parse(ev.data)); }
+    catch (e) { console.warn("WS parse error:", e); }
   };
 
   ws.onerror = () => {};
-  ws.onclose = () => {
-    connected = false;
-    setStatus(false);
-    scheduleReconnect();
-  };
+  ws.onclose = () => { connected = false; setStatus(false); setTimeout(connect, RECONNECT_MS); };
 }
 
-function scheduleReconnect() {
-  setTimeout(connect, RECONNECT_MS);
+function handleMsg(msg) {
+  // Single-frame update (brain_state)
+  if (msg.type === 'brain_state' && Array.isArray(msg.activity)) {
+    if (frameSeq.length === 0) updateActivity(msg.activity);
+    return;
+  }
+  // Multi-frame sequence (stimulation result or cache data)
+  if ((msg.type === 'simulation_result' || msg.type === 'cache_loaded')
+      && Array.isArray(msg.frames) && msg.frames.length > 0) {
+    loadFrameSeq(msg.frames, msg.path || null);
+    return;
+  }
+  // Server greeting
+  if (msg.type === 'welcome') {
+    document.getElementById('status-text').textContent =
+      `已连接 (v${msg.version || '?'})`;
+    return;
+  }
+  if (msg.type === 'error') {
+    console.warn('Server error:', msg.message);
+  }
 }
 
 function setStatus(ok) {
-  const dot  = document.getElementById("status-dot");
-  const text = document.getElementById("status-text");
-  const bk   = document.getElementById("backend-status");
-  dot.className  = ok ? "connected" : "";
-  text.textContent = ok ? "已连接后端" : "演示模式（后端未连接）";
-  if (bk) bk.textContent = ok ? "已连接" : "未连接";
+  document.getElementById('status-dot').className           = ok ? 'connected' : '';
+  document.getElementById('status-text').textContent        = ok ? '已连接后端' : '演示模式（后端未连接）';
+  document.getElementById('backend-status').textContent     = ok ? '已连接' : '未连接';
 }
 
-// ── 事件：鼠标点击脑区 ───────────────────────────────────────────────────────
-canvas.addEventListener("click", (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+// ── Timeline ──────────────────────────────────────────────────────────────────
+function loadFrameSeq(frames, label) {
+  frameSeq  = frames;
+  curFrame  = 0;
+  slider.min   = 0;
+  slider.max   = Math.max(0, frames.length - 1);
+  slider.value = 0;
+  updateFrameLabel();
+  document.getElementById('frame-info').textContent =
+    `${frames.length} 帧${label ? ' — ' + label.split(/[\\/]/).pop() : ''}`;
+  if (frames[0]) updateActivity(frames[0].activity);
+  playSeq();
+}
 
-  for (const r of regions) {
-    const dx = mx - r.x, dy = my - r.y;
-    if (dx * dx + dy * dy <= (REGION_R + 4) ** 2) {
-      r.selected = !r.selected;
-      if (r.selected) selected.add(r.id);
-      else             selected.delete(r.id);
-      document.getElementById("sel-count").textContent = selected.size;
-      return;
-    }
-  }
+function updateFrameLabel() {
+  frameLabel.textContent = frameSeq.length > 0
+    ? `${curFrame + 1} / ${frameSeq.length}` : '—';
+}
+
+function playSeq() {
+  clearInterval(playTimer);
+  isPlaying = true;
+  btnPlay.textContent = '⏸';
+  playTimer = setInterval(() => {
+    if (!frameSeq.length) return;
+    curFrame = (curFrame + 1) % frameSeq.length;
+    slider.value = curFrame;
+    updateFrameLabel();
+    updateActivity(frameSeq[curFrame].activity);
+  }, 100);   // 10 fps
+}
+
+function pauseSeq() {
+  clearInterval(playTimer);
+  isPlaying = false;
+  btnPlay.textContent = '▶';
+}
+
+btnPlay.addEventListener('click', () => isPlaying ? pauseSeq() : playSeq());
+
+slider.addEventListener('input', e => {
+  curFrame = parseInt(e.target.value) || 0;
+  updateFrameLabel();
+  if (frameSeq[curFrame]) updateActivity(frameSeq[curFrame].activity);
 });
 
-// ── 事件：鼠标悬停提示 ───────────────────────────────────────────────────────
-canvas.addEventListener("mousemove", (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
-
-  let hit = null;
-  for (const r of regions) {
-    const dx = mx - r.x, dy = my - r.y;
-    if (dx * dx + dy * dy <= (REGION_R + 6) ** 2) { hit = r; break; }
-  }
-
-  if (hit) {
-    tooltip.style.display = "block";
-    tooltip.style.left    = `${e.offsetX + 14}px`;
-    tooltip.style.top     = `${e.offsetY - 10}px`;
-    tooltip.innerHTML     = `<strong>${hit.label}</strong><br/>活动: ${(hit.activity * 100).toFixed(1)}%`;
-    canvas.style.cursor   = "pointer";
-  } else {
-    tooltip.style.display = "none";
-    canvas.style.cursor   = "crosshair";
-  }
+// ── Button wiring ─────────────────────────────────────────────────────────────
+document.getElementById('amplitude').addEventListener('input', e => {
+  document.getElementById('amp-val').textContent = parseFloat(e.target.value).toFixed(2);
+});
+document.getElementById('frequency').addEventListener('input', e => {
+  document.getElementById('freq-val').textContent = e.target.value;
 });
 
-canvas.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
-
-// ── 按钮：施加刺激 ───────────────────────────────────────────────────────────
-document.getElementById("btn-stim").addEventListener("click", () => {
-  const amplitude = parseFloat(document.getElementById("amplitude").value);
-  const pattern   = document.getElementById("pattern").value;
-  const targets   = [...selected];
+document.getElementById('btn-stim').addEventListener('click', () => {
+  const amplitude = parseFloat(document.getElementById('amplitude').value);
+  const pattern   = document.getElementById('pattern').value;
+  const frequency = parseFloat(document.getElementById('frequency').value);
+  let targets     = [...selected];
 
   if (targets.length === 0) {
-    // 没有选中区域时，随机选几个做演示（使用 Set 避免重复）
-    const randomSet = new Set();
-    while (randomSet.size < 5) {
-      randomSet.add(Math.floor(Math.random() * N_REGIONS));
-    }
-    randomSet.forEach(idx => targets.push(idx));
+    const rnd = new Set();
+    while (rnd.size < 5) rnd.add(Math.floor(Math.random() * N_REGIONS));
+    targets = [...rnd];
   }
 
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
-      type: "simulate_stimulation",
+      type: "simulate",
       target_regions: targets,
-      amplitude,
-      pattern,
-      frequency: 10.0,
-      duration:  50,
+      amplitude, pattern, frequency,
+      duration: 60,
     }));
   } else {
-    // 演示模式：本地模拟刺激效果
+    // Local demo stimulation: direct excitation + spatial spread
+    const act = regionMeshes.map(m => m.userData.activity);
+    targets.forEach(id => {
+      if (id < N_REGIONS) act[id] = Math.min(1, act[id] + amplitude * 0.7);
+    });
     for (const id of targets) {
-      if (id < regions.length) {
-        regions[id].activity = Math.min(1, regions[id].activity + amplitude * 0.6);
-      }
+      const p0 = BRAIN_POS[id];
+      regionMeshes.forEach((m, j) => {
+        if (j === id) return;
+        const d = p0.distanceTo(BRAIN_POS[j]);
+        if (d < 55) act[j] = Math.min(1, act[j] + amplitude * 0.28 * (1 - d / 55));
+      });
     }
-    // 临近扩散
-    for (const id of targets) {
-      const r0 = regions[id];
-      for (const r of regions) {
-        const d = Math.hypot(r.x - r0.x, r.y - r0.y);
-        if (d < 60 && d > 0) {
-          r.activity = Math.min(1, r.activity + amplitude * 0.25 * (1 - d / 60));
-        }
-      }
-    }
+    updateActivity(act);
   }
 });
 
-// ── 按钮：重置 ───────────────────────────────────────────────────────────────
-document.getElementById("btn-reset").addEventListener("click", () => {
-  for (const r of regions) {
-    r.activity  = Math.random() * 0.2;
-    r.selected  = false;
-  }
+document.getElementById('btn-reset').addEventListener('click', () => {
   selected.clear();
-  document.getElementById("sel-count").textContent = "0";
-
+  regionMeshes.forEach(m => {
+    m.userData.selected = false;
+    m.scale.setScalar(0.65 + m.userData.activity * 0.60);
+  });
+  document.getElementById('sel-count').textContent = '0';
+  pauseSeq();
+  frameSeq  = [];
+  curFrame  = 0;
+  slider.max = 0;
+  slider.value = 0;
+  updateFrameLabel();
+  document.getElementById('frame-info').textContent = connected ? '实时数据' : '演示模式';
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "get_brain_state" }));
+    ws.send(JSON.stringify({ type: "get_state" }));
   }
 });
 
-// ── 滑块实时显示 ─────────────────────────────────────────────────────────────
-document.getElementById("amplitude").addEventListener("input", (e) => {
-  document.getElementById("amp-val").textContent = parseFloat(e.target.value).toFixed(2);
+document.getElementById('btn-load').addEventListener('click', () => {
+  const path = document.getElementById('cache-path').value.trim() || null;
+  if (connected && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "load_cache", path }));
+  } else {
+    alert('请先连接后端服务器（运行 python start.py）');
+  }
 });
 
-// ── 主循环 ───────────────────────────────────────────────────────────────────
-function tick() {
-  if (!connected) demoUpdate();
-  setTimeout(tick, 80);   // ~12 fps 数据更新（渲染由 rAF 驱动）
-}
-
-// ── 初始化 ───────────────────────────────────────────────────────────────────
-initRegions();
-connect();
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
 setStatus(false);
-draw();
-tick();
+connect();

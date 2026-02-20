@@ -280,47 +280,82 @@ Unity项目资源文件：
         """
         复制Unity C#脚本到项目
         
-        从 unity_examples/ 复制所有功能完整的Unity C#脚本：
-        - WebSocketClient.cs: WebSocket客户端（前后端通信）
-        - BrainDataStructures.cs: 数据结构定义
-        - BrainConfigLoader.cs: 配置加载器
-        - BrainVisualization.cs: 可视化控制器
-        - StimulationInput.cs: 刺激输入UI
-        - TimelineController.cs: 时间轴控制
-        - CacheToJsonConverter.cs: Cache文件自动转换为JSON
+        优先从 unity_frontend/ 复制新版脚本（NativeWebSocket，正确协议），
+        如果找不到则回退到 unity_examples/ 的旧版本。
+        
+        新版脚本:
+        - TwinBrainWebSocket.cs: 真正的WebSocket客户端（NativeWebSocket）
+        - MessageProtocol.cs: JSON消息类型定义
+        - BrainRegionPositions.cs: 脑区坐标生成（Fibonacci球面算法）
+        - ActivityHeatmap.cs: 热图颜色映射
+        - TwinBrainManager.cs: 主协调器
+        - BrainRegionTag.cs: 脑区标识组件
+        - TimelinePlayer.cs: 时间轴播放
+        - OrbitCamera.cs: 轨道摄像机
+        - TimelineUI.cs: 时间轴UI
+        - StimulationPanel.cs: 刺激控制面板
+        - StatusHUD.cs: 状态显示
+        - RegionTooltip.cs: 悬停提示
         """
         if self.verbose:
             logger.info("\n" + "="*80)
             logger.info("步骤 3: 复制Unity C#脚本")
             logger.info("="*80)
         
-        # 从 unity_examples/ 复制所有Unity C#脚本
-        source_scripts_dir = self.project_root / "unity_examples"
-        if source_scripts_dir.exists():
-            unity_scripts = [
-                "WebSocketClient.cs",
-                "BrainDataStructures.cs", 
-                "BrainConfigLoader.cs",
-                "BrainVisualization.cs",
-                "StimulationInput.cs",
-                "TimelineController.cs",
+        import shutil
+        
+        # 新版脚本目录 (unity_frontend/)
+        new_scripts_base = self.project_root / "unity_frontend"
+        
+        # 旧版脚本目录（回退）
+        legacy_scripts_dir = self.project_root / "unity_examples"
+        
+        if new_scripts_base.exists():
+            # 递归复制所有 .cs 文件并保留子目录结构
+            total = 0
+            for src in new_scripts_base.rglob("*.cs"):
+                rel  = src.relative_to(new_scripts_base)
+                dst  = self.unity_scripts_dir / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                total += 1
+                if self.verbose:
+                    logger.info(f"  ✓ 复制: {rel}")
+            
+            # Also copy package manifest and asmdef
+            for fname in ["TwinBrain.asmdef", "NativeWebSocket_Install.txt"]:
+                src = new_scripts_base / fname
+                if src.exists():
+                    shutil.copy2(src, self.unity_scripts_dir / fname)
+                    if self.verbose:
+                        logger.info(f"  ✓ 复制: {fname}")
+            
+            if self.verbose:
+                logger.info(f"  ✓ 复制完成（{total} 个脚本，来自 unity_frontend/）")
+            
+            if self.verbose:
+                logger.info("\n  ⚠  记得安装 NativeWebSocket 包！")
+                logger.info("     编辑 Unity项目/Packages/manifest.json，在 \"dependencies\" 对象内添加:")
+                logger.info('     "com.endel.nativewebsocket": "https://github.com/endel/NativeWebSocket.git#upm"')
+        
+        elif legacy_scripts_dir.exists():
+            # Fall back to old scripts
+            legacy_scripts = [
+                "WebSocketClient.cs", "BrainDataStructures.cs", "BrainConfigLoader.cs",
+                "BrainVisualization.cs", "StimulationInput.cs", "TimelineController.cs",
                 "CacheToJsonConverter.cs"
             ]
-            
-            for script in unity_scripts:
-                src = source_scripts_dir / script
+            for script in legacy_scripts:
+                src = legacy_scripts_dir / script
                 if src.exists():
-                    dst = self.unity_scripts_dir / script
-                    import shutil
-                    shutil.copy2(src, dst)
+                    shutil.copy2(src, self.unity_scripts_dir / script)
                     if self.verbose:
-                        logger.info(f"  ✓ 复制: {script}")
-                else:
-                    if self.verbose:
-                        logger.warning(f"  ⚠ 脚本未找到: {script}")
+                        logger.info(f"  ✓ 复制 (旧版): {script}")
+            if self.verbose:
+                logger.warning("  ⚠ 使用旧版脚本（HTTP轮询，非真正WebSocket）")
         else:
             if self.verbose:
-                logger.warning(f"  ⚠ unity_examples目录未找到: {source_scripts_dir}")
+                logger.warning(f"  ⚠ 未找到脚本目录（unity_frontend/ 或 unity_examples/）")
         
         if self.verbose:
             logger.info("  ✓ Unity脚本复制完成")
