@@ -1,0 +1,26 @@
+# TwinBrain Framework Dependencies
+# Python >= 3.8
+
+# Core Dependencies
+torch>=2.0.0,<3.0.0
+numpy>=1.21.0,<2.0.0
+nibabel>=3.2.0,<5.0.0
+websockets>=10.0,<13.0
+
+# Optional Dependencies for Development
+# Uncomment if needed for development
+
+# Testing
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
+# pytest-asyncio>=0.21.0
+
+# Code Quality
+# black>=22.0.0
+# flake8>=4.0.0
+# mypy>=0.950
+# bandit>=1.7.0
+
+# Documentation
+# sphinx>=5.0.0
+# sphinx-rtd-theme>=1.0.0

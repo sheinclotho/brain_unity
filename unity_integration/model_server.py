@@ -17,6 +17,22 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 
+# Import validation utilities
+try:
+    from .validation import (
+        validate_region_ids,
+        validate_amplitude,
+        validate_pattern,
+        validate_frequency,
+        validate_duration,
+        validate_n_steps,
+        ValidationError
+    )
+    VALIDATION_AVAILABLE = True
+except ImportError:
+    VALIDATION_AVAILABLE = False
+    logging.warning("Validation module not available")
+
 
 class ModelServer:
     """
@@ -137,10 +153,24 @@ class ModelServer:
         
         Returns:
             预测结果列表 (JSON格式)
+        
+        Raises:
+            ValueError: If n_steps is invalid
         """
+        # Validate n_steps
+        if VALIDATION_AVAILABLE:
+            try:
+                n_steps = validate_n_steps(n_steps)
+            except ValidationError as e:
+                self.logger.error(f"Input validation failed: {e}")
+                raise ValueError(str(e))
+        else:
+            if not 1 <= n_steps <= 1000:
+                raise ValueError(f"n_steps must be between 1 and 1000, got {n_steps}")
+        
         self.logger.info(f"生成 {n_steps} 步预测...")
         
-        n_regions = 200  # Schaefer 200
+        n_regions = 200# Schaefer 200
         
         # 如果没有初始状态，生成随机初始状态
         if initial_state is None:
@@ -197,13 +227,40 @@ class ModelServer:
         
         Returns:
             模拟结果列表 (JSON格式)
+        
+        Raises:
+            ValueError: If input parameters are invalid
         """
+        n_regions = 200
+        
+        # Input validation
+        if VALIDATION_AVAILABLE:
+            try:
+                target_regions = validate_region_ids(target_regions, n_regions=n_regions)
+                amplitude = validate_amplitude(amplitude)
+                pattern = validate_pattern(pattern)
+                frequency = validate_frequency(frequency)
+                duration = validate_duration(duration)
+            except ValidationError as e:
+                self.logger.error(f"Input validation failed: {e}")
+                raise ValueError(str(e))
+        else:
+            # Basic validation fallback
+            if not target_regions:
+                raise ValueError("target_regions cannot be empty")
+            if not 0.01 <= amplitude <= 10.0:
+                raise ValueError(f"amplitude must be between 0.01 and 10.0, got {amplitude}")
+            if not 1 <= duration <= 1000:
+                raise ValueError(f"duration must be between 1 and 1000, got {duration}")
+            # Filter invalid region IDs
+            target_regions = [r for r in target_regions if 0 <= r < n_regions]
+            if not target_regions:
+                raise ValueError(f"No valid target regions (must be 0-{n_regions-1})")
+        
         self.logger.info(f"模拟虚拟刺激...")
         self.logger.info(f"  - 目标脑区: {target_regions}")
         self.logger.info(f"  - 刺激强度: {amplitude}")
         self.logger.info(f"  - 刺激模式: {pattern}")
-        
-        n_regions = 200
         
         # 初始状态
         if initial_state is None:
