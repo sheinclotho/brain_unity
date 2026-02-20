@@ -119,7 +119,7 @@ class BrainVisualizationServer:
                 return_exceptions=True
             )
     
-    async def handle_client(self, websocket, path):
+    async def handle_client(self, websocket, path=None):
         """Handle client connection and requests."""
         await self.register_client(websocket)
         
