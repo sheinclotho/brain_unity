@@ -205,6 +205,25 @@
     </div>
 
     <div class="card">
+      <h3>有效连接推断 (EC)</h3>
+      <p style="font-size:0.75rem;color:#555;margin-bottom:7px">
+        NPI 扰动法 / Jacobian 法从数据中推断脑区因果影响力矩阵
+      </p>
+      <select id="ec-method">
+        <option value="jacobian">Jacobian 法（精确，推荐）</option>
+        <option value="perturbation">NPI 有限差分法</option>
+        <option value="demo">演示模式（无需数据）</option>
+      </select>
+      <div class="gap6"></div>
+      <button id="btn-infer-ec" class="btn-primary">🧠 推断有效连接</button>
+      <div class="gap6"></div>
+      <button id="btn-ec-stim" class="btn-success" disabled>🎯 刺激推荐靶点</button>
+      <div class="gap6"></div>
+      <button id="btn-hide-ec" class="btn-secondary" style="display:none">隐藏连接线</button>
+      <p id="ec-status" style="font-size:0.73rem;color:#666;margin-top:6px"></p>
+    </div>
+
+    <div class="card">
       <h3>活动颜色图例</h3>
       <div class="legend">
         <span>低</span>

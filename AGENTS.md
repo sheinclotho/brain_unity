@@ -102,6 +102,13 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 - **修复**: 增加 EEG 回退路径：若无 fMRI 节点，则取 `eeg.x_seq`，用 `np.interp(linspace(0,1,200), linspace(0,1,N_eeg), values)` 线性插值到 200 槽位，再做百分位归一化。
 - **规则**: 任何从 HeteroData 提取活动值的函数必须同时处理 fMRI（直接映射）和 EEG（插值到 200）两种情况，并在注释中说明映射策略。
 
+### [2026-02-21] NPI 框架对比与 PerturbationAnalyzer 设计
+- **背景**: 参考项目 NPI.py 实现了扰动推断有效连接（EC）的方法，与 TwinBrain 的刺激模拟框架在目标上互补。
+- **关键差异**: NPI 目标是*推断*因果结构（科学分析），TwinBrain 目标是*模拟*刺激效果（可视化交互）。NPI 无 EC 量化，TwinBrain 无因果推断。
+- **改进**: 新增 `unity_integration/perturbation_analyzer.py`（`PerturbationAnalyzer`），实现两种 EC 推断方法（有限差分/Jacobian），并提供基于 EC 的靶点推荐和活动增量预测。
+- **规则**: NPI.py 作为参考实现保留在仓库根目录，不修改；所有 EC 功能实现在 `perturbation_analyzer.py` 中。
+- **新增 WebSocket 消息**: `infer_ec` 请求 / `ec_result` 响应（详见 `项目规范说明书.md` 第 13 节）。
+
 ---
 
 *Last updated: 2026-02-21*
