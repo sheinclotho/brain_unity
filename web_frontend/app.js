@@ -159,11 +159,12 @@ function activityColor(v) {
   return _tc.copy(COLOR_STOPS[COLOR_STOPS.length - 1].c);
 }
 
-function updateActivity(arr) {
+function updateActivity(arr, rawArr) {
   for (let i = 0; i < regionMeshes.length; i++) {
     const m  = regionMeshes[i];
     const v  = Math.max(0, Math.min(1, arr[i] ?? 0.2));
     m.userData.activity = v;
+    m.userData.rawActivity = rawArr ? rawArr[i] : undefined;
     const c  = activityColor(v);
     m.material.color.copy(c);
     m.material.emissive.setRGB(c.r * 0.22, c.g * 0.22, c.b * 0.22);
@@ -258,12 +259,16 @@ canvas.addEventListener('mousemove', e => {
     const m   = regionMeshes[id];
     const pct = (m.userData.activity * 100).toFixed(1);
     const net = NETWORK_NAMES[Math.min(Math.floor(id / (N_REGIONS / 7)), 6)];
+    const rawLine = m.userData.rawActivity !== undefined
+      ? `<br/><span style="color:#aaa;font-size:0.75em">原始值: ${m.userData.rawActivity.toFixed(4)}</span>`
+      : '';
     tooltip.style.display = 'block';
     tooltip.style.left    = `${e.offsetX + 14}px`;
     tooltip.style.top     = `${e.offsetY - 10}px`;
     tooltip.innerHTML =
       `<strong>区域 ${id + 1}</strong>&nbsp;&nbsp;${net}<br/>` +
-      `活动: ${pct}%&nbsp;&nbsp;${id < 100 ? '左脑' : '右脑'}`;
+      `活动: ${pct}%&nbsp;&nbsp;${id < 100 ? '左脑' : '右脑'}` +
+      rawLine;
     canvas.style.cursor = 'pointer';
   } else {
     tooltip.style.display = 'none';
@@ -340,7 +345,17 @@ function handleMsg(msg) {
     updateModalityToggle(msg.modalities || []);
     // Pick the active modality's frames (fall back to primary frames)
     const modFrames = _getModalityFrames();
-    loadFrameSeq(modFrames.length > 0 ? modFrames : msg.frames, msg.path || null);
+    // Determine label for modality badge
+    let modalityLabel = msg.modality || null;
+    if (!modalityLabel) {
+      if (activeModality === 'fmri' && framesFmri.length > 0) modalityLabel = 'fMRI';
+      else if (activeModality === 'eeg' && framesEeg.length > 0) modalityLabel = 'EEG';
+      else if (framesFmri.length > 0) modalityLabel = 'fMRI';
+      else if (framesEeg.length > 0)  modalityLabel = 'EEG';
+    } else if (modalityLabel === 'simulation') {
+      modalityLabel = '⚡ 仿真';
+    }
+    loadFrameSeq(modFrames.length > 0 ? modFrames : msg.frames, msg.path || null, modalityLabel);
     return;
   }
   // EC inference result
@@ -411,8 +426,19 @@ function setStatus(ok) {
   document.getElementById('backend-status').textContent     = ok ? '已连接' : '未连接';
 }
 
+// ── Modality badge (timeline bar) ─────────────────────────────────────────────
+function setModalityBadge(label) {
+  const badge = document.getElementById('modality-badge');
+  if (label) {
+    badge.textContent = label;
+    badge.style.display = '';
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
 // ── Timeline ──────────────────────────────────────────────────────────────────
-function loadFrameSeq(frames, label) {
+function loadFrameSeq(frames, label, modality) {
   frameSeq  = frames;
   curFrame  = 0;
   slider.min   = 0;
@@ -421,7 +447,9 @@ function loadFrameSeq(frames, label) {
   updateFrameLabel();
   document.getElementById('frame-info').textContent =
     `${frames.length} 帧${label ? ' — ' + label.split(/[\\/]/).pop() : ''}`;
-  if (frames[0]) updateActivity(frames[0].activity);
+  // Show modality badge
+  setModalityBadge(modality || null);
+  if (frames[0]) updateActivity(frames[0].activity, frames[0].raw);
   playSeq();
 }
 
@@ -439,7 +467,7 @@ function playSeq() {
     curFrame = (curFrame + 1) % frameSeq.length;
     slider.value = curFrame;
     updateFrameLabel();
-    updateActivity(frameSeq[curFrame].activity);
+    updateActivity(frameSeq[curFrame].activity, frameSeq[curFrame].raw);
   }, 100);   // 10 fps
 }
 
@@ -454,7 +482,7 @@ btnPlay.addEventListener('click', () => isPlaying ? pauseSeq() : playSeq());
 slider.addEventListener('input', e => {
   curFrame = parseInt(e.target.value) || 0;
   updateFrameLabel();
-  if (frameSeq[curFrame]) updateActivity(frameSeq[curFrame].activity);
+  if (frameSeq[curFrame]) updateActivity(frameSeq[curFrame].activity, frameSeq[curFrame].raw);
 });
 
 // ── Button wiring ─────────────────────────────────────────────────────────────
@@ -506,6 +534,7 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   selected.clear();
   regionMeshes.forEach(m => {
     m.userData.selected = false;
+    m.userData.rawActivity = undefined;
     m.scale.setScalar(0.65 + m.userData.activity * 0.60);
   });
   document.getElementById('sel-count').textContent = '0';
@@ -519,6 +548,7 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   updateFrameLabel();
   document.getElementById('modality-toggle').style.display = 'none';
   document.getElementById('frame-info').textContent = connected ? '实时数据' : '演示模式';
+  setModalityBadge(null);
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "get_state" }));
   }
@@ -528,7 +558,7 @@ document.getElementById('btn-mod-fmri').addEventListener('click', () => {
   if (framesFmri.length === 0) return;
   activeModality = 'fmri';
   _applyModalityButtonStyles();
-  loadFrameSeq(framesFmri, null);
+  loadFrameSeq(framesFmri, null, 'fMRI');
   _updateModalityInfo();
 });
 
@@ -536,7 +566,7 @@ document.getElementById('btn-mod-eeg').addEventListener('click', () => {
   if (framesEeg.length === 0) return;
   activeModality = 'eeg';
   _applyModalityButtonStyles();
-  loadFrameSeq(framesEeg, null);
+  loadFrameSeq(framesEeg, null, 'EEG');
   _updateModalityInfo();
 });
 

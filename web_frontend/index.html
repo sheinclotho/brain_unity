@@ -131,6 +131,17 @@
     }
     #timeline-slider { flex: 1; accent-color: #7eb8ff; cursor: pointer; }
     #frame-label { font-size: 0.76rem; color: #666; min-width: 72px; text-align: right; flex-shrink: 0; }
+    #modality-badge {
+      display: none;
+      font-size: 0.72rem;
+      color: #7eb8ff;
+      background: rgba(126,184,255,0.12);
+      border: 1px solid rgba(126,184,255,0.3);
+      border-radius: 4px;
+      padding: 2px 7px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
     /* Tooltip */
     #tooltip {
       position: absolute; pointer-events: none;
@@ -255,6 +266,7 @@
 <div id="timeline-bar">
   <button id="btn-play" title="播放 / 暂停">▶</button>
   <input type="range" id="timeline-slider" min="0" max="0" value="0" />
+  <span id="modality-badge"></span>
   <span id="frame-label">—</span>
 </div>
 
