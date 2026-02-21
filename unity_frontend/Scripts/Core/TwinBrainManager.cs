@@ -45,6 +45,14 @@ namespace TwinBrain
         private float[] _activity = new float[BrainRegionPositions.N_REGIONS];
         private float   _demoTick;
 
+        // ── Modality cache ────────────────────────────────────────────────────
+        /// <summary>Cached fMRI frame sequence from the last cache_loaded message.</summary>
+        public ActivityFrame[] CachedFmriFrames { get; private set; }
+        /// <summary>Cached EEG frame sequence from the last cache_loaded message.</summary>
+        public ActivityFrame[] CachedEegFrames  { get; private set; }
+        /// <summary>Available modalities in the last loaded cache (e.g. "fmri", "eeg").</summary>
+        public string[]        AvailableModalities { get; private set; } = new string[0];
+
         // ── Events ────────────────────────────────────────────────────────────
         public delegate void RegionClickedDelegate(int regionId);
         public static event RegionClickedDelegate OnRegionClicked;
@@ -63,7 +71,7 @@ namespace TwinBrain
 
             // Wire WebSocket events
             _ws.OnBrainState    += ApplyActivity;
-            _ws.OnFrameSequence += seq => _timeline.Load(seq, this);
+            _ws.OnFrameSequence += OnFrameSequenceReceived;
             _ws.OnConnected     += () => Debug.Log("[BrainManager] WS connected");
             _ws.OnDisconnected  += () => Debug.Log("[BrainManager] WS disconnected");
 
@@ -122,7 +130,45 @@ namespace TwinBrain
             ApplyActivity(_activity);
         }
 
+        /// <summary>
+        /// Switch the timeline to display a specific modality ("fmri" or "eeg").
+        /// Uses the frames cached from the last cache_loaded server response.
+        /// </summary>
+        public void SwitchModality(string modality)
+        {
+            ActivityFrame[] frames = null;
+            if (modality == "fmri" && CachedFmriFrames != null && CachedFmriFrames.Length > 0)
+                frames = CachedFmriFrames;
+            else if (modality == "eeg" && CachedEegFrames != null && CachedEegFrames.Length > 0)
+                frames = CachedEegFrames;
+
+            if (frames != null)
+            {
+                _timeline.Load(frames, this);
+                Debug.Log($"[BrainManager] Switched to modality: {modality} ({frames.Length} frames)");
+            }
+            else
+            {
+                Debug.LogWarning($"[BrainManager] Modality '{modality}' not available in current cache.");
+            }
+        }
+
         // ── Private helpers ───────────────────────────────────────────────────
+
+        private void OnFrameSequenceReceived(FrameSequenceMessage msg)
+        {
+            // Store per-modality caches when available (cache_loaded messages)
+            if (msg.frames_fmri != null && msg.frames_fmri.Length > 0)
+                CachedFmriFrames = msg.frames_fmri;
+            if (msg.frames_eeg  != null && msg.frames_eeg.Length  > 0)
+                CachedEegFrames  = msg.frames_eeg;
+            if (msg.modalities  != null)
+                AvailableModalities = msg.modalities;
+
+            // Load the primary frames into the timeline as before
+            if (msg.frames != null && msg.frames.Length > 0)
+                _timeline.Load(msg.frames, this);
+        }
 
         private void SpawnBrainRegions()
         {
