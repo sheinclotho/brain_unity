@@ -92,6 +92,16 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 - **Lesson**: Default host changed from `0.0.0.0` to `127.0.0.1` (localhost only).
 - **Rule**: Network services must default to localhost. Users who need remote access can reconfigure.
 
+### [2026-02-21] 刺激协议不匹配反模式
+- **问题**: 前端 `app.js` 发送扁平刺激参数 `{type:"simulate", target_regions:[...], amplitude, ...}`，而 `handle_simulate` 用 `request.get("stimulation", {})` 取嵌套字典，导致所有参数静默丢失，刺激功能完全失效。
+- **修复**: `handle_simulate` 改为：若 `request["stimulation"]` 存在且为 dict 则取嵌套格式（旧版兼容），否则直接使用 `request` 作为参数来源（新版扁平格式）。
+- **规则**: 消息协议任何一侧改动时，必须同时更新 AGENTS.md 的"协议文档"部分，并验证另一侧不受影响。
+
+### [2026-02-21] EEG 通道数 ≠ 200 脑区，不能直接映射
+- **问题**: EEG 数据通常为 64/128/256 通道（电极数），而可视化有 200 个脑区节点。原 `_extract_time_series` 只找 `fmri.x_seq`，加载 `eeg_data.pt`（仅 EEG 节点）时返回空帧。
+- **修复**: 增加 EEG 回退路径：若无 fMRI 节点，则取 `eeg.x_seq`，用 `np.interp(linspace(0,1,200), linspace(0,1,N_eeg), values)` 线性插值到 200 槽位，再做百分位归一化。
+- **规则**: 任何从 HeteroData 提取活动值的函数必须同时处理 fMRI（直接映射）和 EEG（插值到 200）两种情况，并在注释中说明映射策略。
+
 ---
 
-*Last updated: 2026-02-20*
+*Last updated: 2026-02-21*

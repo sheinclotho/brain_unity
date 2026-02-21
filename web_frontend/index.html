@@ -196,9 +196,12 @@
 
     <div class="card">
       <h3>加载缓存数据</h3>
-      <p style="font-size:0.75rem;color:#555;margin-bottom:7px">支持 hetero_graphs.pt / eeg_data.pt</p>
+      <p style="font-size:0.75rem;color:#555;margin-bottom:7px">
+        支持任意训练生成的 <code>.pt</code> 文件<br/>
+        fMRI（200区域）直接映射；EEG（任意通道数）自动插值到200槽位
+      </p>
       <input type="text" id="cache-path" placeholder="文件路径（空 = 自动检测）" />
-      <button id="btn-load" class="btn-success">�� 加载 .pt 文件</button>
+      <button id="btn-load" class="btn-success">📂 加载 .pt 文件</button>
     </div>
 
     <div class="card">

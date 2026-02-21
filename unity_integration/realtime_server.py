@@ -366,16 +366,16 @@ class BrainVisualizationServer:
         
         Automatically saves stimulation results to output_dir/stimulation/
         for Unity to auto-load.
+
+        Accepts both formats:
+          - Flat:   {type, target_regions, amplitude, pattern, frequency, duration}
+          - Nested: {type, stimulation: {target_regions, amplitude, ...}}
         """
-        stimulation = request.get("stimulation", {})
-        
-        # Input validation
-        if not stimulation or not isinstance(stimulation, dict):
-            return {
-                "type": "error",
-                "success": False,
-                "message": "Invalid stimulation parameters"
-            }
+        # Accept both nested (legacy) and flat (web frontend) parameter layouts
+        if "stimulation" in request and isinstance(request["stimulation"], dict):
+            stimulation = request["stimulation"]
+        else:
+            stimulation = request  # flat format sent by web frontend
         
         try:
             import torch
@@ -415,8 +415,6 @@ class BrainVisualizationServer:
             if len(valid_regions) < len(target_regions):
                 self.logger.warning(f"Filtered {len(target_regions) - len(valid_regions)} invalid region IDs")
                 target_regions = valid_regions
-            
-            n_steps = 50
             
             # Create timestamped output directory for this stimulation
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -477,153 +475,22 @@ class BrainVisualizationServer:
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
                 }
-            from .stimulation_simulator import StimulationConfig
-            
-            # Create stimulation config
-            stim_config = StimulationConfig(
+            # Demo simulation: realistic network-oscillation baseline + stimulation dynamics.
+            # This path is used when no trained model is available.
+            frames = self._demo_simulate(
                 target_regions=target_regions,
                 amplitude=amplitude,
-                duration=duration,
                 pattern=pattern,
-                frequency=frequency
+                frequency=frequency,
+                duration=duration,
+                n_regions=n_regions,
             )
-            
-            # Generate initial state
-            initial_state = torch.randn(n_regions, 1, 1)
-            
-            # Simulate response
-            if self.simulator:
-                trajectory, metrics = self.simulator.simulate_response(
-                    initial_state=initial_state,
-                    config=stim_config,
-                    n_steps=n_steps
-                )
-                
-                # Export trajectory as sequence with auto-save
-                responses = []
-                for t, state in enumerate(trajectory):
-                    if len(state.shape) == 2:
-                        state = state.unsqueeze(1)
-                    
-                    brain_activity = {'fmri': state}
-                    
-                    # Add stimulation info if active
-                    stim_info = None
-                    if metrics[t].get('stimulation_active', False):
-                        stim_info = {
-                            "active": True,
-                            "target_regions": target_regions,
-                            "amplitude": amplitude,
-                            "pattern": pattern
-                        }
-                    
-                    if self.exporter:
-                        brain_state = self.exporter.export_brain_state(
-                            brain_activity=brain_activity,
-                            time_point=t,
-                            time_second=float(t),
-                            subject_id="simulation",
-                            stimulation=stim_info
-                        )
-                        responses.append(brain_state)
-                        
-                        # Auto-save to file
-                        json_path = stim_output_dir / f"frame_{t:04d}.json"
-                        with open(json_path, 'w', encoding='utf-8') as f:
-                            json.dump(brain_state, f, indent=2)
-                
-                # Create sequence index
-                index_data = {
-                    "type": "stimulation_sequence",
-                    "timestamp": timestamp,
-                    "stimulation_params": {
-                        "target_regions": target_regions,
-                        "amplitude": amplitude,
-                        "pattern": pattern,
-                        "frequency": frequency,
-                        "duration": duration
-                    },
-                    "n_frames": len(responses),
-                    "output_dir": str(stim_output_dir),
-                    "files": [f"frame_{i:04d}.json" for i in range(len(responses))],
-                    "metrics": metrics
-                }
-                index_path = stim_output_dir / "sequence_index.json"
-                with open(index_path, 'w', encoding='utf-8') as f:
-                    json.dump(index_data, f, indent=2)
-                
-                self.logger.info(f"✓ Stimulation results auto-saved to: {stim_output_dir}")
-                
-                frames = [{"activity": self._extract_activity_array(r)} for r in responses]
-                return {
-                    "type": "simulation_result",
-                    "success": True,
-                    "n_frames": len(frames),
-                    "frames": frames,
-                    "saved_to": str(stim_output_dir),
-                    "index_file": str(index_path),
-                }
-            else:
-                # Simple simulation without simulator
-                responses = []
-                for t in range(n_steps):
-                    # Enhanced activity in target regions
-                    fmri_data = torch.randn(n_regions, 1, 1)
-                    for region_id in target_regions:
-                        if region_id < n_regions:
-                            fmri_data[region_id] += amplitude * np.sin(2 * np.pi * frequency * t / n_steps)
-                    
-                    brain_activity = {'fmri': fmri_data}
-                    stim_info = {
-                        "active": t < duration,
-                        "target_regions": target_regions,
-                        "amplitude": amplitude
-                    }
-                    
-                    if self.exporter:
-                        brain_state = self.exporter.export_brain_state(
-                            brain_activity=brain_activity,
-                            time_point=t,
-                            subject_id="simulation",
-                            stimulation=stim_info
-                        )
-                        responses.append(brain_state)
-                        
-                        # Auto-save to file
-                        json_path = stim_output_dir / f"frame_{t:04d}.json"
-                        with open(json_path, 'w', encoding='utf-8') as f:
-                            json.dump(brain_state, f, indent=2)
-                
-                # Create sequence index
-                index_data = {
-                    "type": "stimulation_sequence",
-                    "timestamp": timestamp,
-                    "stimulation_params": {
-                        "target_regions": target_regions,
-                        "amplitude": amplitude,
-                        "pattern": pattern,
-                        "frequency": frequency,
-                        "duration": duration
-                    },
-                    "n_frames": len(responses),
-                    "output_dir": str(stim_output_dir),
-                    "files": [f"frame_{i:04d}.json" for i in range(len(responses))]
-                }
-                index_path = stim_output_dir / "sequence_index.json"
-                with open(index_path, 'w', encoding='utf-8') as f:
-                    json.dump(index_data, f, indent=2)
-                
-                self.logger.info(f"✓ Stimulation results auto-saved to: {stim_output_dir}")
-                
-                frames = [{"activity": self._extract_activity_array(r)} for r in responses]
-                return {
-                    "type": "simulation_result",
-                    "success": True,
-                    "n_frames": len(frames),
-                    "frames": frames,
-                    "saved_to": str(stim_output_dir),
-                    "index_file": str(index_path),
-                }
+            return {
+                "type": "simulation_result",
+                "success": True,
+                "n_frames": len(frames),
+                "frames": frames,
+            }
                 
         except Exception as e:
             self.logger.error(f"Error in simulation: {e}")
@@ -632,6 +499,133 @@ class BrainVisualizationServer:
                 "message": f"Simulation failed: {str(e)}"
             }
     
+    # ------------------------------------------------------------------ #
+    #  Demo stimulation simulation (no trained model required)             #
+    # ------------------------------------------------------------------ #
+
+    def _demo_simulate(
+        self,
+        target_regions: list,
+        amplitude: float,
+        pattern: str,
+        frequency: float,
+        duration: int,
+        n_regions: int = 200,
+    ) -> list:
+        """Generate a realistic stimulation animation without a trained model.
+
+        Returns a list of {"activity": [200 floats]} frames showing:
+          1. Pre-stim baseline  (10 frames)
+          2. Stimulation active (``duration`` frames, capped at 60)
+          3. Post-stim recovery (10 frames)
+
+        The baseline uses the same 7-network sinusoidal model as
+        ``handle_get_state`` so the stimulation starts from a plausible state.
+        Spatial spread is approximated via a Gaussian kernel over the
+        Fibonacci-sphere positions baked into the visualisation (same formula
+        as ``makeBrainPositions`` in app.js).
+        """
+        import numpy as np
+        import time
+
+        # Gaussian spatial spread sigma (mm). ~30 mm ≈ typical tDCS/TMS spread
+        # radius observed in neuroimaging studies; keeps neighbouring regions
+        # within the same cortical network correlated.
+        _SPREAD_SIGMA_MM = 30.0
+        # Cap stimulation frames to keep the WebSocket payload manageable.
+        _MAX_STIM_FRAMES = 60
+
+        # ── Reproduce the brain-region positions from app.js ──────────────
+        def _brain_positions():
+            daz = 2 * np.pi * (2 - (1 + np.sqrt(5)) / 2)
+            pos = []
+            for h in range(2):
+                sign = -1 if h == 0 else 1
+                for i in range(100):
+                    t_ = (i + 0.5) / 100.0
+                    el = 1.0 - 1.85 * t_
+                    r  = np.sqrt(max(0.0, 1 - el * el))
+                    az = daz * i
+                    ux = r * np.cos(az)
+                    uz = r * np.sin(az)
+                    lat = abs(ux) * 0.85 + 0.15
+                    bulge = 9 * np.exp(-((el + 0.22) ** 2) * 5)
+                    pos.append([
+                        sign * (lat * 55 + bulge + 9),
+                        el * 63 - 4,
+                        uz * 76 - 8,
+                    ])
+            return np.array(pos, dtype=np.float32)
+
+        positions = _brain_positions()  # (200, 3)
+
+        # ── Pre-compute Gaussian spatial-spread weights ────────────────────
+        spread_weights = np.zeros(n_regions, dtype=np.float32)
+        for tid in target_regions:
+            if 0 <= tid < n_regions:
+                d = np.linalg.norm(positions - positions[tid], axis=1)
+                spread_weights += np.exp(-(d ** 2) / (2 * _SPREAD_SIGMA_MM ** 2))
+        # Normalise: peak = amplitude at target, falls off with distance
+        if spread_weights.max() > 0:
+            spread_weights /= spread_weights.max()
+
+        # ── 7-network baseline oscillation (matches app.js demoUpdate) ────
+        net_freqs  = [0.012, 0.020, 0.035, 0.028, 0.008, 0.025, 0.010]
+        net_phases = [0.0,   1.0,   2.1,   0.7,   3.2,   1.8,   0.4  ]
+        net_size   = n_regions // 7
+        t0         = time.time()
+
+        def _baseline(tick: float) -> np.ndarray:
+            act = np.empty(n_regions, dtype=np.float32)
+            for i in range(n_regions):
+                n_ = min(i // net_size, 6)
+                v  = 0.36 + 0.22 * np.sin(net_freqs[n_] * tick + net_phases[n_] + i * 0.08)
+                v += 0.04 * np.sin(0.003 * tick + i * 0.25)
+                act[i] = float(np.clip(v, 0.0, 1.0))
+            return act
+
+        # ── Stimulation pattern function ───────────────────────────────────
+        def _stim_amp(relative_t: int) -> float:
+            if pattern == "sine":
+                return amplitude * np.sin(2 * np.pi * frequency * relative_t / 10.0)
+            elif pattern == "pulse":
+                return amplitude if relative_t == 0 else 0.0
+            elif pattern == "ramp":
+                return amplitude * min(relative_t / max(duration, 1), 1.0)
+            else:  # constant / unknown
+                return amplitude
+
+        PRE  = 10
+        DUR  = min(int(duration), _MAX_STIM_FRAMES)
+        POST = 10
+        frames = []
+
+        # 1. Pre-stim baseline
+        for k in range(PRE):
+            tick = t0 * 200 + k * 4
+            act = _baseline(tick)
+            frames.append({"activity": act.tolist()})
+
+        # 2. Stimulation active
+        for k in range(DUR):
+            tick = t0 * 200 + (PRE + k) * 4
+            act  = _baseline(tick)
+            amp  = _stim_amp(k)
+            if amp != 0.0:
+                act = np.clip(act + amp * spread_weights, 0.0, 1.0)
+            frames.append({"activity": act.tolist()})
+
+        # 3. Post-stim recovery (exponential decay of residual excitation)
+        post_baseline = _baseline(t0 * 200 + (PRE + DUR) * 4)
+        last_stim_act = np.array(frames[-1]["activity"], dtype=np.float32)
+        for k in range(POST):
+            decay = np.exp(-k / 4.0)
+            act   = post_baseline + (last_stim_act - post_baseline) * decay
+            act   = np.clip(act, 0.0, 1.0)
+            frames.append({"activity": act.tolist()})
+
+        return frames
+
     async def handle_convert_cache(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """
         Handle cache to JSON conversion request.
@@ -839,9 +833,13 @@ class BrainVisualizationServer:
     def _extract_time_series(self, data) -> list:
         """Extract per-time-point activity frames from a cache .pt object.
 
-        Looks for ``fmri.x_seq`` (shape N×T×F) inside the first HeteroData
-        found in *data*, then returns T dicts each containing a normalised
-        activity list of length 200.
+        Strategy (in order of preference):
+          1. ``fmri.x_seq`` (shape N×T×F, N == 200 ROIs) → direct 1-to-1 mapping.
+          2. ``eeg.x_seq``  (shape N_eeg×T×F, N_eeg ≠ 200) → linear interpolation
+             to 200 visualisation slots using np.interp.
+
+        All activity values are normalised to [0, 1] via global 5th/95th
+        percentile clipping (robust to outliers in both modalities).
         """
         import numpy as np
 
@@ -851,31 +849,47 @@ class BrainVisualizationServer:
 
         n_regions = 200
         frames    = []
-        try:
-            if "fmri" not in graph.node_types:
-                return []
-            node  = graph["fmri"]
-            x_seq = getattr(node, "x_seq", None)
-            if x_seq is None:
-                return []
 
+        def _frames_from_xseq(x_seq, n_out: int) -> list:
+            """Shared normalise + resample logic for any x_seq tensor."""
             x = x_seq.cpu().float()
             if x.ndim == 2:
                 x = x.unsqueeze(-1)      # (N, T) → (N, T, 1)
             N, T, _ = x.shape
-
-            # Global percentile normalisation (robust to outliers)
-            flat = x[:, :, 0].numpy().ravel()
+            flat  = x[:, :, 0].numpy().ravel()
             p5, p95 = np.percentile(flat, 5), np.percentile(flat, 95)
             scale   = max(p95 - p5, 1e-6)
-
+            result  = []
             for t in range(T):
                 sig  = x[:, t, 0].numpy()
-                norm = np.clip((sig - p5) / scale, 0, 1)
-                arr  = np.full(n_regions, 0.5, dtype=np.float32)
-                n    = min(N, n_regions)
-                arr[:n] = norm[:n]
-                frames.append({"activity": arr.tolist()})
+                norm = np.clip((sig - p5) / scale, 0.0, 1.0)
+                if N == n_out:
+                    arr = norm.astype(np.float32)
+                else:
+                    # Linearly interpolate N channels → n_out visualisation slots
+                    src_idx = np.linspace(0.0, 1.0, N)
+                    dst_idx = np.linspace(0.0, 1.0, n_out)
+                    arr = np.interp(dst_idx, src_idx, norm).astype(np.float32)
+                result.append({"activity": arr.tolist()})
+            return result
+
+        try:
+            # ── Prefer fMRI (200 ROIs → direct mapping) ───────────────────
+            if "fmri" in graph.node_types:
+                node  = graph["fmri"]
+                x_seq = getattr(node, "x_seq", None)
+                if x_seq is not None:
+                    frames = _frames_from_xseq(x_seq, n_regions)
+
+            # ── Fall back to EEG (N_eeg channels → interpolated) ──────────
+            if not frames and "eeg" in graph.node_types:
+                node  = graph["eeg"]
+                x_seq = getattr(node, "x_seq", None)
+                if x_seq is None:
+                    x_seq = getattr(node, "x", None)
+                if x_seq is not None:
+                    frames = _frames_from_xseq(x_seq, n_regions)
+
         except Exception as exc:
             self.logger.error(f"_extract_time_series error: {exc}")
 
