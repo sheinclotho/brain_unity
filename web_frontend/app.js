@@ -23,7 +23,10 @@ let ws         = null;
 let connected  = false;
 let demoTick   = 0;
 let selected   = new Set();
-let frameSeq   = [];      // [{activity:[…200 floats…]}, …]
+let frameSeq   = [];      // [{activity:[…200 floats…]}, …]  — currently displayed
+let framesFmri = [];      // fMRI-specific frames (from cache)
+let framesEeg  = [];      // EEG-specific frames  (from cache)
+let activeModality = 'fmri';  // 'fmri' | 'eeg'
 let curFrame   = 0;
 let isPlaying  = false;
 let playTimer  = null;
@@ -322,7 +325,22 @@ function handleMsg(msg) {
   // Multi-frame sequence (stimulation result or cache data)
   if ((msg.type === 'simulation_result' || msg.type === 'cache_loaded')
       && Array.isArray(msg.frames) && msg.frames.length > 0) {
-    loadFrameSeq(msg.frames, msg.path || null);
+    // Store per-modality frames when the server provides them
+    if (Array.isArray(msg.frames_fmri) && msg.frames_fmri.length > 0) {
+      framesFmri = msg.frames_fmri;
+    } else {
+      framesFmri = [];
+    }
+    if (Array.isArray(msg.frames_eeg) && msg.frames_eeg.length > 0) {
+      framesEeg = msg.frames_eeg;
+    } else {
+      framesEeg = [];
+    }
+    // Show/configure modality toggle
+    updateModalityToggle(msg.modalities || []);
+    // Pick the active modality's frames (fall back to primary frames)
+    const modFrames = _getModalityFrames();
+    loadFrameSeq(modFrames.length > 0 ? modFrames : msg.frames, msg.path || null);
     return;
   }
   // EC inference result
@@ -343,6 +361,48 @@ function handleMsg(msg) {
       ecStatus.textContent = `⚠ ${msg.message}`;
     }
   }
+}
+
+// ── Modality toggle (fMRI / EEG) ──────────────────────────────────────────────
+function _getModalityFrames() {
+  if (activeModality === 'eeg' && framesEeg.length > 0) return framesEeg;
+  if (framesFmri.length > 0) return framesFmri;
+  return framesEeg.length > 0 ? framesEeg : [];
+}
+
+function _updateModalityInfo() {
+  const labels = [];
+  if (framesFmri.length > 0) labels.push(`fMRI ${framesFmri.length}帧`);
+  if (framesEeg.length  > 0) labels.push(`EEG ${framesEeg.length}帧`);
+  document.getElementById('modality-info').textContent = labels.join(' · ');
+}
+
+function updateModalityToggle(modalities) {
+  const toggle   = document.getElementById('modality-toggle');
+  const btnFmri  = document.getElementById('btn-mod-fmri');
+  const btnEeg   = document.getElementById('btn-mod-eeg');
+  const hasFmri  = modalities.includes('fmri');
+  const hasEeg   = modalities.includes('eeg');
+
+  if (hasFmri || hasEeg) {
+    toggle.style.display = '';
+    btnFmri.disabled = !hasFmri;
+    btnEeg.disabled  = !hasEeg;
+    // Keep active modality if still available, else fall back to first available
+    if (activeModality === 'eeg' && !hasEeg) activeModality = 'fmri';
+    if (activeModality === 'fmri' && !hasFmri) activeModality = 'eeg';
+    _applyModalityButtonStyles();
+    _updateModalityInfo();
+  } else {
+    toggle.style.display = 'none';
+  }
+}
+
+function _applyModalityButtonStyles() {
+  const btnFmri = document.getElementById('btn-mod-fmri');
+  const btnEeg  = document.getElementById('btn-mod-eeg');
+  btnFmri.className = activeModality === 'fmri' ? 'btn-primary' : 'btn-secondary';
+  btnEeg.className  = activeModality === 'eeg'  ? 'btn-primary' : 'btn-secondary';
 }
 
 function setStatus(ok) {
@@ -451,14 +511,33 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   document.getElementById('sel-count').textContent = '0';
   pauseSeq();
   frameSeq  = [];
+  framesFmri = [];
+  framesEeg  = [];
   curFrame  = 0;
   slider.max = 0;
   slider.value = 0;
   updateFrameLabel();
+  document.getElementById('modality-toggle').style.display = 'none';
   document.getElementById('frame-info').textContent = connected ? '实时数据' : '演示模式';
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "get_state" }));
   }
+});
+
+document.getElementById('btn-mod-fmri').addEventListener('click', () => {
+  if (framesFmri.length === 0) return;
+  activeModality = 'fmri';
+  _applyModalityButtonStyles();
+  loadFrameSeq(framesFmri, null);
+  _updateModalityInfo();
+});
+
+document.getElementById('btn-mod-eeg').addEventListener('click', () => {
+  if (framesEeg.length === 0) return;
+  activeModality = 'eeg';
+  _applyModalityButtonStyles();
+  loadFrameSeq(framesEeg, null);
+  _updateModalityInfo();
 });
 
 document.getElementById('btn-load').addEventListener('click', () => {

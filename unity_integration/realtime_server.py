@@ -906,10 +906,12 @@ class BrainVisualizationServer:
 
         Response:
           { "type": "cache_loaded", "path": "…", "n_frames": N,
-            "frames": [{"activity": [200 floats]}, …] }
+            "frames": [{"activity": [200 floats]}, …],
+            "frames_fmri": [...] or null,
+            "frames_eeg":  [...] or null,
+            "modalities":  ["fmri"] | ["eeg"] | ["fmri","eeg"] }
         """
         import torch
-        import numpy as np
 
         raw_path = request.get("path")
         cache_path = Path(raw_path) if raw_path else self._find_cache_file()
@@ -925,17 +927,29 @@ class BrainVisualizationServer:
         except Exception as exc:
             return {"type": "error", "message": f"文件加载失败: {exc}"}
 
-        frames = self._extract_time_series(data)
-        if not frames:
+        both = self._extract_time_series_both(data)
+        frames_fmri = both.get("fmri", [])
+        frames_eeg  = both.get("eeg", [])
+        modalities  = both.get("modalities", [])
+
+        # Primary frames: prefer fMRI, fall back to EEG
+        primary = frames_fmri if frames_fmri else frames_eeg
+        if not primary:
             return {"type": "error", "message": "无法从文件中提取脑区时间序列"}
 
-        self.logger.info(f"✓ 缓存加载完成: {cache_path} → {len(frames)} 帧")
+        self.logger.info(
+            f"✓ 缓存加载完成: {cache_path} → {len(primary)} 帧 "
+            f"(模态: {modalities})"
+        )
         return {
-            "type":     "cache_loaded",
-            "path":     str(cache_path),
-            "n_frames": len(frames),
-            "frames":   frames,
-            "success":  True,
+            "type":        "cache_loaded",
+            "path":        str(cache_path),
+            "n_frames":    len(primary),
+            "frames":      primary,           # backward-compat: primary modality
+            "frames_fmri": frames_fmri or None,
+            "frames_eeg":  frames_eeg  or None,
+            "modalities":  modalities,
+            "success":     True,
         }
 
     def _find_cache_file(self) -> Optional[Path]:
@@ -978,17 +992,35 @@ class BrainVisualizationServer:
         All activity values are normalised to [0, 1] via global 5th/95th
         percentile clipping (robust to outliers in both modalities).
         """
+        both = self._extract_time_series_both(data)
+        primary = both.get("fmri") or both.get("eeg") or []
+        return primary
+
+    def _extract_time_series_both(self, data) -> dict:
+        """Extract fMRI and EEG frame sequences from a cache .pt object.
+
+        Returns a dict with keys:
+          fmri       – list of {"activity": [200 floats]} or [] if unavailable
+          eeg        – list of {"activity": [200 floats]} or [] if unavailable
+          modalities – list of available modality names, e.g. ["fmri","eeg"]
+
+        Normalisation strategy:
+          fMRI: global 5th/95th-percentile across all time + channels → preserves
+                absolute activity level relationships between frames.
+          EEG:  per-frame min-max → shows relative spatial variation at each
+                instant (EEG temporal variance dominates spatial variance, so
+                global normalisation makes all channels appear the same colour).
+        """
         import numpy as np
 
         graph = self._find_hetero_data(data)
         if graph is None:
-            return []
+            return {"fmri": [], "eeg": [], "modalities": []}
 
         n_regions = 200
-        frames    = []
 
         def _frames_from_xseq(x_seq, n_out: int) -> list:
-            """Shared normalise + resample logic for any x_seq tensor."""
+            """Global percentile normalisation for fMRI."""
             x = x_seq.cpu().float()
             if x.ndim == 2:
                 x = x.unsqueeze(-1)      # (N, T) → (N, T, 1)
@@ -1010,27 +1042,55 @@ class BrainVisualizationServer:
                 result.append({"activity": arr.tolist()})
             return result
 
+        def _frames_from_xseq_eeg(x_seq, n_out: int) -> list:
+            """Per-frame min-max normalisation for EEG.
+
+            EEG temporal variance >> spatial variance, so global normalisation
+            collapses all channels to the same colour at any given instant.
+            Per-frame normalisation exposes the relative spatial distribution.
+            """
+            x = x_seq.cpu().float()
+            if x.ndim == 2:
+                x = x.unsqueeze(-1)      # (N, T) → (N, T, 1)
+            N, T, _ = x.shape
+            result = []
+            for t in range(T):
+                sig = x[:, t, 0].numpy()
+                sig_min, sig_max = float(sig.min()), float(sig.max())
+                scale = max(sig_max - sig_min, 1e-6)
+                norm = np.clip((sig - sig_min) / scale, 0.0, 1.0)
+                if N == n_out:
+                    arr = norm.astype(np.float32)
+                else:
+                    src_idx = np.linspace(0.0, 1.0, N)
+                    dst_idx = np.linspace(0.0, 1.0, n_out)
+                    arr = np.interp(dst_idx, src_idx, norm).astype(np.float32)
+                result.append({"activity": arr.tolist()})
+            return result
+
+        frames_fmri: list = []
+        frames_eeg:  list = []
+
         try:
-            # ── Prefer fMRI (200 ROIs → direct mapping) ───────────────────
             if "fmri" in graph.node_types:
                 node  = graph["fmri"]
                 x_seq = getattr(node, "x_seq", None)
                 if x_seq is not None:
-                    frames = _frames_from_xseq(x_seq, n_regions)
+                    frames_fmri = _frames_from_xseq(x_seq, n_regions)
 
-            # ── Fall back to EEG (N_eeg channels → interpolated) ──────────
-            if not frames and "eeg" in graph.node_types:
+            if "eeg" in graph.node_types:
                 node  = graph["eeg"]
                 x_seq = getattr(node, "x_seq", None)
                 if x_seq is None:
                     x_seq = getattr(node, "x", None)
                 if x_seq is not None:
-                    frames = _frames_from_xseq(x_seq, n_regions)
+                    frames_eeg = _frames_from_xseq_eeg(x_seq, n_regions)
 
         except Exception as exc:
-            self.logger.error(f"_extract_time_series error: {exc}")
+            self.logger.error(f"_extract_time_series_both error: {exc}")
 
-        return frames
+        modalities = (["fmri"] if frames_fmri else []) + (["eeg"] if frames_eeg else [])
+        return {"fmri": frames_fmri, "eeg": frames_eeg, "modalities": modalities}
 
     def _extract_activity_array(self, result: Dict) -> list:
         """Extract a flat [0,1] activity list from various result-dict formats.

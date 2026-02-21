@@ -202,6 +202,14 @@
       </p>
       <input type="text" id="cache-path" placeholder="文件路径（空 = 自动检测）" />
       <button id="btn-load" class="btn-success">📂 加载 .pt 文件</button>
+      <div id="modality-toggle" style="display:none;margin-top:8px">
+        <p style="font-size:0.73rem;color:#666;margin-bottom:5px">显示模态：</p>
+        <div style="display:flex;gap:6px">
+          <button id="btn-mod-fmri" class="btn-primary" style="flex:1;padding:5px">fMRI</button>
+          <button id="btn-mod-eeg"  class="btn-secondary" style="flex:1;padding:5px">EEG</button>
+        </div>
+        <p id="modality-info" style="font-size:0.72rem;color:#666;margin-top:4px"></p>
+      </div>
     </div>
 
     <div class="card">

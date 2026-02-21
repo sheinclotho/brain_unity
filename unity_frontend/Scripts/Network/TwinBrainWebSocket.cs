@@ -41,12 +41,12 @@ namespace TwinBrain
         public float reconnectDelay = 3f;
 
         // ── Events (thread-safe – dispatched on main thread via queue) ──────
-        public event Action                  OnConnected;
-        public event Action                  OnDisconnected;
-        public event Action<string>          OnError;
-        public event Action<float[]>         OnBrainState;       // single-frame activity
-        public event Action<ActivityFrame[]> OnFrameSequence;    // multi-frame sequence
-        public event Action<string>          OnServerVersion;
+        public event Action                        OnConnected;
+        public event Action                        OnDisconnected;
+        public event Action<string>                OnError;
+        public event Action<float[]>               OnBrainState;        // single-frame activity
+        public event Action<FrameSequenceMessage>  OnFrameSequence;     // multi-frame sequence
+        public event Action<string>                OnServerVersion;
 
         // ── State ────────────────────────────────────────────────────────────
         public bool IsConnected => _ws != null && _ws.State == WebSocketState.Open;
@@ -190,7 +190,7 @@ namespace TwinBrain
                 case "cache_loaded":
                     var seq = JsonUtility.FromJson<FrameSequenceMessage>(json);
                     if (seq.frames != null && seq.frames.Length > 0)
-                        OnFrameSequence?.Invoke(seq.frames);
+                        OnFrameSequence?.Invoke(seq);
                     break;
 
                 case "error":

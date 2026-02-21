@@ -61,6 +61,7 @@ namespace TwinBrain
     /// <summary>
     /// simulate → simulation_result / load_cache → cache_loaded:
     /// contains a sequence of frames, each with a flat activity array.
+    /// When loading a cache, may also contain per-modality frame lists.
     /// </summary>
     [Serializable]
     public class FrameSequenceMessage
@@ -70,6 +71,10 @@ namespace TwinBrain
         public int           n_frames;
         public string        path;
         public ActivityFrame[] frames;
+        // Multi-modality fields (cache_loaded only; null when unavailable)
+        public ActivityFrame[] frames_fmri;
+        public ActivityFrame[] frames_eeg;
+        public string[]        modalities;  // e.g. ["fmri","eeg"]
     }
 
     [Serializable]
