@@ -928,8 +928,8 @@ class BrainVisualizationServer:
             return {"type": "error", "message": f"文件加载失败: {exc}"}
 
         both = self._extract_time_series_both(data)
-        frames_fmri = both.get("fmri") or []
-        frames_eeg  = both.get("eeg")  or []
+        frames_fmri = both.get("fmri", [])
+        frames_eeg  = both.get("eeg", [])
         modalities  = both.get("modalities", [])
 
         # Primary frames: prefer fMRI, fall back to EEG
