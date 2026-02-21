@@ -325,6 +325,11 @@ function handleMsg(msg) {
     loadFrameSeq(msg.frames, msg.path || null);
     return;
   }
+  // EC inference result
+  if (msg.type === 'ec_result') {
+    handleECResult(msg);
+    return;
+  }
   // Server greeting
   if (msg.type === 'welcome') {
     document.getElementById('status-text').textContent =
@@ -333,6 +338,10 @@ function handleMsg(msg) {
   }
   if (msg.type === 'error') {
     console.warn('Server error:', msg.message);
+    const ecStatus = document.getElementById('ec-status');
+    if (ecStatus && ecStatus.textContent === '推断中…') {
+      ecStatus.textContent = `⚠ ${msg.message}`;
+    }
   }
 }
 
@@ -459,6 +468,171 @@ document.getElementById('btn-load').addEventListener('click', () => {
   } else {
     alert('请先连接后端服务器（运行 python start.py）');
   }
+});
+
+// ── Effective Connectivity (EC) Inference ─────────────────────────────────────
+let ecLines      = [];          // Three.js Line objects
+let ecTopSources = [];          // top-source region IDs
+let ecTopTargets = [];          // top-target region IDs
+let ecActivityDelta = null;     // (200,) predicted Δactivity from top source
+const EC_LINE_COLOR   = new THREE.Color(0xffcc44);
+const EC_SOURCE_COLOR = new THREE.Color(0xffffff);
+const EC_TARGET_COLOR = new THREE.Color(0x44ffcc);
+
+function clearECViz() {
+  ecLines.forEach(l => scene.remove(l));
+  ecLines = [];
+  regionMeshes.forEach(m => {
+    if (m.userData._ecHighlight) {
+      m.material.emissive.setRGB(
+        m.material.color.r * 0.22,
+        m.material.color.g * 0.22,
+        m.material.color.b * 0.22
+      );
+      m.userData._ecHighlight = false;
+    }
+  });
+}
+
+function drawECLines(topSources, topTargets, ecFlat, n) {
+  clearECViz();
+  if (!ecFlat) return;
+
+  // For each top source: draw lines to its 5 strongest targets
+  topSources.slice(0, 5).forEach(src => {
+    // Find top-5 targets for this source (row src of EC matrix)
+    const rowStart = src * n;
+    const row = ecFlat.slice(rowStart, rowStart + n);
+    const topT = Array.from({length: n}, (_, i) => i)
+      .sort((a, b) => Math.abs(row[b]) - Math.abs(row[a]))
+      .slice(0, 5);
+
+    topT.forEach(dst => {
+      if (dst === src) return;
+      const weight = Math.abs(row[dst]);
+      if (weight < 0.05) return;
+      const p0 = BRAIN_POS[src], p1 = BRAIN_POS[dst];
+      const pts = new Float32Array([p0.x, p0.y, p0.z, p1.x, p1.y, p1.z]);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+        color: EC_LINE_COLOR,
+        transparent: true,
+        opacity: Math.min(0.75, weight * 1.5),
+      }));
+      scene.add(line);
+      ecLines.push(line);
+    });
+
+    // Highlight source sphere
+    const srcMesh = regionMeshes[src];
+    if (srcMesh) {
+      srcMesh.material.emissive.copy(EC_SOURCE_COLOR).multiplyScalar(0.55);
+      srcMesh.userData._ecHighlight = true;
+    }
+  });
+
+  // Highlight top target spheres
+  topTargets.slice(0, 5).forEach(dst => {
+    const m = regionMeshes[dst];
+    if (m) {
+      m.material.emissive.copy(EC_TARGET_COLOR).multiplyScalar(0.45);
+      m.userData._ecHighlight = true;
+    }
+  });
+}
+
+function handleECResult(msg) {
+  const ecStatus = document.getElementById('ec-status');
+  if (!msg.ec_flat || !Array.isArray(msg.ec_flat)) {
+    ecStatus.textContent = '⚠ EC 数据格式错误';
+    return;
+  }
+  ecTopSources    = msg.top_sources   || [];
+  ecTopTargets    = msg.top_targets   || [];
+  ecActivityDelta = msg.activity_delta|| null;
+
+  const n = msg.n_regions || 200;
+  drawECLines(ecTopSources, ecTopTargets, msg.ec_flat, n);
+
+  // Show activity delta overlay
+  if (ecActivityDelta) updateActivity(ecActivityDelta);
+
+  // Enable "刺激推荐靶点" button
+  document.getElementById('btn-ec-stim').disabled = false;
+  document.getElementById('btn-hide-ec').style.display = '';
+
+  ecStatus.textContent =
+    // Region IDs are 0-indexed internally; display as 1-indexed for users
+    `✓ ${msg.method} | 最强源: 区域 ${(ecTopSources[0]||0)+1} | ` +
+    `连接线: ${ecLines.length}`;
+}
+
+document.getElementById('btn-infer-ec').addEventListener('click', () => {
+  const method = document.getElementById('ec-method').value;
+  document.getElementById('ec-status').textContent = '推断中…';
+  if (connected && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'infer_ec', method, n_lags: 5 }));
+  } else {
+    // Offline demo: generate synthetic EC client-side
+    document.getElementById('ec-status').textContent = '（离线演示，后端未连接）';
+    const n = N_REGIONS;
+    // goldenAngle: angular increment from the golden ratio for Fibonacci sphere
+    // (unused here since we use pre-computed BRAIN_POS positions directly)
+    const sigma2 = 40.0 ** 2;
+    const ecFlat = new Array(n * n).fill(0);
+    for (let i = 0; i < n; i++) {
+      const pi = BRAIN_POS[i];
+      for (let j = 0; j < n; j++) {
+        if (i === j) continue;
+        const pj = BRAIN_POS[j];
+        const d2 = (pi.x-pj.x)**2 + (pi.y-pj.y)**2 + (pi.z-pj.z)**2;
+        ecFlat[i * n + j] = Math.exp(-d2 / (2 * sigma2));
+      }
+      // Homotopic connection
+      const homo = i < 100 ? i + 100 : i - 100;
+      ecFlat[i * n + homo] = 0.55;
+    }
+    const rowSums = Array.from({length:n}, (_, i) =>
+      ecFlat.slice(i*n, i*n+n).reduce((a,b) => a+b, 0)
+    );
+    for (let i = 0; i < n; i++)
+      for (let j = 0; j < n; j++)
+        if (rowSums[i] > 0) ecFlat[i*n+j] /= rowSums[i];
+
+    const outScores = Array.from({length:n}, (_, i) =>
+      ecFlat.slice(i*n, i*n+n).reduce((a,b) => a+b, 0)
+    );
+    const inScores = Array.from({length:n}, (_, j) =>
+      Array.from({length:n}, (_, i) => ecFlat[i*n+j]).reduce((a,b)=>a+b,0)
+    );
+    const topSrc = [...Array(n).keys()].sort((a,b) => outScores[b]-outScores[a]).slice(0,10);
+    const topTgt = [...Array(n).keys()].sort((a,b) => inScores[b]-inScores[a]).slice(0,10);
+    const actDelta = Array.from({length:n}, (_, i) => ecFlat[topSrc[0]*n + i]);
+    const maxD = Math.max(...actDelta);
+    handleECResult({
+      ec_flat: ecFlat, top_sources: topSrc, top_targets: topTgt,
+      activity_delta: maxD > 0 ? actDelta.map(v => v/maxD) : actDelta,
+      n_regions: n, method: 'demo (offline)'
+    });
+  }
+});
+
+document.getElementById('btn-ec-stim').addEventListener('click', () => {
+  if (!ecTopSources.length) return;
+  // Select the top-5 source regions and trigger stimulation
+  ecTopSources.slice(0, 5).forEach(id => {
+    selected.add(id);
+    if (regionMeshes[id]) regionMeshes[id].userData.selected = true;
+  });
+  document.getElementById('sel-count').textContent = selected.size;
+  document.getElementById('btn-stim').click();
+});
+
+document.getElementById('btn-hide-ec').addEventListener('click', () => {
+  clearECViz();
+  document.getElementById('btn-hide-ec').style.display = 'none';
+  document.getElementById('ec-status').textContent = '';
 });
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
