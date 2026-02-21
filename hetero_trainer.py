@@ -550,7 +550,16 @@ class DynamicHeteroTrainer:
         if context_len <= 0:
             context_len = max(1, T - 1)
 
-        context = proj_seq[:, :context_len, :]
+        # Detach context to prevent the diamond-shaped computation graph that arises
+        # because this GRU is the SAME module used in model.forward() to produce
+        # proj_seq.  Without detach, the model's GRU appears twice in the backward
+        # graph (once via proj_seq and once via the temporal-pred call below), which
+        # causes "Trying to backward through the graph a second time" in PyTorch when
+        # the first call's saved tensors are freed before the second call's backward
+        # reaches them.  Detaching context breaks the cycle: gradients for temp_loss
+        # still flow through future_targets → proj_seq → model, while pred_feat only
+        # trains the GRU parameters directly.
+        context = proj_seq.detach()[:, :context_len, :]
         out_ctx, h = gru(context)
 
         next_input = out_ctx[:, -1:, :].contiguous()

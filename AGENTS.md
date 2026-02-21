@@ -92,6 +92,14 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 - **Lesson**: Default host changed from `0.0.0.0` to `127.0.0.1` (localhost only).
 - **Rule**: Network services must default to localhost. Users who need remote access can reconfigure.
 
+### [2026-02-21] PyTorch Diamond-Graph / Double-Backward Anti-Pattern
+- **问题**: `_temporal_prediction_loss()` 用 `self.model.grus[nt]`（model.forward 中生成 `proj_seq` 的 **同一个** GRU 模块）以 `proj_seq[:, :context_len, :]` 为 context 再次前向计算。这使同一 GRU 在计算图中出现两次（钻石形），当 PyTorch autograd 引擎在 `future_targets` 分支处理完 model GRU backward 后提前释放其 saved tensors，`pred_feat` 分支的 backward 再次到达时就会触发 `RuntimeError: Trying to backward through the graph a second time`。错误通常在第二个 epoch 才出现，因为第一个 epoch 的 CUDA workspace 布局与第二个不同。
+- **修复**: 将 `context = proj_seq[:, :context_len, :]` 改为 `context = proj_seq.detach()[:, :context_len, :]`。detach 打断了 `pred_feat → GRU → context → proj_seq → model GRU` 这条路径；梯度信号仍通过 `future_targets → proj_seq → model GRU` 正常流回主模型，训练语义不变。
+- **形状不匹配 (UserWarning)**: `F.huber_loss(recon, target)` 在 batch 维度不一致（如 `[1,190,1]` vs `[63,190,1]`）时会广播并产生 UserWarning。正确做法是先裁剪：`mN=min(Nr,Nt); r_crop=recon[:mN]; t_crop=target[:mN]`，`hetero_trainer.py` 已按此实现。
+- **规则 1**: 若同一 nn.Module 在同一 forward 中被调用多次，且 **第二次的输入依赖第一次的输出**，则必须对输入 `.detach()`，或在 backward 中使用 `retain_graph=True`（不推荐，仅作应急）。
+- **规则 2**: 所有 loss 计算前必须确认 tensor 形状一致，禁止依赖 PyTorch 广播来"修复"维度不匹配。
+- **规则 3**: 遇到 "backward a second time" 错误，优先检查计算图中是否有模块被调用两次，其次检查是否有跨 iteration/epoch 的 tensor 引用未 detach。
+
 ---
 
-*Last updated: 2026-02-20*
+*Last updated: 2026-02-21*
