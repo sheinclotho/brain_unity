@@ -22,12 +22,19 @@ WebSocket 消息协议:
           ec_flat:       [200×200 floats, row-major],
           top_sources:   [int×10],   // 影响力最强的源脑区
           top_targets:   [int×10],   // 感受性最强的目标脑区
-          activity_delta:[200 floats] // 刺激 top_sources[0] 后的预测活动变化
+          activity_delta:[200 floats] // 刺激 top_sources[0:3] 后的预测活动变化
+          fit_quality:   {train_mse, val_mse, overfit_ratio, reliable}
          }
 """
 
 import logging
+import os
 from typing import Callable, List, Optional, Tuple
+
+# Suppress Intel OpenMP duplicate-runtime crash (libiomp5 / libiomp5md.dll).
+# This module imports both torch and numpy at the top level; the env var must
+# be set *before* those libraries initialise their OpenMP context.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import numpy as np
 import torch
@@ -35,6 +42,17 @@ import torch.nn as nn
 import torch.utils.data as data
 
 logger = logging.getLogger(__name__)
+
+
+# ── Module-level tuneable constants ─────────────────────────────────────────
+# Scale model capacity down when n_train < this threshold.  Below this value
+# the parameter-to-sample ratio of the full-size MLP becomes too high for
+# reliable gradient descent.
+_MIN_SAMPLES_FOR_FULL_CAPACITY: int = 500
+
+# When val_mse / train_mse exceeds this threshold the model has severely
+# overfit noise; EC inference results are flagged as unreliable.
+_OVERFIT_RELIABILITY_THRESHOLD: float = 20.0
 
 
 # ── Surrogate brain: lightweight MLP (same architecture as NPI's ANN_MLP) ──────
@@ -45,17 +63,23 @@ class _SurrogateMLP(nn.Module):
 
     Input:  (n_regions × n_lags,) flattened
     Output: (n_regions,)
+
+    Dropout is applied after each hidden activation to regularise training
+    on small neuroimaging datasets (typical T ≈ 300–500 frames).
     """
 
     def __init__(self, n_regions: int, n_lags: int,
-                 hidden_dim: int = 256, latent_dim: int = 128):
+                 hidden_dim: int = 256, latent_dim: int = 128,
+                 dropout: float = 0.3):
         super().__init__()
         input_dim = n_regions * n_lags
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, latent_dim),
             nn.ReLU(),
+            nn.Dropout(p=dropout),
             nn.Linear(latent_dim, n_regions),
         )
 
@@ -112,6 +136,7 @@ class PerturbationAnalyzer:
         self._surrogate: Optional[_SurrogateMLP] = None
         self._input_X:   Optional[np.ndarray]    = None   # (M, N*lags) – cached training inputs
         self._last_ec:   Optional[np.ndarray]    = None   # (N, N) – last computed EC matrix
+        self._fit_quality: dict                  = {}     # last fit metrics (train/val MSE)
 
     # ── Surrogate training ──────────────────────────────────────────────────
 
@@ -125,19 +150,25 @@ class PerturbationAnalyzer:
         batch_size: int = 64,
         lr: float = 1e-3,
         train_ratio: float = 0.8,
+        weight_decay: float = 1e-4,
+        dropout: float = 0.3,
+        patience: int = 12,
     ) -> Tuple[List[float], List[float]]:
         """
         在提供的时序数据上训练 MLP 代理模型。
 
         Args:
-            time_series: (T, N_regions) numpy array, 值域任意（内部会标准化）
-            n_lags:      历史窗口长度（覆盖 self.n_lags）
-            hidden_dim / latent_dim: 网络宽度
+            time_series:  (T, N_regions) numpy array, 值域任意（内部会标准化）
+            n_lags:       历史窗口长度（覆盖 self.n_lags）
+            hidden_dim / latent_dim: 网络宽度（会根据数据集规模自适应缩放）
             num_epochs / batch_size / lr: 训练超参数
-            train_ratio: 训练/测试分割比例
+            train_ratio:  训练/测试分割比例
+            weight_decay: Adam L2 正则化系数（防止过拟合，对照 NPI 的 l2 参数）
+            dropout:      隐层 Dropout 概率（减少小数据集过拟合）
+            patience:     早停耐心值 —— 验证 MSE 连续 patience 轮不改善则停止
 
         Returns:
-            (train_losses, test_losses) 各 epoch 的 MSE 损失
+            (train_losses, val_losses) 各 epoch 的 MSE 损失
         """
         if n_lags is not None:
             self.n_lags = n_lags
@@ -159,32 +190,87 @@ class PerturbationAnalyzer:
         train_dl = data.DataLoader(data.TensorDataset(tx, ty), batch_size, shuffle=True)
         val_dl   = data.DataLoader(data.TensorDataset(vx, vy), batch_size, shuffle=False)
 
+        # Adaptive capacity: scale hidden/latent dims down for small datasets to
+        # reduce the parameter-to-sample ratio and mitigate overfitting.
+        # Reference: NPI uses fixed dims regardless of dataset size, which causes
+        # severe overfitting when T < ~1000.
+        n_train = len(tx)
+        scale   = min(1.0, n_train / _MIN_SAMPLES_FOR_FULL_CAPACITY)
+        adj_hidden = max(32, int(hidden_dim * scale))
+        adj_latent = max(16, int(latent_dim * scale))
+        if scale < 1.0:
+            logger.info(
+                f"数据集较小 ({n_train} 样本), 自适应缩减模型容量: "
+                f"hidden={adj_hidden}, latent={adj_latent}"
+            )
+
         model = _SurrogateMLP(
-            self.n_regions, self.n_lags, hidden_dim, latent_dim
+            self.n_regions, self.n_lags, adj_hidden, adj_latent, dropout
         ).to(self.device)
-        opt   = torch.optim.Adam(model.parameters(), lr=lr)
+        opt     = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
         loss_fn = nn.MSELoss()
 
         train_hist, val_hist = [], []
+        best_val   = float("inf")
+        best_state = None
+        no_improve = 0
+
         for _ in range(num_epochs):
             model.train()
             for xb, yb in train_dl:
                 pred = model(xb)
                 l = loss_fn(pred, yb)
                 opt.zero_grad(); l.backward(); opt.step()
+
             model.eval()
             with torch.no_grad():
                 tl = sum(loss_fn(model(xb), yb).item() * len(xb)
                          for xb, yb in train_dl) / len(tx)
-                vl = sum(loss_fn(model(xb), yb).item() * len(xb)
-                         for xb, yb in val_dl) / max(len(vx), 1)
+                vl = (sum(loss_fn(model(xb), yb).item() * len(xb)
+                          for xb, yb in val_dl) / max(len(vx), 1)
+                      if len(vx) > 0 else tl)
             train_hist.append(tl)
             val_hist.append(vl)
 
+            # Early stopping: restore best weights when val loss stops improving
+            if vl < best_val - 1e-7:
+                best_val   = vl
+                no_improve = 0
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    logger.info(f"早停: 验证MSE连续{patience}轮未改善，在第{len(train_hist)}轮停止")
+                    break
+
+        # Restore the checkpoint with best validation loss
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
         self._surrogate = model
-        logger.info(
-            f"代理模型训练完成: 最终训练MSE={train_hist[-1]:.5f}, 验证MSE={val_hist[-1]:.5f}"
-        )
+
+        final_train = train_hist[-1]
+        final_val   = val_hist[-1]
+        overfit_ratio = final_val / max(final_train, 1e-9)
+
+        # Record fit quality for downstream consumers (e.g. frontend reliability badge)
+        self._fit_quality = {
+            "train_mse":    round(float(final_train), 6),
+            "val_mse":      round(float(final_val),   6),
+            "overfit_ratio": round(float(overfit_ratio), 2),
+            "reliable":     overfit_ratio < _OVERFIT_RELIABILITY_THRESHOLD,
+            "n_epochs":     len(train_hist),
+        }
+
+        if overfit_ratio > _OVERFIT_RELIABILITY_THRESHOLD:
+            logger.warning(
+                f"代理模型严重过拟合: 验证MSE({final_val:.5f}) / 训练MSE({final_train:.5f}) "
+                f"= {overfit_ratio:.1f}×. EC推断结果可信度较低，建议提供更多时序数据。"
+            )
+        else:
+            logger.info(
+                f"代理模型训练完成: 最终训练MSE={final_train:.5f}, 验证MSE={final_val:.5f}"
+            )
         return train_hist, val_hist
 
     # ── EC inference — finite difference (NPI-style) ────────────────────────
@@ -419,9 +505,15 @@ class PerturbationAnalyzer:
         if ec_matrix is None:
             return {}
         n = self.n_regions
-        return {
+        top_sources = self.suggest_targets(ec_matrix, 10, "outgoing")
+        top_targets = self.suggest_targets(ec_matrix, 10, "incoming")
+        result = {
             "ec_flat":      ec_matrix.flatten().tolist(),   # 200×200
-            "top_sources":  self.suggest_targets(ec_matrix, 10, "outgoing"),
-            "top_targets":  self.suggest_targets(ec_matrix, 10, "incoming"),
+            "top_sources":  top_sources,
+            "top_targets":  top_targets,
             "n_regions":    n,
         }
+        # Include surrogate quality so the frontend can show a reliability badge
+        if self._fit_quality:
+            result["fit_quality"] = self._fit_quality
+        return result

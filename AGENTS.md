@@ -120,6 +120,29 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 - **改进 2**: 时间轴底栏新增模态徽章（`#modality-badge`），在播放任何数据时始终显示当前数据类型（`fMRI` / `EEG` / `⚡ 仿真`），解决用户不知道正在看什么的问题。
 - **规则**: 服务端向前端发送的所有帧数据应尽可能包含 `raw` 字段；仿真帧不含 `raw`（因无对应物理量）。所有 simulation_result 消息必须携带 `"modality": "simulation"` 字段。
 
+### [2026-02-23] OMP 双重初始化崩溃 & MLP 代理过拟合
+
+#### OMP: Error #15 (libiomp5 / libiomp5md.dll)
+- **问题**: 调用 `infer_ec` 后程序在 Windows 上崩溃：`OMP: Error #15: Initializing libiomp5md.dll, but found libiomp5md.dll already initialized.` 根因是 PyTorch 和 NumPy/Intel MKL 各自链接了独立的 OpenMP 运行时，两者都在同一进程中初始化，产生冲突。
+- **修复**: 在 `start.py`（主入口）和 `perturbation_analyzer.py`（顶层 torch/numpy 导入前）都添加 `os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")`，确保在任何 OpenMP 运行时初始化之前设置该环境变量。
+- **规则**: 凡是直接在顶层（模块导入时）加载 torch 或 numpy 的文件，都必须在第一个 import 之前设置 `KMP_DUPLICATE_LIB_OK=TRUE`。
+
+#### MLP 代理严重过拟合（训练MSE=0.00239 vs 验证MSE=0.62391，比例约260×）
+- **根因分析**:
+  1. 384帧 × 0.8 = ~307 训练样本，但模型有 1000→256→128→200，约 31.4万参数，参数/样本比 >1000:1。
+  2. 原版 NPI.py 的 `train_NN` 函数有 `l2`（weight decay）参数，但我们的实现没有使用。
+  3. 没有 dropout，没有早停，模型无限拟合训练集噪音。
+- **修复**:
+  - **自适应容量缩减**: `hidden_dim / latent_dim` 按 `min(1, n_train/500)` 比例缩放，小数据集自动使用更小的网络。
+  - **Dropout**: `_SurrogateMLP` 在每个隐层 ReLU 后加 `nn.Dropout(p=0.3)`。
+  - **Weight decay**: Adam 优化器加 `weight_decay=1e-4`（对照 NPI 的 `l2` 参数）。
+  - **早停**: 验证 MSE 连续 12 轮不改善则停止，恢复最优权重。
+  - **过拟合检测**: `overfit_ratio = val_mse / train_mse`，> 20× 时打印警告并在响应中标记 `reliable=False`。
+- **`ec_result` 响应新增字段**: `fit_quality: {train_mse, val_mse, overfit_ratio, reliable, n_epochs}`，前端可据此显示可信度徽章。
+- **`activity_delta` 改进**: 原来只用 top-1 源脑区，改为 top-3，预测结果更具代表性。
+- **代理缓存**: `BrainVisualizationServer` 新增 `_ec_analyzer_cache` 字典，以 `(缓存文件路径, n_lags)` 为键缓存已训练的 `PerturbationAnalyzer`，切换方法（jacobian↔perturbation）不再重新训练，大幅缩短响应时间。
+- **规则**: `fit_surrogate` 必须始终返回 `_fit_quality` 字典；`ec_result` 响应必须包含 `fit_quality` 字段；前端应在 EC 可视化面板显示可信度指示器。
+
 ---
 
-*Last updated: 2026-02-21*
+*Last updated: 2026-02-23*
