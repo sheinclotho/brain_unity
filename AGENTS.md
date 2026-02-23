@@ -109,6 +109,17 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 - **规则**: NPI.py 作为参考实现保留在仓库根目录，不修改；所有 EC 功能实现在 `perturbation_analyzer.py` 中。
 - **新增 WebSocket 消息**: `infer_ec` 请求 / `ec_result` 响应（详见 `项目规范说明书.md` 第 13 节）。
 
+### [2026-02-21] 刺激动画 Nyquist 采样 Bug
+- **问题**: `_demo_simulate` 中 `_stim_amp` 的正弦公式 `sin(2π × frequency × k / 10)` 在整数频率（5, 10, 15 Hz 等）时 k 为整数，导致所有帧采样值为 sin(n×2π) = 0，刺激完全无效果（颜色不变）。非整数频率则出现高频闪烁（视觉噪音）。
+- **根因**: 以 10fps 播放时，Nyquist 极限为 5 Hz；10 Hz 正弦的每帧采样恰好落在零点。
+- **修复**: 改为展示*神经响应包络*（bell-shape 上升-高峰-下降）加低速振荡，而非采样原始电气波形。同理优化 pulse（指数衰减）、ramp（线性增长）、constant（平滑上升）各模式。
+- **规则**: 刺激动画展示的是大脑可塑性/兴奋性的慢时程变化（百毫秒~秒级），不是刺激仪器的高频电气信号。可视化帧率≤10fps 时，绝不直接采样 ≥5Hz 的刺激波形。
+
+### [2026-02-21] 模态标识 & 绝对值展示
+- **改进 1**: 每帧数据新增 `raw` 字段（与 `activity` 并列），存储归一化前的原始传感器值。前端 tooltip 在归一化百分比下方额外显示原始绝对值，解决"只能看相对颜色，不知道实际幅值"的问题。
+- **改进 2**: 时间轴底栏新增模态徽章（`#modality-badge`），在播放任何数据时始终显示当前数据类型（`fMRI` / `EEG` / `⚡ 仿真`），解决用户不知道正在看什么的问题。
+- **规则**: 服务端向前端发送的所有帧数据应尽可能包含 `raw` 字段；仿真帧不含 `raw`（因无对应物理量）。所有 simulation_result 消息必须携带 `"modality": "simulation"` 字段。
+
 ---
 
 *Last updated: 2026-02-21*

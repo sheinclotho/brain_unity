@@ -475,6 +475,7 @@ class BrainVisualizationServer:
                     "success": True,
                     "n_frames": len(frames),
                     "frames": frames,
+                    "modality": "simulation",
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
                 }
@@ -493,6 +494,7 @@ class BrainVisualizationServer:
                 "success": True,
                 "n_frames": len(frames),
                 "frames": frames,
+                "modality": "simulation",
             }
                 
         except Exception as e:
@@ -721,19 +723,32 @@ class BrainVisualizationServer:
                 act[i] = float(np.clip(v, 0.0, 1.0))
             return act
 
-        # ── Stimulation pattern function ───────────────────────────────────
-        def _stim_amp(relative_t: int) -> float:
-            if pattern == "sine":
-                return amplitude * np.sin(2 * np.pi * frequency * relative_t / 10.0)
-            elif pattern == "pulse":
-                return amplitude if relative_t == 0 else 0.0
-            elif pattern == "ramp":
-                return amplitude * min(relative_t / max(duration, 1), 1.0)
-            else:  # constant / unknown
-                return amplitude
-
         PRE  = 10
         DUR  = min(int(duration), _MAX_STIM_FRAMES)
+
+        # ── Stimulation pattern function ───────────────────────────────────
+        # NOTE: We model the *neural response envelope*, not the raw electrical
+        # waveform.  At 10 fps the Nyquist limit is 5 Hz, so sampling a 10 Hz
+        # sine wave at integer frame indices yields sin(2πn)=0 for every frame
+        # (zero effect visible to the user).  Instead we show the slow-timescale
+        # change in cortical excitability that is the brain's actual response to
+        # sustained stimulation — which is the quantity of clinical interest.
+        def _stim_amp(relative_t: int) -> float:
+            progress = relative_t / max(DUR - 1, 1)   # 0 → 1
+            if pattern == "sine":
+                # Bell-shaped excitability envelope (rises, peaks, decays) plus a
+                # gentle visible oscillation whose rate is clamped well below Nyquist.
+                # The slow oscillation approximates rhythm-entrainment effects.
+                slow_cycles = min(frequency / 10.0, 3.0)   # ≤ 3 visible cycles
+                osc = 0.20 * np.sin(2 * np.pi * slow_cycles * progress)
+                return amplitude * (np.sin(np.pi * progress) + osc)
+            elif pattern == "pulse":
+                # Sharp onset, exponential decay (models afterdischarge dynamics)
+                return amplitude * np.exp(-relative_t * 0.12)
+            elif pattern == "ramp":
+                return amplitude * progress
+            else:  # constant / unknown — smooth ramp-up to avoid sudden color jump
+                return amplitude * min(1.0, relative_t / max(DUR * 0.15, 1.0))
         POST = 10
         frames = []
 
@@ -1020,7 +1035,12 @@ class BrainVisualizationServer:
         n_regions = 200
 
         def _frames_from_xseq(x_seq, n_out: int) -> list:
-            """Global percentile normalisation for fMRI."""
+            """Global percentile normalisation for fMRI.
+
+            Each frame contains:
+              activity – [0,1] normalised values (drives sphere colour)
+              raw      – original sensor values (shown in hover tooltip)
+            """
             x = x_seq.cpu().float()
             if x.ndim == 2:
                 x = x.unsqueeze(-1)      # (N, T) → (N, T, 1)
@@ -1029,17 +1049,18 @@ class BrainVisualizationServer:
             p5, p95 = np.percentile(flat, 5), np.percentile(flat, 95)
             scale   = max(p95 - p5, 1e-6)
             result  = []
+            src_idx = np.linspace(0.0, 1.0, N) if N != n_out else None
+            dst_idx = np.linspace(0.0, 1.0, n_out) if N != n_out else None
             for t in range(T):
                 sig  = x[:, t, 0].numpy()
                 norm = np.clip((sig - p5) / scale, 0.0, 1.0)
                 if N == n_out:
                     arr = norm.astype(np.float32)
+                    raw = sig.astype(np.float32)
                 else:
-                    # Linearly interpolate N channels → n_out visualisation slots
-                    src_idx = np.linspace(0.0, 1.0, N)
-                    dst_idx = np.linspace(0.0, 1.0, n_out)
                     arr = np.interp(dst_idx, src_idx, norm).astype(np.float32)
-                result.append({"activity": arr.tolist()})
+                    raw = np.interp(dst_idx, src_idx, sig).astype(np.float32)
+                result.append({"activity": arr.tolist(), "raw": raw.tolist()})
             return result
 
         def _frames_from_xseq_eeg(x_seq, n_out: int) -> list:
@@ -1048,12 +1069,18 @@ class BrainVisualizationServer:
             EEG temporal variance >> spatial variance, so global normalisation
             collapses all channels to the same colour at any given instant.
             Per-frame normalisation exposes the relative spatial distribution.
+
+            Each frame contains:
+              activity – [0,1] normalised values (drives sphere colour)
+              raw      – original sensor values (shown in hover tooltip)
             """
             x = x_seq.cpu().float()
             if x.ndim == 2:
                 x = x.unsqueeze(-1)      # (N, T) → (N, T, 1)
             N, T, _ = x.shape
             result = []
+            src_idx = np.linspace(0.0, 1.0, N) if N != n_out else None
+            dst_idx = np.linspace(0.0, 1.0, n_out) if N != n_out else None
             for t in range(T):
                 sig = x[:, t, 0].numpy()
                 sig_min, sig_max = float(sig.min()), float(sig.max())
@@ -1061,11 +1088,11 @@ class BrainVisualizationServer:
                 norm = np.clip((sig - sig_min) / scale, 0.0, 1.0)
                 if N == n_out:
                     arr = norm.astype(np.float32)
+                    raw = sig.astype(np.float32)
                 else:
-                    src_idx = np.linspace(0.0, 1.0, N)
-                    dst_idx = np.linspace(0.0, 1.0, n_out)
                     arr = np.interp(dst_idx, src_idx, norm).astype(np.float32)
-                result.append({"activity": arr.tolist()})
+                    raw = np.interp(dst_idx, src_idx, sig).astype(np.float32)
+                result.append({"activity": arr.tolist(), "raw": raw.tolist()})
             return result
 
         frames_fmri: list = []
