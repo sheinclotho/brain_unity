@@ -1022,6 +1022,26 @@ class BrainVisualizationServer:
                     return result
         return None
 
+    def _find_all_hetero_data(self, data) -> list:
+        """Recursively collect ALL HeteroData objects from a nested structure.
+
+        When a cache file stores ``Dict[task, List[HeteroData]]`` the full
+        time series is split across multiple HeteroData chunks (each holding
+        ``spatial_T`` frames, e.g. 384) to keep training memory bounded.
+        This method collects every chunk so the caller can concatenate them
+        and recover the complete time series.
+        """
+        results = []
+        if hasattr(data, "node_types"):
+            results.append(data)
+        elif isinstance(data, (list, tuple)):
+            for item in data:
+                results.extend(self._find_all_hetero_data(item))
+        elif isinstance(data, dict):
+            for v in data.values():
+                results.extend(self._find_all_hetero_data(v))
+        return results
+
     def _extract_time_series(self, data) -> list:
         """Extract per-time-point activity frames from a cache .pt object.
 
@@ -1051,11 +1071,19 @@ class BrainVisualizationServer:
           EEG:  per-frame min-max → shows relative spatial variation at each
                 instant (EEG temporal variance dominates spatial variance, so
                 global normalisation makes all channels appear the same colour).
+
+        Full-series reconstruction:
+          Training stores data as Dict[task, List[HeteroData]] where each
+          HeteroData holds exactly spatial_T (e.g. 384) consecutive frames to
+          keep GPU memory bounded.  This method collects ALL HeteroData chunks
+          and concatenates their x_seq tensors along the time axis (dim=1) so
+          that the visualiser sees the complete, un-truncated recording.
         """
+        import torch
         import numpy as np
 
-        graph = self._find_hetero_data(data)
-        if graph is None:
+        graphs = self._find_all_hetero_data(data)
+        if not graphs:
             return {"fmri": [], "eeg": [], "modalities": []}
 
         n_regions = 200
@@ -1127,21 +1155,46 @@ class BrainVisualizationServer:
         n_eeg_raw:  int   = 0   # actual number of EEG channels before interpolation
 
         try:
-            if "fmri" in graph.node_types:
-                node  = graph["fmri"]
-                x_seq = getattr(node, "x_seq", None)
-                if x_seq is not None:
-                    n_fmri_raw  = int(x_seq.shape[0])
-                    frames_fmri = _frames_from_xseq(x_seq, n_regions)
+            # Collect and concatenate x_seq tensors across all HeteroData chunks.
+            # Each chunk covers spatial_T (e.g. 384) consecutive time points; the
+            # full recording is recovered by concatenating along dim=1 (time axis).
+            fmri_chunks: list = []
+            eeg_chunks:  list = []
 
-            if "eeg" in graph.node_types:
-                node  = graph["eeg"]
-                x_seq = getattr(node, "x_seq", None)
-                if x_seq is None:
-                    x_seq = getattr(node, "x", None)
-                if x_seq is not None:
-                    n_eeg_raw  = int(x_seq.shape[0])
-                    frames_eeg = _frames_from_xseq_eeg(x_seq, n_regions)
+            for g in graphs:
+                if "fmri" in g.node_types:
+                    xseq = getattr(g["fmri"], "x_seq", None)
+                    if xseq is not None:
+                        if xseq.ndim == 2:
+                            xseq = xseq.unsqueeze(-1)
+                        fmri_chunks.append(xseq)
+                        if n_fmri_raw == 0:
+                            n_fmri_raw = int(xseq.shape[0])
+
+                if "eeg" in g.node_types:
+                    xseq = getattr(g["eeg"], "x_seq", None)
+                    if xseq is None:
+                        xseq = getattr(g["eeg"], "x", None)
+                    if xseq is not None:
+                        if xseq.ndim == 2:
+                            xseq = xseq.unsqueeze(-1)
+                        eeg_chunks.append(xseq)
+                        if n_eeg_raw == 0:
+                            n_eeg_raw = int(xseq.shape[0])
+
+            if fmri_chunks:
+                fmri_cat = torch.cat(fmri_chunks, dim=1)  # (N, T_total, F)
+                frames_fmri = _frames_from_xseq(fmri_cat, n_regions)
+
+            if eeg_chunks:
+                eeg_cat = torch.cat(eeg_chunks, dim=1)    # (N_eeg, T_total, F)
+                frames_eeg = _frames_from_xseq_eeg(eeg_cat, n_regions)
+
+            if len(graphs) > 1:
+                self.logger.info(
+                    f"_extract_time_series_both: 合并 {len(graphs)} 个数据块 → "
+                    f"fMRI {len(frames_fmri)} 帧, EEG {len(frames_eeg)} 帧"
+                )
 
         except Exception as exc:
             self.logger.error(f"_extract_time_series_both error: {exc}")
