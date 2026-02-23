@@ -143,6 +143,30 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 - **代理缓存**: `BrainVisualizationServer` 新增 `_ec_analyzer_cache` 字典，以 `(缓存文件路径, n_lags)` 为键缓存已训练的 `PerturbationAnalyzer`，切换方法（jacobian↔perturbation）不再重新训练，大幅缩短响应时间。
 - **规则**: `fit_surrogate` 必须始终返回 `_fit_quality` 字典；`ec_result` 响应必须包含 `fit_quality` 字段；前端应在 EC 可视化面板显示可信度指示器。
 
+### [2026-02-23] EEG 可视化方案评估 & 显示模态切换卡片
+
+#### EEG 可视化方案评估
+提出四种方案，最终选定方案 4：
+
+| 方案 | 描述 | 结论 |
+|------|------|------|
+| 1. 现有方案（插值到200脑区） | 将任意N通道插值到200个解剖脑区 | ✓ 保留，适合连接研究 |
+| 2. 2D 头皮地形图 | 标准EEG电极拓扑图 | ✗ 需要电极坐标，不在.pt格式中 |
+| 3. 3D 头皮电极 | 在头皮上显示N个电极球体 | ✗ 同上，且10-20系统不适合任意通道数 |
+| 4. 通道数指示器 | 在模态信息中显示"EEG 64通道→200槽" | ✓ 零成本，信息完整 |
+
+**决策依据**: TwinBrain 的核心目标是脑区连接分析，而非电极拓扑展示。插值到200个解剖脑区在科学上更合理。通道数指示器填补了"用户不知道被插值了多少通道"的信息缺口。
+
+#### 显示模态切换卡片重构
+- **问题**: 原有的 `#modality-toggle` 隐藏在"加载缓存数据"卡片内部，`display:none` 初始不可见，用户不知道该功能存在。
+- **修复**: 提取为独立的"显示模态"卡片，在侧边栏中永久可见。
+  - 两个按钮（fMRI / EEG）默认 `disabled`，加载数据后根据可用模态自动启用
+  - 只有 EEG → fMRI 按钮 disabled；只有 fMRI → EEG 按钮 disabled；两者都有 → 都可点击
+  - 模态信息显示原始通道数（如 `EEG 64通道→200×384帧`）
+- **EC 可信度徽章**: `handleECResult` 中读取 `fit_quality`，当 `reliable=true` 显示绿色"✓ 可靠"，否则显示橙色"⚠ 过拟合 N×"。
+- **后端新增字段**: `handle_load_cache` 响应新增 `n_fmri_regions`（fMRI实际区域数）和 `n_eeg_channels`（EEG实际通道数），`_extract_time_series_both` 同步返回这两个值。
+- **规则**: 模态切换卡片必须永久可见，不可在无数据时隐藏；前端依赖的所有模态状态必须通过 `updateModalityToggle(modalities)` 统一管理。
+
 ---
 
 *Last updated: 2026-02-23*

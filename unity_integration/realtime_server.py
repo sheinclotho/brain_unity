@@ -980,14 +980,17 @@ class BrainVisualizationServer:
             f"(模态: {modalities})"
         )
         return {
-            "type":        "cache_loaded",
-            "path":        str(cache_path),
-            "n_frames":    len(primary),
-            "frames":      primary,           # backward-compat: primary modality
-            "frames_fmri": frames_fmri or None,
-            "frames_eeg":  frames_eeg  or None,
-            "modalities":  modalities,
-            "success":     True,
+            "type":           "cache_loaded",
+            "path":           str(cache_path),
+            "n_frames":       len(primary),
+            "frames":         primary,           # backward-compat: primary modality
+            "frames_fmri":    frames_fmri or None,
+            "frames_eeg":     frames_eeg  or None,
+            "modalities":     modalities,
+            # Actual counts before interpolation (fallback = 200 standard Schaefer parcellation)
+            "n_fmri_regions": both.get("n_fmri_regions", 200),
+            "n_eeg_channels": both.get("n_eeg_channels", 0),
+            "success":        True,
         }
 
     def _find_cache_file(self) -> Optional[Path]:
@@ -1120,12 +1123,15 @@ class BrainVisualizationServer:
 
         frames_fmri: list = []
         frames_eeg:  list = []
+        n_fmri_raw: int   = 0   # actual number of fMRI ROIs before any interpolation
+        n_eeg_raw:  int   = 0   # actual number of EEG channels before interpolation
 
         try:
             if "fmri" in graph.node_types:
                 node  = graph["fmri"]
                 x_seq = getattr(node, "x_seq", None)
                 if x_seq is not None:
+                    n_fmri_raw  = int(x_seq.shape[0])
                     frames_fmri = _frames_from_xseq(x_seq, n_regions)
 
             if "eeg" in graph.node_types:
@@ -1134,13 +1140,20 @@ class BrainVisualizationServer:
                 if x_seq is None:
                     x_seq = getattr(node, "x", None)
                 if x_seq is not None:
+                    n_eeg_raw  = int(x_seq.shape[0])
                     frames_eeg = _frames_from_xseq_eeg(x_seq, n_regions)
 
         except Exception as exc:
             self.logger.error(f"_extract_time_series_both error: {exc}")
 
         modalities = (["fmri"] if frames_fmri else []) + (["eeg"] if frames_eeg else [])
-        return {"fmri": frames_fmri, "eeg": frames_eeg, "modalities": modalities}
+        return {
+            "fmri":           frames_fmri,
+            "eeg":            frames_eeg,
+            "modalities":     modalities,
+            "n_fmri_regions": n_fmri_raw,   # e.g. 200 (direct mapping)
+            "n_eeg_channels": n_eeg_raw,    # e.g. 64 or 128 (interpolated to 200)
+        }
 
     def _extract_activity_array(self, result: Dict) -> list:
         """Extract a flat [0,1] activity list from various result-dict formats.
