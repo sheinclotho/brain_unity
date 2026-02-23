@@ -30,6 +30,8 @@ let activeModality = 'fmri';  // 'fmri' | 'eeg'
 let curFrame   = 0;
 let isPlaying  = false;
 let playTimer  = null;
+// Metadata about the most recently loaded dataset (channel/region counts)
+let loadedMeta = { nFmriRegions: 0, nEegChannels: 0 };
 
 // ── Guard: Three.js must be loaded ────────────────────────────────────────────
 if (typeof THREE === 'undefined') {
@@ -341,6 +343,11 @@ function handleMsg(msg) {
     } else {
       framesEeg = [];
     }
+    // Store actual channel / region counts so the UI can describe the data
+    loadedMeta = {
+      nFmriRegions: msg.n_fmri_regions || (framesFmri.length > 0 ? 200 : 0),
+      nEegChannels: msg.n_eeg_channels || 0,
+    };
     // Show/configure modality toggle
     updateModalityToggle(msg.modalities || []);
     // Pick the active modality's frames (fall back to primary frames)
@@ -387,30 +394,34 @@ function _getModalityFrames() {
 
 function _updateModalityInfo() {
   const labels = [];
-  if (framesFmri.length > 0) labels.push(`fMRI ${framesFmri.length}帧`);
-  if (framesEeg.length  > 0) labels.push(`EEG ${framesEeg.length}帧`);
-  document.getElementById('modality-info').textContent = labels.join(' · ');
+  if (framesFmri.length > 0) {
+    const n = loadedMeta.nFmriRegions > 0 ? loadedMeta.nFmriRegions : N_REGIONS;
+    labels.push(`fMRI ${n}区×${framesFmri.length}帧`);
+  }
+  if (framesEeg.length > 0) {
+    const n = loadedMeta.nEegChannels > 0
+      ? `${loadedMeta.nEegChannels}通道→${N_REGIONS}`
+      : `?通道→${N_REGIONS}`;
+    labels.push(`EEG ${n}×${framesEeg.length}帧`);
+  }
+  document.getElementById('modality-info').textContent =
+    labels.length > 0 ? labels.join(' · ') : '加载 .pt 文件后可切换';
 }
 
 function updateModalityToggle(modalities) {
-  const toggle   = document.getElementById('modality-toggle');
-  const btnFmri  = document.getElementById('btn-mod-fmri');
-  const btnEeg   = document.getElementById('btn-mod-eeg');
-  const hasFmri  = modalities.includes('fmri');
-  const hasEeg   = modalities.includes('eeg');
+  const btnFmri = document.getElementById('btn-mod-fmri');
+  const btnEeg  = document.getElementById('btn-mod-eeg');
+  const hasFmri = modalities.includes('fmri');
+  const hasEeg  = modalities.includes('eeg');
 
-  if (hasFmri || hasEeg) {
-    toggle.style.display = '';
-    btnFmri.disabled = !hasFmri;
-    btnEeg.disabled  = !hasEeg;
-    // Keep active modality if still available, else fall back to first available
-    if (activeModality === 'eeg' && !hasEeg) activeModality = 'fmri';
-    if (activeModality === 'fmri' && !hasFmri) activeModality = 'eeg';
-    _applyModalityButtonStyles();
-    _updateModalityInfo();
-  } else {
-    toggle.style.display = 'none';
-  }
+  btnFmri.disabled = !hasFmri;
+  btnEeg.disabled  = !hasEeg;
+
+  // Keep active modality if still available, else fall back to first available
+  if (activeModality === 'eeg'  && !hasEeg)  activeModality = 'fmri';
+  if (activeModality === 'fmri' && !hasFmri) activeModality = 'eeg';
+  _applyModalityButtonStyles();
+  _updateModalityInfo();
 }
 
 function _applyModalityButtonStyles() {
@@ -546,7 +557,13 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   slider.max = 0;
   slider.value = 0;
   updateFrameLabel();
-  document.getElementById('modality-toggle').style.display = 'none';
+  // Reset modality buttons to disabled state (no data loaded)
+  loadedMeta = { nFmriRegions: 0, nEegChannels: 0 };
+  document.getElementById('btn-mod-fmri').disabled = true;
+  document.getElementById('btn-mod-eeg').disabled  = true;
+  document.getElementById('btn-mod-fmri').className = 'btn-secondary';
+  document.getElementById('btn-mod-eeg').className  = 'btn-secondary';
+  document.getElementById('modality-info').textContent = '加载 .pt 文件后可切换';
   document.getElementById('frame-info').textContent = connected ? '实时数据' : '演示模式';
   setModalityBadge(null);
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
@@ -671,10 +688,17 @@ function handleECResult(msg) {
   document.getElementById('btn-ec-stim').disabled = false;
   document.getElementById('btn-hide-ec').style.display = '';
 
-  ecStatus.textContent =
-    // Region IDs are 0-indexed internally; display as 1-indexed for users
-    `✓ ${msg.method} | 最强源: 区域 ${(ecTopSources[0]||0)+1} | ` +
-    `连接线: ${ecLines.length}`;
+  // Build status string — include surrogate reliability when available
+  let statusStr =
+    `✓ ${msg.method} | 最强源: 区域 ${(ecTopSources[0]||0)+1} | 连接线: ${ecLines.length}`;
+  if (msg.fit_quality) {
+    const fq = msg.fit_quality;
+    const reliStr = fq.reliable
+      ? `<span style="color:#44ff88">✓ 可靠</span>`
+      : `<span style="color:#ffaa44">⚠ 过拟合 ${fq.overfit_ratio}×</span>`;
+    statusStr += ` | ${reliStr}`;
+  }
+  ecStatus.innerHTML = statusStr;
 }
 
 document.getElementById('btn-infer-ec').addEventListener('click', () => {

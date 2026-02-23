@@ -19,6 +19,11 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
+# Suppress Intel OpenMP duplicate-runtime crash that occurs when both PyTorch
+# and NumPy/MKL link their own copy of libiomp5 (common on Windows).
+# Must be set before any library that loads OpenMP is imported.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 

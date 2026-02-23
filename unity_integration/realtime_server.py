@@ -91,6 +91,11 @@ class BrainVisualizationServer:
             self.logger = logging.getLogger(__name__)
         
         self.clients: Set = set()
+
+        # Cache for trained PerturbationAnalyzer instances.
+        # Key: (cache_file_path_str, n_lags) so the surrogate is only retrained
+        # when the source data or lag window changes, not on every infer_ec call.
+        self._ec_analyzer_cache: dict = {}
     
     async def register_client(self, websocket):
         """Register a new client connection."""
@@ -523,7 +528,8 @@ class BrainVisualizationServer:
            ec_flat: [200*200 floats],     -- row-major EC matrix
            top_sources: [int*10],         -- most influential source regions
            top_targets: [int*10],         -- most receptive target regions
-           activity_delta: [200 floats],  -- predicted activity change from top source
+           activity_delta: [200 floats],  -- predicted activity change from top 3 sources
+           fit_quality: {train_mse, val_mse, overfit_ratio, reliable, n_epochs},
            success: true}
         """
         import numpy as np
@@ -543,15 +549,14 @@ class BrainVisualizationServer:
         except ImportError:
             return {"type": "error", "message": "PerturbationAnalyzer 模块未找到"}
 
-        analyzer = PerturbationAnalyzer(n_regions=200, n_lags=n_lags)
-
         # ── Demo mode (no data needed) ─────────────────────────────────────
         if method == "demo":
+            analyzer = PerturbationAnalyzer(n_regions=200, n_lags=n_lags)
             ec = analyzer.infer_ec_demo()
             result = analyzer.ec_to_dict(ec)
             top_src = result["top_sources"]
             result["activity_delta"] = analyzer.predict_activity_delta(
-                top_src[:1], amplitude=0.5, ec_matrix=ec
+                top_src[:3], amplitude=0.5, ec_matrix=ec
             ).tolist()
             result["method"]  = "demo"
             result["success"] = True
@@ -588,16 +593,32 @@ class BrainVisualizationServer:
         if time_series is None or len(time_series) < n_lags + 10:
             self.logger.info("EC 推断: 生成合成振荡时序数据（演示用）")
             time_series = self._generate_demo_time_series(300)
+            cache_path = None   # no file backing; don't cache by path
 
-        # ── Train surrogate ────────────────────────────────────────────────
-        self.logger.info(f"训练 MLP 代理模型: {time_series.shape} …")
-        analyzer.fit_surrogate(
-            time_series,
-            n_lags=n_lags,
-            num_epochs=60,
-            batch_size=64,
-            lr=1e-3,
-        )
+        # ── Reuse cached surrogate when possible ───────────────────────────
+        cache_key = (str(cache_path) if cache_path else "__synthetic__", n_lags)
+        analyzer  = self._ec_analyzer_cache.get(cache_key)
+        need_train = analyzer is None
+
+        if need_train:
+            analyzer = PerturbationAnalyzer(n_regions=200, n_lags=n_lags)
+            self.logger.info(f"训练 MLP 代理模型: {time_series.shape} …")
+            analyzer.fit_surrogate(
+                time_series,
+                n_lags=n_lags,
+                # num_epochs is a ceiling; early stopping (patience=12) will
+                # terminate training before this limit when validation MSE
+                # stops improving, so a higher cap costs nothing in practice
+                # and gives the model more time to converge on larger datasets.
+                num_epochs=80,
+                batch_size=64,
+                lr=1e-3,
+            )
+            # Cache the trained analyzer so subsequent infer_ec requests (e.g.
+            # switching method jacobian→perturbation) skip retraining.
+            self._ec_analyzer_cache[cache_key] = analyzer
+        else:
+            self.logger.info("EC 推断: 复用已缓存代理模型（跳过训练）")
 
         # ── Infer EC ───────────────────────────────────────────────────────
         if method == "perturbation":
@@ -609,14 +630,16 @@ class BrainVisualizationServer:
 
         result = analyzer.ec_to_dict(ec)
         top_src = result["top_sources"]
+        # Use top-3 sources for a more representative activity spread prediction
         result["activity_delta"] = analyzer.predict_activity_delta(
-            top_src[:1], amplitude=0.5, ec_matrix=ec
+            top_src[:3], amplitude=0.5, ec_matrix=ec
         ).tolist()
         result["method"]  = method
         result["success"] = True
         result["type"]    = "ec_result"
         self.logger.info(
-            f"EC 推断完成 ({method}), 影响力最强区域: {top_src[:5]}"
+            f"EC 推断完成 ({method}), 影响力最强区域: {top_src[:5]}, "
+            f"可靠: {result.get('fit_quality', {}).get('reliable', 'N/A')}"
         )
         return result
 
@@ -957,14 +980,17 @@ class BrainVisualizationServer:
             f"(模态: {modalities})"
         )
         return {
-            "type":        "cache_loaded",
-            "path":        str(cache_path),
-            "n_frames":    len(primary),
-            "frames":      primary,           # backward-compat: primary modality
-            "frames_fmri": frames_fmri or None,
-            "frames_eeg":  frames_eeg  or None,
-            "modalities":  modalities,
-            "success":     True,
+            "type":           "cache_loaded",
+            "path":           str(cache_path),
+            "n_frames":       len(primary),
+            "frames":         primary,           # backward-compat: primary modality
+            "frames_fmri":    frames_fmri or None,
+            "frames_eeg":     frames_eeg  or None,
+            "modalities":     modalities,
+            # Actual counts before interpolation (fallback = 200 standard Schaefer parcellation)
+            "n_fmri_regions": both.get("n_fmri_regions", 200),
+            "n_eeg_channels": both.get("n_eeg_channels", 0),
+            "success":        True,
         }
 
     def _find_cache_file(self) -> Optional[Path]:
@@ -1097,12 +1123,15 @@ class BrainVisualizationServer:
 
         frames_fmri: list = []
         frames_eeg:  list = []
+        n_fmri_raw: int   = 0   # actual number of fMRI ROIs before any interpolation
+        n_eeg_raw:  int   = 0   # actual number of EEG channels before interpolation
 
         try:
             if "fmri" in graph.node_types:
                 node  = graph["fmri"]
                 x_seq = getattr(node, "x_seq", None)
                 if x_seq is not None:
+                    n_fmri_raw  = int(x_seq.shape[0])
                     frames_fmri = _frames_from_xseq(x_seq, n_regions)
 
             if "eeg" in graph.node_types:
@@ -1111,13 +1140,20 @@ class BrainVisualizationServer:
                 if x_seq is None:
                     x_seq = getattr(node, "x", None)
                 if x_seq is not None:
+                    n_eeg_raw  = int(x_seq.shape[0])
                     frames_eeg = _frames_from_xseq_eeg(x_seq, n_regions)
 
         except Exception as exc:
             self.logger.error(f"_extract_time_series_both error: {exc}")
 
         modalities = (["fmri"] if frames_fmri else []) + (["eeg"] if frames_eeg else [])
-        return {"fmri": frames_fmri, "eeg": frames_eeg, "modalities": modalities}
+        return {
+            "fmri":           frames_fmri,
+            "eeg":            frames_eeg,
+            "modalities":     modalities,
+            "n_fmri_regions": n_fmri_raw,   # e.g. 200 (direct mapping)
+            "n_eeg_channels": n_eeg_raw,    # e.g. 64 or 128 (interpolated to 200)
+        }
 
     def _extract_activity_array(self, result: Dict) -> list:
         """Extract a flat [0,1] activity list from various result-dict formats.
