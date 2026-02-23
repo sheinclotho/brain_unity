@@ -167,6 +167,13 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 - **后端新增字段**: `handle_load_cache` 响应新增 `n_fmri_regions`（fMRI实际区域数）和 `n_eeg_channels`（EEG实际通道数），`_extract_time_series_both` 同步返回这两个值。
 - **规则**: 模态切换卡片必须永久可见，不可在无数据时隐藏；前端依赖的所有模态状态必须通过 `updateModalityToggle(modalities)` 统一管理。
 
+### [2026-02-23] 缓存文件时序数据截断 Bug（`_find_hetero_data` 只读第一块）
+
+- **问题**: `hetero_graphs.pt` 以 `Dict[task, List[HeteroData]]` 格式保存，每个 `HeteroData` 仅包含 `spatial_T=384` 帧（训练时为节省显存而切块）。但 `_find_hetero_data` 对列表只返回第一个元素（`data[0]`），导致加载后始终只有 384 帧，而非完整时序。例如原始录制 1152 帧 → 3 个 384 帧块 → 只读到第 1 块 = 384 帧。EC 推断的代理模型因样本严重不足而过拟合。
+- **根因**: 训练阶段为降低 GPU 内存峰值，将长时序切成若干定长窗口（`spatial_T`）并存入 `List[HeteroData]`；加载时没有将这些块拼接回完整序列。
+- **修复**: 新增 `_find_all_hetero_data(data)`，递归收集嵌套结构中的**所有** `HeteroData` 对象；`_extract_time_series_both` 改为对每个模态（fMRI/EEG）收集所有块的 `x_seq`，沿时间轴（dim=1）用 `torch.cat` 拼接，得到完整时序后再做归一化和帧生成。
+- **规则**: 任何从 `hetero_graphs.pt` 提取时序的代码都必须使用 `_find_all_hetero_data`（而非 `_find_hetero_data`）并拼接所有块。单块 `HeteroData` 的 `T` 维度不等于完整录制时长。
+
 ---
 
 *Last updated: 2026-02-23*
