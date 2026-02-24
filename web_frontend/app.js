@@ -517,11 +517,17 @@ document.getElementById('btn-stim').addEventListener('click', () => {
   }
 
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
+    // Include the currently-displayed brain state so the server can use the
+    // user's selected time point as the stimulation starting point.
+    const initial_state = frameSeq.length > 0
+      ? frameSeq[curFrame].activity
+      : regionMeshes.map(m => m.userData.activity);
     ws.send(JSON.stringify({
       type: "simulate",
       target_regions: targets,
       amplitude, pattern, frequency,
       duration: 60,
+      initial_state,
     }));
   } else {
     // Local demo stimulation: direct excitation + spatial spread

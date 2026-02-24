@@ -232,8 +232,10 @@ class PerturbationAnalyzer:
             train_hist.append(tl)
             val_hist.append(vl)
 
-            # Early stopping: restore best weights when val loss stops improving
-            if vl < best_val - 1e-7:
+            # Early stopping: restore best weights when val loss stops improving.
+            # 1e-4 threshold avoids halting on pure floating-point noise while
+            # still detecting genuine plateaus (original 1e-7 was too strict).
+            if vl < best_val - 1e-4:
                 best_val   = vl
                 no_improve = 0
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
@@ -499,7 +501,15 @@ class PerturbationAnalyzer:
             )
 
     def ec_to_dict(self, ec_matrix: Optional[np.ndarray] = None) -> dict:
-        """将 EC 矩阵转换为前端可用的 JSON 友好字典。"""
+        """将 EC 矩阵转换为前端可用的 JSON 友好字典。
+
+        The returned ``ec_flat`` is globally normalised so that the maximum
+        absolute value equals 1.0.  Without this step the raw Jacobian /
+        finite-difference values are typically O(0.001–0.01), which fall below
+        the 0.05 draw-threshold in the frontend and result in zero visible
+        connection lines.  Relative rankings (top_sources, top_targets) are
+        unaffected by scaling.
+        """
         if ec_matrix is None:
             ec_matrix = self._last_ec
         if ec_matrix is None:
@@ -507,8 +517,13 @@ class PerturbationAnalyzer:
         n = self.n_regions
         top_sources = self.suggest_targets(ec_matrix, 10, "outgoing")
         top_targets = self.suggest_targets(ec_matrix, 10, "incoming")
+        # Normalise to [-1, 1] so the frontend threshold (0.05) is meaningful.
+        # Use a small epsilon guard and explicitly copy to avoid returning a
+        # reference to the original matrix.
+        ec_max = float(np.abs(ec_matrix).max())
+        ec_norm = ec_matrix / ec_max if ec_max > 1e-12 else ec_matrix.copy()
         result = {
-            "ec_flat":      ec_matrix.flatten().tolist(),   # 200×200
+            "ec_flat":      ec_norm.flatten().tolist(),   # 200×200, normalised
             "top_sources":  top_sources,
             "top_targets":  top_targets,
             "n_regions":    n,

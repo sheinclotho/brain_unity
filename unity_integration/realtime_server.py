@@ -395,6 +395,9 @@ class BrainVisualizationServer:
             pattern = stimulation.get("pattern", "sine")
             frequency = stimulation.get("frequency", 10.0)
             duration = stimulation.get("duration", 20)
+            # The frontend sends the currently-displayed frame's activity so the
+            # stimulation starts from the user's actual selected brain state.
+            initial_state = stimulation.get("initial_state", None)
             
             # Validate target regions
             if not isinstance(target_regions, list) or len(target_regions) == 0:
@@ -493,6 +496,7 @@ class BrainVisualizationServer:
                 frequency=frequency,
                 duration=duration,
                 n_regions=n_regions,
+                initial_state=initial_state,
             )
             return {
                 "type": "simulation_result",
@@ -673,6 +677,7 @@ class BrainVisualizationServer:
         frequency: float,
         duration: int,
         n_regions: int = 200,
+        initial_state: list = None,
     ) -> list:
         """Generate a realistic stimulation animation without a trained model.
 
@@ -681,8 +686,12 @@ class BrainVisualizationServer:
           2. Stimulation active (``duration`` frames, capped at 60)
           3. Post-stim recovery (10 frames)
 
-        The baseline uses the same 7-network sinusoidal model as
-        ``handle_get_state`` so the stimulation starts from a plausible state.
+        When ``initial_state`` is provided (the user's selected time point
+        from loaded data), it is used as the starting brain state so the
+        stimulation is clearly anchored to the user's actual data rather than
+        a freshly generated synthetic baseline.  When omitted, the 7-network
+        sinusoidal model from ``handle_get_state`` is used as a fallback.
+
         Spatial spread is approximated via a Gaussian kernel over the
         Fibonacci-sphere positions baked into the visualisation (same formula
         as ``makeBrainPositions`` in app.js).
@@ -775,29 +784,54 @@ class BrainVisualizationServer:
         POST = 10
         frames = []
 
-        # 1. Pre-stim baseline
-        for k in range(PRE):
-            tick = t0 * 200 + k * 4
-            act = _baseline(tick)
-            frames.append({"activity": act.tolist()})
-
-        # 2. Stimulation active
-        for k in range(DUR):
-            tick = t0 * 200 + (PRE + k) * 4
-            act  = _baseline(tick)
-            amp  = _stim_amp(k)
-            if amp != 0.0:
-                act = np.clip(act + amp * spread_weights, 0.0, 1.0)
-            frames.append({"activity": act.tolist()})
-
-        # 3. Post-stim recovery (exponential decay of residual excitation)
-        post_baseline = _baseline(t0 * 200 + (PRE + DUR) * 4)
-        last_stim_act = np.array(frames[-1]["activity"], dtype=np.float32)
-        for k in range(POST):
-            decay = np.exp(-k / 4.0)
-            act   = post_baseline + (last_stim_act - post_baseline) * decay
-            act   = np.clip(act, 0.0, 1.0)
-            frames.append({"activity": act.tolist()})
+        # Use the user's actual brain state as the starting point when provided.
+        # This anchors the stimulation to the loaded data's selected time point
+        # rather than a freshly synthesised baseline.
+        if initial_state is not None and len(initial_state) >= n_regions:
+            if len(initial_state) > n_regions:
+                self.logger.warning(
+                    f"initial_state has {len(initial_state)} elements but n_regions={n_regions}; "
+                    "truncating — check frontend/backend region count mismatch"
+                )
+            init_arr = np.array(initial_state[:n_regions], dtype=np.float32)
+            # 1. Pre-stim: show the user's selected brain state unchanged
+            for _ in range(PRE):
+                frames.append({"activity": init_arr.tolist()})
+            # 2. Stimulation active: perturb the initial state
+            for k in range(DUR):
+                amp = _stim_amp(k)
+                act = np.clip(init_arr + amp * spread_weights, 0.0, 1.0)
+                frames.append({"activity": act.tolist()})
+            # 3. Post-stim recovery: exponential decay back to initial state
+            last_stim_act = np.array(frames[-1]["activity"], dtype=np.float32)
+            for k in range(POST):
+                decay = np.exp(-k / 4.0)
+                act   = init_arr + (last_stim_act - init_arr) * decay
+                act   = np.clip(act, 0.0, 1.0)
+                frames.append({"activity": act.tolist()})
+        else:
+            # Fallback: use the 7-network sinusoidal baseline (demo / no data loaded)
+            # 1. Pre-stim baseline
+            for k in range(PRE):
+                tick = t0 * 200 + k * 4
+                act = _baseline(tick)
+                frames.append({"activity": act.tolist()})
+            # 2. Stimulation active
+            for k in range(DUR):
+                tick = t0 * 200 + (PRE + k) * 4
+                act  = _baseline(tick)
+                amp  = _stim_amp(k)
+                if amp != 0.0:
+                    act = np.clip(act + amp * spread_weights, 0.0, 1.0)
+                frames.append({"activity": act.tolist()})
+            # 3. Post-stim recovery (exponential decay of residual excitation)
+            post_baseline = _baseline(t0 * 200 + (PRE + DUR) * 4)
+            last_stim_act = np.array(frames[-1]["activity"], dtype=np.float32)
+            for k in range(POST):
+                decay = np.exp(-k / 4.0)
+                act   = post_baseline + (last_stim_act - post_baseline) * decay
+                act   = np.clip(act, 0.0, 1.0)
+                frames.append({"activity": act.tolist()})
 
         return frames
 
