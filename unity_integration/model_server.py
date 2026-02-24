@@ -343,8 +343,14 @@ class ModelServer:
         t = np.linspace(0, n_steps * 0.5, n_steps)  # 时间轴（秒）
         
         if pattern == "sine":
-            # 正弦波
-            signal = amplitude * np.sin(2 * np.pi * frequency * t)
+            # Raw clinical-frequency sine (≥5 Hz) sampled at ~2 fps aliases to
+            # zero on every frame: sin(2π·10·0.5·k) = sin(10πk) = 0 for all k.
+            # Use the same bell-shaped neural-response envelope as _demo_simulate
+            # so both code paths produce consistent, visible stimulation effects.
+            progress    = np.linspace(0, 1, n_steps)
+            slow_cycles = min(frequency / 10.0, 3.0)   # ≤ 3 visible cycles
+            signal = amplitude * (np.sin(np.pi * progress)
+                                  + 0.20 * np.sin(2 * np.pi * slow_cycles * progress))
         
         elif pattern == "pulse":
             # 脉冲

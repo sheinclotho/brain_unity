@@ -137,6 +137,10 @@ class PerturbationAnalyzer:
         self._input_X:   Optional[np.ndarray]    = None   # (M, N*lags) – cached training inputs
         self._last_ec:   Optional[np.ndarray]    = None   # (N, N) – last computed EC matrix
         self._fit_quality: dict                  = {}     # last fit metrics (train/val MSE)
+        # Per-region z-score statistics from fit_surrogate, used in predict_trajectory
+        # to normalise new initial states into the same space the surrogate was trained on.
+        self._ts_mean: Optional[np.ndarray] = None   # (N,) float32
+        self._ts_std:  Optional[np.ndarray] = None   # (N,) float32
 
     # ── Surrogate training ──────────────────────────────────────────────────
 
@@ -177,6 +181,10 @@ class PerturbationAnalyzer:
         ts_mean = time_series.mean(axis=0, keepdims=True)
         ts_std  = np.maximum(time_series.std(axis=0, keepdims=True), 1e-6)
         ts_norm = (time_series - ts_mean) / ts_std
+
+        # Store per-region stats so predict_trajectory can re-normalise new states.
+        self._ts_mean = ts_mean.flatten().astype(np.float32)   # (N,)
+        self._ts_std  = ts_std.flatten().astype(np.float32)    # (N,)
 
         X, Y = _build_lag_dataset(ts_norm, self.n_lags)
         self._input_X = X          # 保存用于后续 EC 推断
@@ -458,6 +466,78 @@ class PerturbationAnalyzer:
 
         top_idx = np.argsort(scores)[::-1][:n_targets]
         return top_idx.tolist()
+
+    # ── Data-driven trajectory prediction ────────────────────────────────────
+
+    def predict_trajectory(
+        self,
+        initial_state: np.ndarray,
+        stim_weights: np.ndarray,
+        stim_fn: Callable[[int], float],
+        n_steps: int = 60,
+    ) -> List[dict]:
+        """Auto-regressive stimulation trajectory prediction using the trained surrogate.
+
+        This is the scientifically correct way to answer "what will this brain
+        do after stimulation?": apply a perturbation to the current state, feed
+        it through the MLP that was fitted on the *actual* fMRI/EEG time series,
+        and auto-regressively unroll the prediction.
+
+        Args:
+            initial_state : (N,) float32 activity in the same normalised [0,1]
+                            display space used when fit_surrogate was called.
+            stim_weights  : (N,) spatial distribution of the stimulation (0→1,
+                            peak = 1 at target regions, Gaussian falloff elsewhere).
+            stim_fn       : callable(step_index) → scalar stimulation amplitude.
+                            Returns 0 after stimulation ends (post-stim phase).
+            n_steps       : total number of future frames to predict.
+
+        Returns:
+            List of {"activity": [200 floats]} dicts, display space [0, 1].
+        """
+        self._require_surrogate()
+        if self._ts_mean is None or self._ts_std is None:
+            raise RuntimeError(
+                "Normalization stats missing; fit_surrogate must be called before "
+                "predict_trajectory."
+            )
+
+        std_safe  = np.maximum(self._ts_std, 1e-6)        # (N,) – avoids div-by-zero
+        init_norm = (initial_state.astype(np.float32) - self._ts_mean) / std_safe
+
+        # Build initial lag window by repeating the current z-scored state n_lags
+        # times.  This is the least-informative assumption when only one initial
+        # state is available; the surrogate quickly adapts after the first few
+        # auto-regressive steps.
+        lag_window = np.tile(init_norm, self.n_lags).astype(np.float32)  # (N*n_lags,)
+
+        frames = []
+        self._surrogate.eval()
+        with torch.no_grad():
+            for k in range(n_steps):
+                amp = float(stim_fn(k))
+                x = lag_window.copy()
+                if amp != 0.0:
+                    # Perturb the most-recent step (last N elements of the window)
+                    # in z-score space; stim_weights are in [0,1] display space so
+                    # we divide by std to bring them into z-score units.
+                    x[-self.n_regions:] += (amp * stim_weights / std_safe).astype(np.float32)
+
+                # Forward pass through the surrogate
+                x_t     = torch.tensor(x, dtype=torch.float32, device=self.device)
+                pred_zs = self._surrogate(x_t.unsqueeze(0)).squeeze(0).cpu().numpy()
+
+                # De-normalise back to display space
+                pred_display = np.clip(
+                    pred_zs * std_safe + self._ts_mean, 0.0, 1.0
+                ).astype(np.float32)
+                frames.append({"activity": pred_display.tolist()})
+
+                # Slide lag window: drop oldest step, append newest prediction
+                lag_window[:-self.n_regions] = lag_window[self.n_regions:]
+                lag_window[-self.n_regions:] = pred_zs
+
+        return frames
 
     # ── Activity delta prediction ────────────────────────────────────────────
 

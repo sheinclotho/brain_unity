@@ -438,12 +438,19 @@ class BrainVisualizationServer:
             # Use ModelServer if available
             if self.model_server:
                 self.logger.info(f"Using ModelServer for stimulation simulation")
+                # Convert the user's initial_state list to a tensor so ModelServer
+                # starts from the actual brain state rather than random noise.
+                init_tensor = None
+                if initial_state is not None:
+                    arr = np.array(initial_state[:n_regions], dtype=np.float32)
+                    init_tensor = torch.tensor(arr).unsqueeze(-1)  # (n_regions, 1)
                 responses = self.model_server.simulate_stimulation(
                     target_regions=target_regions,
                     amplitude=amplitude,
                     pattern=pattern,
                     frequency=frequency,
                     duration=duration,
+                    initial_state=init_tensor,
                     subject_id="stimulation"
                 )
                 
@@ -487,8 +494,97 @@ class BrainVisualizationServer:
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
                 }
-            # Demo simulation: realistic network-oscillation baseline + stimulation dynamics.
-            # This path is used when no trained model is available.
+
+            # ── Data-driven surrogate path (requires prior EC inference) ──────
+            # If the user has already run "推断有效连接", a trained MLP surrogate
+            # is available in _ec_analyzer_cache.  Use its predict_trajectory to
+            # produce a REAL data-driven forecast instead of generic Wilson-Cowan.
+            surrogate_frames = None
+            if initial_state is not None and self._ec_analyzer_cache:
+                analyzer = list(self._ec_analyzer_cache.values())[-1]
+                if (analyzer._surrogate is not None
+                        and analyzer._ts_mean is not None
+                        and analyzer.n_regions == n_regions):
+                    try:
+                        # Compute Gaussian spatial spread weights (same as _demo_simulate)
+                        def _bp():
+                            daz = 2 * np.pi * (2 - (1 + np.sqrt(5)) / 2)
+                            pos = []
+                            for h in range(2):
+                                sign = -1 if h == 0 else 1
+                                for i in range(100):
+                                    t_ = (i + 0.5) / 100.0
+                                    el = 1.0 - 1.85 * t_
+                                    r  = np.sqrt(max(0.0, 1 - el * el))
+                                    az = daz * i
+                                    lat = abs(r * np.cos(az)) * 0.85 + 0.15
+                                    bulge = 9 * np.exp(-((el + 0.22) ** 2) * 5)
+                                    pos.append([sign * (lat * 55 + bulge + 9),
+                                                el * 63 - 4, r * np.sin(az) * 76 - 8])
+                            return np.array(pos, dtype=np.float32)
+
+                        _pos = _bp()
+                        sw = np.zeros(n_regions, dtype=np.float32)
+                        for tid in target_regions:
+                            if 0 <= tid < n_regions:
+                                d = np.linalg.norm(_pos - _pos[tid], axis=1)
+                                sw += np.exp(-(d ** 2) / (2 * 30.0 ** 2))
+                        if sw.max() > 0:
+                            sw /= sw.max()
+
+                        PRE_s = 10
+                        DUR_s = min(int(duration), 60)
+                        POST_s = 10
+
+                        def _stim_amp_s(k):
+                            progress = k / max(DUR_s - 1, 1)
+                            if pattern == "sine":
+                                slow_c = min(frequency / 10.0, 3.0)
+                                return amplitude * (np.sin(np.pi * progress)
+                                                    + 0.20 * np.sin(2 * np.pi * slow_c * progress))
+                            elif pattern == "pulse":
+                                return amplitude * np.exp(-k * 0.12)
+                            elif pattern == "ramp":
+                                return amplitude * progress
+                            else:
+                                return amplitude * min(1.0, k / max(DUR_s * 0.15, 1.0))
+
+                        def _stim_fn(k):
+                            if k < DUR_s:
+                                return _stim_amp_s(k)
+                            return 0.0  # post-stim
+
+                        init_arr = np.array(initial_state[:n_regions], dtype=np.float32)
+
+                        traj = analyzer.predict_trajectory(
+                            initial_state=init_arr,
+                            stim_weights=sw,
+                            stim_fn=_stim_fn,
+                            n_steps=DUR_s + POST_s,
+                        )
+                        # Pre-stim: static display of user's selected state
+                        pre_frames = [{"activity": init_arr.tolist()}] * PRE_s
+                        surrogate_frames = pre_frames + traj
+                        self.logger.info(
+                            f"使用已训练代理模型预测刺激轨迹 ({len(surrogate_frames)} 帧)"
+                        )
+                    except Exception as _exc:
+                        self.logger.warning(
+                            f"代理预测失败，回退到 Wilson-Cowan: {_exc}"
+                        )
+                        surrogate_frames = None
+
+            if surrogate_frames is not None:
+                return {
+                    "type": "simulation_result",
+                    "success": True,
+                    "n_frames": len(surrogate_frames),
+                    "frames": surrogate_frames,
+                    "modality": "simulation",
+                    "method": "surrogate_mlp",
+                }
+
+            # Final fallback: Wilson-Cowan recurrent dynamics (no trained model needed).
             frames = self._demo_simulate(
                 target_regions=target_regions,
                 amplitude=amplitude,
@@ -504,6 +600,7 @@ class BrainVisualizationServer:
                 "n_frames": len(frames),
                 "frames": frames,
                 "modality": "simulation",
+                "method": "wilson_cowan",
             }
                 
         except Exception as e:
@@ -781,12 +878,43 @@ class BrainVisualizationServer:
                 return amplitude * progress
             else:  # constant / unknown — smooth ramp-up to avoid sudden color jump
                 return amplitude * min(1.0, relative_t / max(DUR * 0.15, 1.0))
-        POST = 10
+        # ── Connectivity matrix for recurrent neural dynamics ─────────────
+        # Gaussian coupling strength using the same Fibonacci positions already
+        # computed above.  Sigma is 50% wider than stimulation spread so that
+        # excitation can propagate into neighbouring networks over time.
+        # Rows are L1-normalised so the network activity stays bounded.
+        _CONN_SIGMA_MM = _SPREAD_SIGMA_MM * 1.5
+        D = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=2)
+        W = np.exp(-(D ** 2) / (2 * _CONN_SIGMA_MM ** 2))
+        np.fill_diagonal(W, 0.0)
+        row_sums = W.sum(axis=1, keepdims=True)
+        W = np.where(row_sums > 0, W / row_sums, W).astype(np.float32)
+
+        # Fixed seed so the noise is reproducible (same run → same animation).
+        rng = np.random.default_rng(0)
+
+        def _wc_step(state: np.ndarray, stim_in: np.ndarray) -> np.ndarray:
+            """One Wilson-Cowan recurrent update step.
+
+            state   : (N,) float32, current normalised activity in [0, 1]
+            stim_in : (N,) float32, external stimulation input (0 = no stim)
+
+            Each region's next-state depends on:
+              - its own current state   (memory, via decay coefficient 0.82)
+              - direct stimulation      (stim_in)
+              - connectivity-weighted input from all other regions (W @ state)
+            This matches the Wilson-Cowan model in ModelServer.simulate_stimulation
+            so both code paths are behaviourally consistent.
+            """
+            net        = W @ state                                 # (N,) recurrent input
+            excitation = np.tanh(state + stim_in + net * 0.25)    # WC activation
+            noise      = rng.standard_normal(n_regions).astype(np.float32) * 0.015
+            return np.clip(state * 0.82 + excitation * 0.18 + noise, 0.0, 1.0)
+
+        _NO_STIM = np.zeros(n_regions, dtype=np.float32)
+        POST  = 10
         frames = []
 
-        # Use the user's actual brain state as the starting point when provided.
-        # This anchors the stimulation to the loaded data's selected time point
-        # rather than a freshly synthesised baseline.
         if initial_state is not None and len(initial_state) >= n_regions:
             if len(initial_state) > n_regions:
                 self.logger.warning(
@@ -794,44 +922,46 @@ class BrainVisualizationServer:
                     "truncating — check frontend/backend region count mismatch"
                 )
             init_arr = np.array(initial_state[:n_regions], dtype=np.float32)
-            # 1. Pre-stim: show the user's selected brain state unchanged
+
+            # 1. Pre-stim: show the user's selected brain state (static snapshot)
             for _ in range(PRE):
                 frames.append({"activity": init_arr.tolist()})
-            # 2. Stimulation active: perturb the initial state
+
+            # 2. Stimulation active: Wilson-Cowan recurrent dynamics.
+            #    CRITICALLY: each step evolves from the *previous step's state*,
+            #    NOT from init_arr.  This means the stimulation effect accumulates
+            #    and propagates through the connectivity matrix over time — the
+            #    simulation has genuine temporal memory.
+            current = init_arr.copy()
             for k in range(DUR):
-                amp = _stim_amp(k)
-                act = np.clip(init_arr + amp * spread_weights, 0.0, 1.0)
-                frames.append({"activity": act.tolist()})
-            # 3. Post-stim recovery: exponential decay back to initial state
-            last_stim_act = np.array(frames[-1]["activity"], dtype=np.float32)
-            for k in range(POST):
-                decay = np.exp(-k / 4.0)
-                act   = init_arr + (last_stim_act - init_arr) * decay
-                act   = np.clip(act, 0.0, 1.0)
-                frames.append({"activity": act.tolist()})
+                current = _wc_step(current, _stim_amp(k) * spread_weights)
+                frames.append({"activity": current.tolist()})
+
+            # 3. Post-stim: continued recurrent dynamics with no external input.
+            #    The brain naturally evolves (and gradually relaxes) from the
+            #    post-stim state rather than jumping back to init_arr.
+            for _ in range(POST):
+                current = _wc_step(current, _NO_STIM)
+                frames.append({"activity": current.tolist()})
+
         else:
-            # Fallback: use the 7-network sinusoidal baseline (demo / no data loaded)
-            # 1. Pre-stim baseline
+            # Fallback: no data loaded — start from sinusoidal 7-network baseline.
+            # 1. Pre-stim baseline (sinusoidal)
             for k in range(PRE):
-                tick = t0 * 200 + k * 4
-                act = _baseline(tick)
-                frames.append({"activity": act.tolist()})
-            # 2. Stimulation active
+                frames.append({"activity": _baseline(t0 * 200 + k * 4).tolist()})
+
+            # 2. Stimulation active: begin from the *last* pre-stim state, then
+            #    apply recurrent Wilson-Cowan dynamics — not a fresh baseline each
+            #    frame.  Stimulation effect now accumulates over time.
+            current = np.array(frames[-1]["activity"], dtype=np.float32)
             for k in range(DUR):
-                tick = t0 * 200 + (PRE + k) * 4
-                act  = _baseline(tick)
-                amp  = _stim_amp(k)
-                if amp != 0.0:
-                    act = np.clip(act + amp * spread_weights, 0.0, 1.0)
-                frames.append({"activity": act.tolist()})
-            # 3. Post-stim recovery (exponential decay of residual excitation)
-            post_baseline = _baseline(t0 * 200 + (PRE + DUR) * 4)
-            last_stim_act = np.array(frames[-1]["activity"], dtype=np.float32)
-            for k in range(POST):
-                decay = np.exp(-k / 4.0)
-                act   = post_baseline + (last_stim_act - post_baseline) * decay
-                act   = np.clip(act, 0.0, 1.0)
-                frames.append({"activity": act.tolist()})
+                current = _wc_step(current, _stim_amp(k) * spread_weights)
+                frames.append({"activity": current.tolist()})
+
+            # 3. Post-stim: continued recurrent dynamics without stimulation
+            for _ in range(POST):
+                current = _wc_step(current, _NO_STIM)
+                frames.append({"activity": current.tolist()})
 
         return frames
 
