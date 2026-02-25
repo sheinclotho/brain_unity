@@ -305,8 +305,11 @@ class BrainStateAnalyzer:
             surrogate.eval()
             N = n_regions
             ec = np.zeros((N, N), dtype=np.float32)
+            # Ensure input tensor lives on the same device as the surrogate model
+            # to avoid a RuntimeError when the model was trained on CUDA.
+            device = next(surrogate.parameters()).device
             with torch.no_grad():
-                X_t    = torch.tensor(X_arr, dtype=torch.float32)
+                X_t    = torch.tensor(X_arr, dtype=torch.float32).to(device)
                 base   = surrogate(X_t).cpu().numpy()
                 for j in range(N):
                     X_pert = X_t.clone()

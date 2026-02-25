@@ -253,9 +253,25 @@
         无标签异常检测：偏差图谱 / 连接枢纽分析
       </p>
       <select id="analysis-method">
-        <option value="deviation">时段偏差图谱（前半 vs 后半）</option>
+        <option value="deviation">时段偏差图谱（自定义窗口）</option>
         <option value="graph_metrics">连接枢纽分析（需先推断 EC）</option>
       </select>
+      <!-- Window controls (shown only for deviation method) -->
+      <div id="analysis-windows" style="margin-top:7px;font-size:0.73rem;color:#666;line-height:2">
+        <span style="color:#555">窗口1 (帧，空=自动):</span><br/>
+        <div style="display:flex;align-items:center;gap:4px">
+          <input id="w1s" type="text" placeholder="起" style="width:46px;padding:3px 5px;background:#111222;border:1px solid rgba(255,255,255,0.14);color:#e0e0ff;border-radius:4px;font-size:0.78rem"/>
+          <span>—</span>
+          <input id="w1e" type="text" placeholder="止" style="width:46px;padding:3px 5px;background:#111222;border:1px solid rgba(255,255,255,0.14);color:#e0e0ff;border-radius:4px;font-size:0.78rem"/>
+        </div>
+        <span style="color:#555">窗口2 (帧，空=自动):</span><br/>
+        <div style="display:flex;align-items:center;gap:4px">
+          <input id="w2s" type="text" placeholder="起" style="width:46px;padding:3px 5px;background:#111222;border:1px solid rgba(255,255,255,0.14);color:#e0e0ff;border-radius:4px;font-size:0.78rem"/>
+          <span>—</span>
+          <input id="w2e" type="text" placeholder="止" style="width:46px;padding:3px 5px;background:#111222;border:1px solid rgba(255,255,255,0.14);color:#e0e0ff;border-radius:4px;font-size:0.78rem"/>
+        </div>
+        <span style="color:#444;font-size:0.7rem">留空则自动以中点等分前后半</span>
+      </div>
       <div class="gap6"></div>
       <button id="btn-analyze" class="btn-primary">📊 分析大脑状态</button>
       <p id="analysis-status" style="font-size:0.73rem;color:#666;margin-top:6px;line-height:1.5"></p>

@@ -129,6 +129,10 @@ class BrainVisualizationServer:
         # handle_analyze_brain can access it without re-loading the .pt file.
         self._loaded_time_series: Optional["np.ndarray"] = None  # (T, 200)
         self._loaded_cache_path:  Optional[str]          = None
+        # Raw (un-per-frame-normalized) time series for deviation analysis.
+        # EEG per-frame normalization loses temporal structure, making z-score
+        # deviation maps near-zero.  The raw series preserves real task differences.
+        self._loaded_raw_time_series: Optional["np.ndarray"] = None  # (T, 200)
     
     async def register_client(self, websocket):
         """Register a new client connection."""
@@ -1003,7 +1007,14 @@ class BrainVisualizationServer:
                 "message": "请先加载 .pt 文件，再使用偏差分析",
             }
 
-        ts = self._loaded_time_series   # (T, 200)
+        # Prefer raw (un-normalised) time series so that per-frame-normalised EEG
+        # data retains genuine between-task amplitude differences.  Fall back to
+        # the normalised series if no raw data was stored (e.g. fMRI global-norm).
+        ts = (
+            self._loaded_raw_time_series
+            if self._loaded_raw_time_series is not None
+            else self._loaded_time_series
+        )   # (T, 200)
         T  = len(ts)
         if T < 6:
             return {"type": "error", "success": False,
@@ -1025,6 +1036,7 @@ class BrainVisualizationServer:
             overlay, summary = BrainStateAnalyzer.compute_deviation_map(ref_ts, test_ts)
             summary["window1"] = f"帧 {w1s}–{w1e}"
             summary["window2"] = f"帧 {w2s}–{w2e}"
+            summary["total_frames"] = T
             self.logger.info(
                 f"偏差分析完成: 均值z={summary['mean_z_score']}, "
                 f"最大z={summary['max_z_score']}, "
@@ -1220,9 +1232,15 @@ class BrainVisualizationServer:
                 )
             init_arr = np.array(initial_state[:n_regions], dtype=np.float32)
 
-            # 1. Pre-stim: show the user's selected brain state (static snapshot)
+            # 1. Pre-stim: run WC free dynamics (no stimulation) starting from the
+            #    user's selected brain state.  Using DYNAMIC frames rather than
+            #    static copies means the pre-stim phase shows genuine neural
+            #    evolution — and critically, each simulation from a DIFFERENT
+            #    initial state will look visually distinct in the pre-stim window.
+            current = init_arr.copy()
             for _ in range(PRE):
-                frames.append({"activity": init_arr.tolist()})
+                current = _wc_step(current, _NO_STIM)
+                frames.append({"activity": current.tolist()})
 
             # 2. Stimulation active: Wilson-Cowan recurrent dynamics.
             #    CRITICALLY: each step evolves from the *previous step's state*,
@@ -1448,8 +1466,18 @@ class BrainVisualizationServer:
                 [f["activity"] for f in primary], dtype=np.float32
             )   # (T, 200)
             self._loaded_cache_path = str(cache_path)
+            # Also store raw (un-per-frame-normalised) values so that the deviation
+            # analysis uses the original sensor amplitudes, not normalised [0,1] data.
+            # EEG frames are per-frame min-max normalised (loses temporal structure);
+            # raw values preserve the genuine between-task amplitude differences.
+            if primary and "raw" in primary[0]:
+                self._loaded_raw_time_series = np.array(
+                    [f.get("raw", f["activity"]) for f in primary], dtype=np.float32
+                )   # (T, 200)
+            else:
+                self._loaded_raw_time_series = None
         except Exception:
-            pass
+            self._loaded_raw_time_series = None
 
         return {
             "type":           "cache_loaded",
