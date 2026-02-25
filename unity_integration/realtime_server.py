@@ -1187,11 +1187,9 @@ class BrainVisualizationServer:
                 return amplitude * progress
             else:  # constant / unknown — smooth ramp-up to avoid sudden color jump
                 return amplitude * min(1.0, relative_t / max(DUR * 0.15, 1.0))
-        # ── Connectivity matrix for recurrent neural dynamics ─────────────
-        # Gaussian coupling strength using the same Fibonacci positions already
-        # computed above.  Sigma is 50% wider than stimulation spread so that
-        # excitation can propagate into neighbouring networks over time.
-        # Rows are L1-normalised so the network activity stays bounded.
+        # ── Connectivity matrix for spatial propagation of deviations ────────
+        # Used only to spread *deviations from baseline* to neighbouring regions.
+        # L1-normalised so propagation stays bounded.
         _CONN_SIGMA_MM = _SPREAD_SIGMA_MM * 1.5
         D = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=2)
         W = np.exp(-(D ** 2) / (2 * _CONN_SIGMA_MM ** 2))
@@ -1202,28 +1200,7 @@ class BrainVisualizationServer:
         # Fixed seed so the noise is reproducible (same run → same animation).
         rng = np.random.default_rng(0)
 
-        def _wc_step(state: np.ndarray, stim_in: np.ndarray) -> np.ndarray:
-            """One Wilson-Cowan recurrent update step.
-
-            state   : (N,) float32, current normalised activity in [0, 1]
-            stim_in : (N,) float32, external stimulation input (0 = no stim)
-
-            Each region's next-state depends on:
-              - its own current state   (memory, via decay coefficient 0.82)
-              - direct stimulation      (stim_in)
-              - connectivity-weighted input from all other regions (W @ state)
-            This matches the Wilson-Cowan model in ModelServer.simulate_stimulation
-            so both code paths are behaviourally consistent.
-            """
-            net        = W @ state                                 # (N,) recurrent input
-            excitation = np.tanh(state + stim_in + net * 0.25)    # WC activation
-            noise      = rng.standard_normal(n_regions).astype(np.float32) * 0.015
-            return np.clip(state * 0.82 + excitation * 0.18 + noise, 0.0, 1.0)
-
-        _NO_STIM = np.zeros(n_regions, dtype=np.float32)
-        POST  = 10
-        frames = []
-
+        # ── Determine baseline (init_arr) for both simulation paths ──────────
         if initial_state is not None and len(initial_state) >= n_regions:
             if len(initial_state) > n_regions:
                 self.logger.warning(
@@ -1231,29 +1208,53 @@ class BrainVisualizationServer:
                     "truncating — check frontend/backend region count mismatch"
                 )
             init_arr = np.array(initial_state[:n_regions], dtype=np.float32)
+        else:
+            # Fallback: use the sinusoidal 7-network baseline at PRE-1 as reference
+            init_arr = _baseline(t0 * 200 + (PRE - 1) * 4)
 
+        def _wc_step(state: np.ndarray, stim_in: np.ndarray) -> np.ndarray:
+            """Deviation-based leaky integrator with local spatial propagation.
+
+            Fixes the original model's 0.7-attractor bug: the previous formula
+            ``tanh(state + stim + net*0.25)`` had a non-zero fixed point at ~0.7
+            so ALL regions converged to yellow regardless of stimulation.
+
+            This model uses init_arr as the stable resting equilibrium:
+              - deviation = state − init_arr  (0 when at rest)
+              - net_dev   = W @ deviation      (only deviations propagate, not
+                                                absolute activity; prevents
+                                                global saturation)
+              - delta     = tanh(stim_in*2.0 + net_dev*0.35) * 0.04
+              - leak      = deviation * 0.10   (returns to init_arr in ~10 steps)
+
+            Without stimulation: deviation stays at 0 → state stable at init_arr.
+            With stimulation:    target regions rise clearly above init_arr;
+                                 leak prevents runaway saturation.
+            """
+            deviation = state - init_arr
+            net_dev   = W @ deviation
+            delta     = np.tanh(stim_in * 2.0 + net_dev * 0.35) * 0.04
+            leak      = deviation * 0.10
+            noise     = rng.standard_normal(n_regions).astype(np.float32) * 0.008
+            return np.clip(state + delta - leak + noise, 0.0, 1.0)
+
+        _NO_STIM = np.zeros(n_regions, dtype=np.float32)
+        POST  = 10
+        frames = []
+
+        if initial_state is not None and len(initial_state) >= n_regions:
             # 1. Pre-stim: static snapshot of the user's selected brain state.
-            # Showing STATIC frames for 1 second clearly anchors the user to their
-            # chosen data point and avoids the WC-attractor drift that would make
-            # different initial states look the same before stimulation even starts.
-            # The stim phase (below) then begins from this exact state, so there
-            # is no snap-back discontinuity at the pre→stim boundary.
             for _ in range(PRE):
                 frames.append({"activity": init_arr.tolist()})
 
-            # 2. Stimulation active: Wilson-Cowan recurrent dynamics.
-            #    CRITICALLY: each step evolves from the *previous step's state*,
-            #    NOT from init_arr.  This means the stimulation effect accumulates
-            #    and propagates through the connectivity matrix over time — the
-            #    simulation has genuine temporal memory.
+            # 2. Stimulation active: deviation-based WC dynamics from init_arr.
             current = init_arr.copy()
             for k in range(DUR):
                 current = _wc_step(current, _stim_amp(k) * spread_weights)
                 frames.append({"activity": current.tolist()})
 
-            # 3. Post-stim: continued recurrent dynamics with no external input.
-            #    The brain naturally evolves (and gradually relaxes) from the
-            #    post-stim state rather than jumping back to init_arr.
+            # 3. Post-stim: continued dynamics with no external input.
+            #    Leak pulls state back toward init_arr naturally.
             for _ in range(POST):
                 current = _wc_step(current, _NO_STIM)
                 frames.append({"activity": current.tolist()})
@@ -1264,15 +1265,13 @@ class BrainVisualizationServer:
             for k in range(PRE):
                 frames.append({"activity": _baseline(t0 * 200 + k * 4).tolist()})
 
-            # 2. Stimulation active: begin from the *last* pre-stim state, then
-            #    apply recurrent Wilson-Cowan dynamics — not a fresh baseline each
-            #    frame.  Stimulation effect now accumulates over time.
+            # 2. Stimulation active: deviation-based WC from last pre-stim frame.
             current = np.array(frames[-1]["activity"], dtype=np.float32)
             for k in range(DUR):
                 current = _wc_step(current, _stim_amp(k) * spread_weights)
                 frames.append({"activity": current.tolist()})
 
-            # 3. Post-stim: continued recurrent dynamics without stimulation
+            # 3. Post-stim: return to baseline
             for _ in range(POST):
                 current = _wc_step(current, _NO_STIM)
                 frames.append({"activity": current.tolist()})

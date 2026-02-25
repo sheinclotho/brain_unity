@@ -239,4 +239,10 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 - **正确框架**: 规范建模（normative modeling），见 `项目规范说明书.md` 第 14 节。
 - **规则**: TwinBrain 的分析结论只说"与自身参考状态相比异常"，绝不使用"疾病"或"诊断"等词汇。
 
+### [2026-02-25] WC 模型 ~0.70 全局引力点 & 未选脑区静默刺激
+- **Bug 1（前端）**: 未选中任何脑区时，旧代码随机选 5 个区域施加刺激，用户不知道刺激了什么。修复：显示警告并立即返回，不发送请求。
+- **Bug 2（后端）**: `_demo_simulate` 中 Wilson-Cowan 步进公式 `tanh(state + stim_in + net*0.25)` 在 L1 归一化连接矩阵下有 `state ≈ 0.70` 的全局引力点，所有区域无论是否被刺激都会收敛到黄色，刺激效果不可见。
+- **修复**: 改用以 `init_arr` 为稳定平衡点的偏差驱动漏积分器 `delta = tanh(stim*2.0 + W@deviation*0.35)*0.04; leak = deviation*0.10`，固定点在 `init_arr` 处，不施加刺激时不产生任何漂移。
+- **规则**: Wilson-Cowan 式模型中，连接项必须作用于**偏差**（`state - baseline`）而非绝对活动，否则 L1 归一化连接矩阵几乎必然在某个中间值处产生虚假引力点。刺激幅度应以归一化活动为单位（0–1），不应超过 0.04/步，以避免单帧跳跃。
+
 *Last updated: 2026-02-25*
