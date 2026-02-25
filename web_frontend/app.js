@@ -498,7 +498,7 @@ function setModalityBadge(label) {
 // ── Timeline ──────────────────────────────────────────────────────────────────
 // isSimulation=true: frames come from a stimulation run (don't overwrite origFrames)
 // isSimulation=false: frames come from cache load or modality switch (real data)
-function loadFrameSeq(frames, label, modality, isSimulation = false) {
+function loadFrameSeq(frames, label, modality, isSimulation = false, startAt = 0) {
   viewingSimulation = isSimulation;
   // Keep origFrames pointing at the most recently loaded real data.
   // Simulation results must NOT overwrite this so that subsequent "施加刺激"
@@ -506,21 +506,35 @@ function loadFrameSeq(frames, label, modality, isSimulation = false) {
   // output of a previous simulation.
   if (!isSimulation) {
     origFrames   = frames;
-    origCurFrame = 0;
+    origCurFrame = startAt;
   }
   frameSeq  = frames;
-  curFrame  = 0;
+  curFrame  = startAt;
   slider.min   = 0;
   slider.max   = Math.max(0, frames.length - 1);
-  slider.value = 0;
+  slider.value = startAt;
   updateFrameLabel();
   document.getElementById('frame-info').textContent =
     `${frames.length} 帧${label ? ' — ' + label.split(/[\\/]/).pop() : ''}`;
   // Show modality badge
   setModalityBadge(modality || null);
-  if (frames[0]) updateActivity(frames[0].activity, frames[0].raw);
+  // Show/hide "↩ 返回数据" button
+  _updateReturnDataBtn();
+  if (frames[startAt]) updateActivity(frames[startAt].activity, frames[startAt].raw);
   playSeq();
 }
+
+function _updateReturnDataBtn() {
+  const btn = document.getElementById('btn-return-data');
+  if (!btn) return;
+  if (viewingSimulation && origFrames.length > 0) {
+    btn.style.display = '';
+    btn.title = `↩ 返回原始数据（第 ${origCurFrame + 1} 帧）`;
+  } else {
+    btn.style.display = 'none';
+  }
+}
+
 
 function updateFrameLabel() {
   frameLabel.textContent = frameSeq.length > 0
@@ -579,26 +593,30 @@ document.getElementById('btn-stim').addEventListener('click', () => {
   }
 
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
-    // ALWAYS use original loaded data as the stimulation starting point.
-    // If the user is viewing a previous simulation result (viewingSimulation=true),
-    // frameSeq holds simulation frames.  Using origFrames[origCurFrame] ensures
-    // the new simulation starts from REAL brain activity, not a prior simulation
-    // output — which is what makes repeated simulations at different time points
-    // produce genuinely different results.
-    //
-    // origCurFrame is updated whenever the slider moves or play advances in
-    // non-simulation mode, so it reflects the user's last scrub position in
-    // the original data.
+    // Determine initial_state: always start from REAL data (origFrames), not from
+    // a previous simulation.  While viewing a simulation (viewingSimulation=true),
+    // origCurFrame is frozen at the last position in the original data — this
+    // ensures repeated clicks always start from the same fixed reference frame
+    // and users can change that reference by clicking "↩ 返回数据" and advancing.
     let initial_state;
+    let srcLabel = '';
     if (origFrames.length > 0) {
-      // Snapshot the current position in original data before we trigger a new simulation
-      if (!viewingSimulation) origCurFrame = curFrame;
+      if (!viewingSimulation) origCurFrame = curFrame;  // snapshot current real-data position
       const srcIdx = Math.min(origCurFrame, origFrames.length - 1);
       initial_state = origFrames[srcIdx].activity;
+      srcLabel = `（数据第 ${srcIdx + 1} 帧）`;
     } else if (frameSeq.length > 0) {
       initial_state = frameSeq[curFrame].activity;
     } else {
       initial_state = regionMeshes.map(m => m.userData.activity);
+    }
+    // Briefly show which data frame the simulation will start from
+    const stimBtn = document.getElementById('btn-stim');
+    if (srcLabel) {
+      const origText = stimBtn.textContent;
+      stimBtn.textContent = `⚡ 仿真中 ${srcLabel}`;
+      stimBtn.disabled = true;
+      setTimeout(() => { stimBtn.textContent = origText; stimBtn.disabled = false; }, 3000);
     }
     ws.send(JSON.stringify({
       type: "simulate",
@@ -679,9 +697,11 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   slider.max = 0;
   slider.value = 0;
   updateFrameLabel();
-  // Hide counterfactual toggle
+  // Hide counterfactual toggle and return-data button
   const cfBtn = document.getElementById('btn-cf-toggle');
   if (cfBtn) cfBtn.style.display = 'none';
+  const rdBtn = document.getElementById('btn-return-data');
+  if (rdBtn) rdBtn.style.display = 'none';
   // Reset analysis and validation status
   document.getElementById('analysis-status').textContent = '';
   document.getElementById('ec-validation-status').textContent = '';
@@ -916,6 +936,24 @@ document.getElementById('btn-cf-toggle').addEventListener('click', () => {
     cfBtn.style.borderColor = 'rgba(255,160,44,0.4)';
     loadFrameSeq(stimFrames.length > 0 ? stimFrames : [], null, '⚡ 仿真', true);
   }
+});
+
+// ── Return to original data ────────────────────────────────────────────────────
+document.getElementById('btn-return-data').addEventListener('click', () => {
+  if (!origFrames.length) return;
+  // Determine the modality label
+  let label = null;
+  if (framesFmri.length > 0 && activeModality === 'fmri') label = 'fMRI';
+  else if (framesEeg.length > 0 && activeModality === 'eeg') label = 'EEG';
+  // Hide the CF toggle (simulation context is gone)
+  const cfBtn = document.getElementById('btn-cf-toggle');
+  if (cfBtn) cfBtn.style.display = 'none';
+  counterFactualFrames = [];
+  showingCounterFactual = false;
+  // Restore original data at the frame the user was on before simulation started
+  loadFrameSeq(origFrames, null, label, false, origCurFrame);
+  // Pause immediately so the user can see the exact frame they paused on
+  pauseSeq();
 });
 
 // ── EC Validation ─────────────────────────────────────────────────────────────

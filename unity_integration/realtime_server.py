@@ -1232,15 +1232,14 @@ class BrainVisualizationServer:
                 )
             init_arr = np.array(initial_state[:n_regions], dtype=np.float32)
 
-            # 1. Pre-stim: run WC free dynamics (no stimulation) starting from the
-            #    user's selected brain state.  Using DYNAMIC frames rather than
-            #    static copies means the pre-stim phase shows genuine neural
-            #    evolution — and critically, each simulation from a DIFFERENT
-            #    initial state will look visually distinct in the pre-stim window.
-            current = init_arr.copy()
+            # 1. Pre-stim: static snapshot of the user's selected brain state.
+            # Showing STATIC frames for 1 second clearly anchors the user to their
+            # chosen data point and avoids the WC-attractor drift that would make
+            # different initial states look the same before stimulation even starts.
+            # The stim phase (below) then begins from this exact state, so there
+            # is no snap-back discontinuity at the pre→stim boundary.
             for _ in range(PRE):
-                current = _wc_step(current, _NO_STIM)
-                frames.append({"activity": current.tolist()})
+                frames.append({"activity": init_arr.tolist()})
 
             # 2. Stimulation active: Wilson-Cowan recurrent dynamics.
             #    CRITICALLY: each step evolves from the *previous step's state*,

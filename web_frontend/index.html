@@ -303,6 +303,13 @@
   <input type="range" id="timeline-slider" min="0" max="0" value="0" />
   <span id="modality-badge"></span>
   <span id="frame-label">—</span>
+  <!-- Shown while viewing a simulation: click to go back to original data -->
+  <button id="btn-return-data" title="返回原始数据帧"
+          style="display:none;width:auto;padding:4px 10px;font-size:0.75rem;
+                 background:rgba(100,220,120,0.15);border:1px solid rgba(100,220,120,0.35);
+                 color:#88ffaa;border-radius:5px;white-space:nowrap;flex-shrink:0">
+    ↩ 返回数据
+  </button>
   <button id="btn-cf-toggle" title="切换至对照轨迹（无刺激基线）"
           style="display:none;width:auto;padding:4px 10px;font-size:0.75rem;
                  background:rgba(255,160,44,0.18);border:1px solid rgba(255,160,44,0.4);
