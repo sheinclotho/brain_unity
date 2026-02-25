@@ -301,6 +301,24 @@ class BrainStateAnalyzer:
         X1   = input_X[:half]
         X2   = input_X[half:] if half < M else input_X   # guard: if only 1 sample
 
+        # Require at least 5 samples per half for a meaningful comparison.
+        # With fewer samples the EC estimate is dominated by noise; the
+        # correlation between EC₁ and EC₂ would be artificially high (≈ 1.0)
+        # because both halves reflect the same surrogate outputs on the same
+        # data, giving false confidence.
+        MIN_SAMPLES_PER_HALF = 5
+        if len(X1) < MIN_SAMPLES_PER_HALF or len(X2) < MIN_SAMPLES_PER_HALF:
+            detail = {
+                "half_split_r": None,
+                "n_samples_h1": len(X1),
+                "n_samples_h2": len(X2),
+                "interpretation": (
+                    f"样本不足（h1={len(X1)}, h2={len(X2)}），"
+                    f"每半部分至少需要 {MIN_SAMPLES_PER_HALF} 个样本才能评估可靠性"
+                ),
+            }
+            return 0.0, detail
+
         def _compute_ec(X_arr):
             surrogate.eval()
             N = n_regions

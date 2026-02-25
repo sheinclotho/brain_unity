@@ -44,6 +44,10 @@ let origCurFrame = 0;     // frame index the user was at in the original data
 let viewingSimulation = false;  // true when frameSeq holds simulation output
 // Backup of the last stimulation frames (used to restore after CF toggle).
 let stimFrames  = [];
+// Track whether a stimulation request is pending (waiting for server response).
+// Used to lock the stim button until the result arrives, preventing duplicate
+// requests if the server takes longer than the original 3-second timeout.
+let stimPending = false;
 
 // ── Guard: Three.js must be loaded ────────────────────────────────────────────
 if (typeof THREE === 'undefined') {
@@ -341,6 +345,10 @@ function handleMsg(msg) {
     if (frameSeq.length === 0) updateActivity(msg.activity);
     return;
   }
+  // Unlock stim button whenever a simulation result or error arrives
+  if (msg.type === 'simulation_result' || msg.type === 'error') {
+    _unlockStimBtn();
+  }
   // Multi-frame sequence (stimulation result or cache data)
   if ((msg.type === 'simulation_result' || msg.type === 'cache_loaded')
       && Array.isArray(msg.frames) && msg.frames.length > 0) {
@@ -421,6 +429,7 @@ function handleMsg(msg) {
   }
   if (msg.type === 'error') {
     console.warn('Server error:', msg.message);
+    // Show error in whichever status element is currently awaiting a response.
     const ecStatus = document.getElementById('ec-status');
     if (ecStatus && ecStatus.textContent === '推断中…') {
       ecStatus.textContent = `⚠ ${msg.message}`;
@@ -428,6 +437,11 @@ function handleMsg(msg) {
     const aStatus = document.getElementById('analysis-status');
     if (aStatus && aStatus.textContent.endsWith('…')) {
       aStatus.textContent = `⚠ ${msg.message}`;
+    }
+    // If a simulation was pending, also show the error in the stim info bar
+    if (stimPending) {
+      const fi = document.getElementById('frame-info');
+      if (fi) fi.textContent = `⚠ 仿真失败: ${msg.message || '未知错误'}`;
     }
   }
 }
@@ -478,6 +492,17 @@ function _applyModalityButtonStyles() {
   btnEeg.className  = activeModality === 'eeg'  ? 'btn-primary' : 'btn-secondary';
 }
 
+// Unlock the stim button after a simulation response (or error) arrives.
+// Clears the pending flag and the fallback timeout so both paths clean up.
+function _unlockStimBtn() {
+  if (!stimPending) return;
+  stimPending = false;
+  const stimBtn = document.getElementById('btn-stim');
+  if (stimBtn._stimTimeout) { clearTimeout(stimBtn._stimTimeout); stimBtn._stimTimeout = null; }
+  stimBtn.disabled = false;
+  if (stimBtn._origText) { stimBtn.textContent = stimBtn._origText; stimBtn._origText = null; }
+}
+
 function setStatus(ok) {
   document.getElementById('status-dot').className           = ok ? 'connected' : '';
   document.getElementById('status-text').textContent        = ok ? '已连接后端' : '演示模式（后端未连接）';
@@ -500,19 +525,23 @@ function setModalityBadge(label) {
 // isSimulation=false: frames come from cache load or modality switch (real data)
 function loadFrameSeq(frames, label, modality, isSimulation = false, startAt = 0) {
   viewingSimulation = isSimulation;
+  // Clamp startAt to a valid index so we never access frames[undefined].
+  // This matters when "↩ 返回数据" restores origCurFrame=383 onto a
+  // 256-frame EEG sequence (shorter than the fMRI sequence the user was on).
+  const safeStart = Math.max(0, Math.min(startAt, frames.length > 0 ? frames.length - 1 : 0));
   // Keep origFrames pointing at the most recently loaded real data.
   // Simulation results must NOT overwrite this so that subsequent "施加刺激"
   // requests always use actual brain activity as the starting point, not the
   // output of a previous simulation.
   if (!isSimulation) {
     origFrames   = frames;
-    origCurFrame = startAt;
+    origCurFrame = safeStart;
   }
   frameSeq  = frames;
-  curFrame  = startAt;
+  curFrame  = safeStart;
   slider.min   = 0;
   slider.max   = Math.max(0, frames.length - 1);
-  slider.value = startAt;
+  slider.value = safeStart;
   updateFrameLabel();
   document.getElementById('frame-info').textContent =
     `${frames.length} 帧${label ? ' — ' + label.split(/[\\/]/).pop() : ''}`;
@@ -520,7 +549,7 @@ function loadFrameSeq(frames, label, modality, isSimulation = false, startAt = 0
   setModalityBadge(modality || null);
   // Show/hide "↩ 返回数据" button
   _updateReturnDataBtn();
-  if (frames[startAt]) updateActivity(frames[startAt].activity, frames[startAt].raw);
+  if (frames[safeStart]) updateActivity(frames[safeStart].activity, frames[safeStart].raw);
   playSeq();
 }
 
@@ -610,14 +639,23 @@ document.getElementById('btn-stim').addEventListener('click', () => {
     } else {
       initial_state = regionMeshes.map(m => m.userData.activity);
     }
-    // Briefly show which data frame the simulation will start from
+    // Lock the button until the server responds (not a fixed timeout).
+    // stimPending is cleared in handleMsg when simulation_result or error arrives.
     const stimBtn = document.getElementById('btn-stim');
-    if (srcLabel) {
-      const origText = stimBtn.textContent;
-      stimBtn.textContent = `⚡ 仿真中 ${srcLabel}`;
-      stimBtn.disabled = true;
-      setTimeout(() => { stimBtn.textContent = origText; stimBtn.disabled = false; }, 3000);
-    }
+    const origBtnText = stimBtn.textContent;
+    stimPending = true;
+    stimBtn.disabled = true;
+    stimBtn.textContent = `⚡ 仿真中…${srcLabel ? ' ' + srcLabel : ''}`;
+    // Fallback timeout: unlock after 30s even if no response (network/server issues)
+    const stimTimeout = setTimeout(() => {
+      if (stimPending) {
+        stimPending = false;
+        stimBtn.disabled = false;
+        stimBtn.textContent = origBtnText;
+      }
+    }, 30000);
+    stimBtn._stimTimeout = stimTimeout;
+    stimBtn._origText = origBtnText;
     ws.send(JSON.stringify({
       type: "simulate",
       target_regions: targets,
@@ -981,8 +1019,11 @@ function handleECValidationResult(msg) {
     if (hs.error) {
       // Show the actual error so the user knows what went wrong
       parts.push(`半分可靠性: ⚠ 计算失败 — ${hs.error.substring(0, 80)}`);
+    } else if (hs.half_split_r === null || hs.half_split_r === undefined) {
+      // Insufficient data guard triggered (< 5 samples per half)
+      parts.push(`半分可靠性: ⚠ ${hs.interpretation || '样本不足'}`);
     } else {
-      const rVal = hs.half_split_r !== undefined ? hs.half_split_r.toFixed(3) : '?';
+      const rVal = hs.half_split_r.toFixed(3);
       parts.push(`半分可靠性 r=${rVal} — ${hs.interpretation || ''}`);
     }
   }
