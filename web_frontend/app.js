@@ -36,6 +36,18 @@ let loadedMeta = { nFmriRegions: 0, nEegChannels: 0 };
 // Shown when the user clicks "○ 对照轨迹" in the timeline bar.
 let counterFactualFrames = [];
 let showingCounterFactual = false;
+// Original loaded data frames (never overwritten by simulation results).
+// Used as the source for stimulation initial_state so re-running a simulation
+// always starts from the actual recorded data, not from a previous simulation.
+let origFrames  = [];
+let origCurFrame = 0;     // frame index the user was at in the original data
+let viewingSimulation = false;  // true when frameSeq holds simulation output
+// Backup of the last stimulation frames (used to restore after CF toggle).
+let stimFrames  = [];
+// Track whether a stimulation request is pending (waiting for server response).
+// Used to lock the stim button until the result arrives, preventing duplicate
+// requests if the server takes longer than the original 3-second timeout.
+let stimPending = false;
 
 // ── Guard: Three.js must be loaded ────────────────────────────────────────────
 if (typeof THREE === 'undefined') {
@@ -333,6 +345,10 @@ function handleMsg(msg) {
     if (frameSeq.length === 0) updateActivity(msg.activity);
     return;
   }
+  // Unlock stim button whenever a simulation result or error arrives
+  if (msg.type === 'simulation_result' || msg.type === 'error') {
+    _unlockStimBtn();
+  }
   // Multi-frame sequence (stimulation result or cache data)
   if ((msg.type === 'simulation_result' || msg.type === 'cache_loaded')
       && Array.isArray(msg.frames) && msg.frames.length > 0) {
@@ -356,6 +372,7 @@ function handleMsg(msg) {
     updateModalityToggle(msg.modalities || []);
     // Pick the active modality's frames (fall back to primary frames)
     const modFrames = _getModalityFrames();
+    const finalFrames = modFrames.length > 0 ? modFrames : msg.frames;
     // Determine label for modality badge
     let modalityLabel = msg.modality || null;
     if (!modalityLabel) {
@@ -373,12 +390,18 @@ function handleMsg(msg) {
       showingCounterFactual = false;
       const cfBtn = document.getElementById('btn-cf-toggle');
       if (cfBtn) { cfBtn.style.display = ''; cfBtn.textContent = '○ 对照轨迹'; }
-    } else {
+    } else if (msg.type !== 'simulation_result') {
+      // Clear CF button when loading new cache data (not simulation)
       counterFactualFrames = [];
       const cfBtn = document.getElementById('btn-cf-toggle');
       if (cfBtn) cfBtn.style.display = 'none';
     }
-    loadFrameSeq(modFrames.length > 0 ? modFrames : msg.frames, msg.path || null, modalityLabel);
+    const isStim = msg.type === 'simulation_result';
+    if (isStim) {
+      // Backup stimulation frames so the CF toggle can restore them later
+      stimFrames = finalFrames.slice();
+    }
+    loadFrameSeq(finalFrames, msg.path || null, modalityLabel, isStim);
     return;
   }
   // EC inference result
@@ -406,6 +429,7 @@ function handleMsg(msg) {
   }
   if (msg.type === 'error') {
     console.warn('Server error:', msg.message);
+    // Show error in whichever status element is currently awaiting a response.
     const ecStatus = document.getElementById('ec-status');
     if (ecStatus && ecStatus.textContent === '推断中…') {
       ecStatus.textContent = `⚠ ${msg.message}`;
@@ -413,6 +437,11 @@ function handleMsg(msg) {
     const aStatus = document.getElementById('analysis-status');
     if (aStatus && aStatus.textContent.endsWith('…')) {
       aStatus.textContent = `⚠ ${msg.message}`;
+    }
+    // If a simulation was pending, also show the error in the stim info bar
+    if (stimPending) {
+      const fi = document.getElementById('frame-info');
+      if (fi) fi.textContent = `⚠ 仿真失败: ${msg.message || '未知错误'}`;
     }
   }
 }
@@ -463,6 +492,17 @@ function _applyModalityButtonStyles() {
   btnEeg.className  = activeModality === 'eeg'  ? 'btn-primary' : 'btn-secondary';
 }
 
+// Unlock the stim button after a simulation response (or error) arrives.
+// Clears the pending flag and the fallback timeout so both paths clean up.
+function _unlockStimBtn() {
+  if (!stimPending) return;
+  stimPending = false;
+  const stimBtn = document.getElementById('btn-stim');
+  if (stimBtn._stimTimeout) { clearTimeout(stimBtn._stimTimeout); stimBtn._stimTimeout = null; }
+  stimBtn.disabled = false;
+  if (stimBtn._origText) { stimBtn.textContent = stimBtn._origText; stimBtn._origText = null; }
+}
+
 function setStatus(ok) {
   document.getElementById('status-dot').className           = ok ? 'connected' : '';
   document.getElementById('status-text').textContent        = ok ? '已连接后端' : '演示模式（后端未连接）';
@@ -481,20 +521,49 @@ function setModalityBadge(label) {
 }
 
 // ── Timeline ──────────────────────────────────────────────────────────────────
-function loadFrameSeq(frames, label, modality) {
+// isSimulation=true: frames come from a stimulation run (don't overwrite origFrames)
+// isSimulation=false: frames come from cache load or modality switch (real data)
+function loadFrameSeq(frames, label, modality, isSimulation = false, startAt = 0) {
+  viewingSimulation = isSimulation;
+  // Clamp startAt to a valid index so we never access frames[undefined].
+  // This matters when "↩ 返回数据" restores origCurFrame=383 onto a
+  // 256-frame EEG sequence (shorter than the fMRI sequence the user was on).
+  const safeStart = Math.max(0, Math.min(startAt, frames.length > 0 ? frames.length - 1 : 0));
+  // Keep origFrames pointing at the most recently loaded real data.
+  // Simulation results must NOT overwrite this so that subsequent "施加刺激"
+  // requests always use actual brain activity as the starting point, not the
+  // output of a previous simulation.
+  if (!isSimulation) {
+    origFrames   = frames;
+    origCurFrame = safeStart;
+  }
   frameSeq  = frames;
-  curFrame  = 0;
+  curFrame  = safeStart;
   slider.min   = 0;
   slider.max   = Math.max(0, frames.length - 1);
-  slider.value = 0;
+  slider.value = safeStart;
   updateFrameLabel();
   document.getElementById('frame-info').textContent =
     `${frames.length} 帧${label ? ' — ' + label.split(/[\\/]/).pop() : ''}`;
   // Show modality badge
   setModalityBadge(modality || null);
-  if (frames[0]) updateActivity(frames[0].activity, frames[0].raw);
+  // Show/hide "↩ 返回数据" button
+  _updateReturnDataBtn();
+  if (frames[safeStart]) updateActivity(frames[safeStart].activity, frames[safeStart].raw);
   playSeq();
 }
+
+function _updateReturnDataBtn() {
+  const btn = document.getElementById('btn-return-data');
+  if (!btn) return;
+  if (viewingSimulation && origFrames.length > 0) {
+    btn.style.display = '';
+    btn.title = `↩ 返回原始数据（第 ${origCurFrame + 1} 帧）`;
+  } else {
+    btn.style.display = 'none';
+  }
+}
+
 
 function updateFrameLabel() {
   frameLabel.textContent = frameSeq.length > 0
@@ -508,6 +577,8 @@ function playSeq() {
   playTimer = setInterval(() => {
     if (!frameSeq.length) return;
     curFrame = (curFrame + 1) % frameSeq.length;
+    // Track position in original data when NOT in simulation mode
+    if (!viewingSimulation) origCurFrame = curFrame;
     slider.value = curFrame;
     updateFrameLabel();
     updateActivity(frameSeq[curFrame].activity, frameSeq[curFrame].raw);
@@ -524,6 +595,8 @@ btnPlay.addEventListener('click', () => isPlaying ? pauseSeq() : playSeq());
 
 slider.addEventListener('input', e => {
   curFrame = parseInt(e.target.value) || 0;
+  // Keep origCurFrame in sync while viewing original data
+  if (!viewingSimulation) origCurFrame = curFrame;
   updateFrameLabel();
   if (frameSeq[curFrame]) updateActivity(frameSeq[curFrame].activity, frameSeq[curFrame].raw);
 });
@@ -549,11 +622,40 @@ document.getElementById('btn-stim').addEventListener('click', () => {
   }
 
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
-    // Include the currently-displayed brain state so the server can use the
-    // user's selected time point as the stimulation starting point.
-    const initial_state = frameSeq.length > 0
-      ? frameSeq[curFrame].activity
-      : regionMeshes.map(m => m.userData.activity);
+    // Determine initial_state: always start from REAL data (origFrames), not from
+    // a previous simulation.  While viewing a simulation (viewingSimulation=true),
+    // origCurFrame is frozen at the last position in the original data — this
+    // ensures repeated clicks always start from the same fixed reference frame
+    // and users can change that reference by clicking "↩ 返回数据" and advancing.
+    let initial_state;
+    let srcLabel = '';
+    if (origFrames.length > 0) {
+      if (!viewingSimulation) origCurFrame = curFrame;  // snapshot current real-data position
+      const srcIdx = Math.min(origCurFrame, origFrames.length - 1);
+      initial_state = origFrames[srcIdx].activity;
+      srcLabel = `（数据第 ${srcIdx + 1} 帧）`;
+    } else if (frameSeq.length > 0) {
+      initial_state = frameSeq[curFrame].activity;
+    } else {
+      initial_state = regionMeshes.map(m => m.userData.activity);
+    }
+    // Lock the button until the server responds (not a fixed timeout).
+    // stimPending is cleared in handleMsg when simulation_result or error arrives.
+    const stimBtn = document.getElementById('btn-stim');
+    const origBtnText = stimBtn.textContent;
+    stimPending = true;
+    stimBtn.disabled = true;
+    stimBtn.textContent = `⚡ 仿真中…${srcLabel ? ' ' + srcLabel : ''}`;
+    // Fallback timeout: unlock after 30s even if no response (network/server issues)
+    const stimTimeout = setTimeout(() => {
+      if (stimPending) {
+        stimPending = false;
+        stimBtn.disabled = false;
+        stimBtn.textContent = origBtnText;
+      }
+    }, 30000);
+    stimBtn._stimTimeout = stimTimeout;
+    stimBtn._origText = origBtnText;
     ws.send(JSON.stringify({
       type: "simulate",
       target_regions: targets,
@@ -562,20 +664,52 @@ document.getElementById('btn-stim').addEventListener('click', () => {
       initial_state,
     }));
   } else {
-    // Local demo stimulation: direct excitation + spatial spread
-    const act = regionMeshes.map(m => m.userData.activity);
-    targets.forEach(id => {
-      if (id < N_REGIONS) act[id] = Math.min(1, act[id] + amplitude * 0.7);
+    // Offline mode: generate a simple stimulation animation so the effect persists
+    // and is not immediately overwritten by the demo render loop.
+    const act0 = origFrames.length > 0
+      ? origFrames[Math.min(origCurFrame, origFrames.length - 1)].activity.slice()
+      : regionMeshes.map(m => m.userData.activity);
+
+    // Gaussian spatial spread weights
+    const sw = new Array(N_REGIONS).fill(0);
+    targets.forEach(tid => {
+      const p0 = BRAIN_POS[tid];
+      for (let j = 0; j < N_REGIONS; j++) {
+        const d2 = p0.distanceTo(BRAIN_POS[j]) ** 2;
+        sw[j] += Math.exp(-d2 / 1800);
+      }
     });
-    for (const id of targets) {
-      const p0 = BRAIN_POS[id];
-      regionMeshes.forEach((m, j) => {
-        if (j === id) return;
-        const d = p0.distanceTo(BRAIN_POS[j]);
-        if (d < 55) act[j] = Math.min(1, act[j] + amplitude * 0.28 * (1 - d / 55));
+    const swMax = sw.reduce((a, b) => Math.max(a, b), 0);
+    if (swMax > 0) sw.forEach((_, i) => sw[i] /= swMax);
+
+    // Simple single-step WC stimulation (no connectivity) for offline preview
+    const PRE = 5, DUR = 20, POST = 5;
+    const localFrames = [];
+    let curr = act0.slice();
+
+    function stepLocal(state, stimIn) {
+      return state.map((v, i) => {
+        const exc = Math.tanh(v + stimIn[i]);
+        return Math.max(0, Math.min(1, v * 0.85 + exc * 0.15));
       });
     }
-    updateActivity(act);
+
+    for (let k = 0; k < PRE; k++) {
+      curr = stepLocal(curr, new Array(N_REGIONS).fill(0));
+      localFrames.push({ activity: curr.slice() });
+    }
+    for (let k = 0; k < DUR; k++) {
+      const progress = (k + 0.5) / Math.max(DUR, 1);
+      const amp = amplitude * Math.sin(Math.PI * progress);
+      curr = stepLocal(curr, sw.map(w => amp * w));
+      localFrames.push({ activity: curr.slice() });
+    }
+    for (let k = 0; k < POST; k++) {
+      curr = stepLocal(curr, new Array(N_REGIONS).fill(0));
+      localFrames.push({ activity: curr.slice() });
+    }
+    stimFrames = localFrames;
+    loadFrameSeq(localFrames, null, '⚡ 仿真 (离线)', true);
   }
 });
 
@@ -591,15 +725,21 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   frameSeq  = [];
   framesFmri = [];
   framesEeg  = [];
+  origFrames = [];
+  stimFrames = [];
   counterFactualFrames = [];
   showingCounterFactual = false;
+  viewingSimulation = false;
+  origCurFrame = 0;
   curFrame  = 0;
   slider.max = 0;
   slider.value = 0;
   updateFrameLabel();
-  // Hide counterfactual toggle
+  // Hide counterfactual toggle and return-data button
   const cfBtn = document.getElementById('btn-cf-toggle');
   if (cfBtn) cfBtn.style.display = 'none';
+  const rdBtn = document.getElementById('btn-return-data');
+  if (rdBtn) rdBtn.style.display = 'none';
   // Reset analysis and validation status
   document.getElementById('analysis-status').textContent = '';
   document.getElementById('ec-validation-status').textContent = '';
@@ -621,7 +761,7 @@ document.getElementById('btn-mod-fmri').addEventListener('click', () => {
   if (framesFmri.length === 0) return;
   activeModality = 'fmri';
   _applyModalityButtonStyles();
-  loadFrameSeq(framesFmri, null, 'fMRI');
+  loadFrameSeq(framesFmri, null, 'fMRI', false);
   _updateModalityInfo();
 });
 
@@ -629,7 +769,7 @@ document.getElementById('btn-mod-eeg').addEventListener('click', () => {
   if (framesEeg.length === 0) return;
   activeModality = 'eeg';
   _applyModalityButtonStyles();
-  loadFrameSeq(framesEeg, null, 'EEG');
+  loadFrameSeq(framesEeg, null, 'EEG', false);
   _updateModalityInfo();
 });
 
@@ -825,19 +965,33 @@ document.getElementById('btn-cf-toggle').addEventListener('click', () => {
     cfBtn.style.background = 'rgba(126,184,255,0.18)';
     cfBtn.style.color = '#7eb8ff';
     cfBtn.style.borderColor = 'rgba(126,184,255,0.4)';
-    loadFrameSeq(counterFactualFrames, null, '○ 对照');
+    loadFrameSeq(counterFactualFrames, null, '○ 对照', true);
   } else {
-    // Switch back to stimulated trajectory
+    // Switch back to stimulated trajectory using the backed-up stimFrames
     cfBtn.textContent = '○ 对照轨迹';
     cfBtn.style.background = 'rgba(255,160,44,0.18)';
     cfBtn.style.color = '#ffcc66';
     cfBtn.style.borderColor = 'rgba(255,160,44,0.4)';
-    loadFrameSeq(frameSeq.length > 0 ? frameSeq : [], null, '⚡ 仿真');
-    // frameSeq was already set to stimulated frames by the last loadFrameSeq call;
-    // we need to reload from the original stimulated sequence.  The simplest way
-    // is to keep a reference.  For now, force a re-fetch from the last server call
-    // (handled below via stimFramesBackup).
+    loadFrameSeq(stimFrames.length > 0 ? stimFrames : [], null, '⚡ 仿真', true);
   }
+});
+
+// ── Return to original data ────────────────────────────────────────────────────
+document.getElementById('btn-return-data').addEventListener('click', () => {
+  if (!origFrames.length) return;
+  // Determine the modality label
+  let label = null;
+  if (framesFmri.length > 0 && activeModality === 'fmri') label = 'fMRI';
+  else if (framesEeg.length > 0 && activeModality === 'eeg') label = 'EEG';
+  // Hide the CF toggle (simulation context is gone)
+  const cfBtn = document.getElementById('btn-cf-toggle');
+  if (cfBtn) cfBtn.style.display = 'none';
+  counterFactualFrames = [];
+  showingCounterFactual = false;
+  // Restore original data at the frame the user was on before simulation started
+  loadFrameSeq(origFrames, null, label, false, origCurFrame);
+  // Pause immediately so the user can see the exact frame they paused on
+  pauseSeq();
 });
 
 // ── EC Validation ─────────────────────────────────────────────────────────────
@@ -862,18 +1016,34 @@ function handleECValidationResult(msg) {
 
   if (r.half_split) {
     const hs = r.half_split;
-    const rVal = hs.half_split_r !== undefined ? hs.half_split_r.toFixed(3) : '?';
-    parts.push(`半分可靠性 r=${rVal} — ${hs.interpretation || ''}`);
+    if (hs.error) {
+      // Show the actual error so the user knows what went wrong
+      parts.push(`半分可靠性: ⚠ 计算失败 — ${hs.error.substring(0, 80)}`);
+    } else if (hs.half_split_r === null || hs.half_split_r === undefined) {
+      // Insufficient data guard triggered (< 5 samples per half)
+      parts.push(`半分可靠性: ⚠ ${hs.interpretation || '样本不足'}`);
+    } else {
+      const rVal = hs.half_split_r.toFixed(3);
+      parts.push(`半分可靠性 r=${rVal} — ${hs.interpretation || ''}`);
+    }
   }
   if (r.distance) {
     const d = r.distance;
-    const rVal = d.ec_vs_distance_r !== undefined ? d.ec_vs_distance_r.toFixed(3) : '?';
-    parts.push(`EC vs 距离 r=${rVal} (p${d.p_approx || ''}) — ${d.interpretation || ''}`);
+    if (d.error) {
+      parts.push(`EC vs 距离: ⚠ ${d.error.substring(0, 60)}`);
+    } else {
+      const rVal = d.ec_vs_distance_r !== undefined ? d.ec_vs_distance_r.toFixed(3) : '?';
+      parts.push(`EC vs 距离 r=${rVal} (p${d.p_approx || ''}) — ${d.interpretation || ''}`);
+    }
   }
   if (r.fc_vs_ec) {
     const fe = r.fc_vs_ec;
-    const rVal = fe.ec_fc_pearson_r !== undefined ? fe.ec_fc_pearson_r.toFixed(3) : '?';
-    parts.push(`EC vs FC r=${rVal} — ${fe.interpretation || ''}`);
+    if (fe.error) {
+      parts.push(`EC vs FC: ⚠ ${fe.error.substring(0, 60)}`);
+    } else {
+      const rVal = fe.ec_fc_pearson_r !== undefined ? fe.ec_fc_pearson_r.toFixed(3) : '?';
+      parts.push(`EC vs FC r=${rVal} — ${fe.interpretation || ''}`);
+    }
   }
   el.innerHTML = parts.map(p => `• ${p}`).join('<br/>');
 }
@@ -883,12 +1053,32 @@ document.getElementById('btn-analyze').addEventListener('click', () => {
   const method = document.getElementById('analysis-method').value;
   document.getElementById('analysis-status').textContent = '分析中…';
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'analyze_brain', method }));
+    // Collect optional window parameters (empty = auto-split at midpoint)
+    const parseWin = id => { const v = parseInt(document.getElementById(id).value); return isNaN(v) ? undefined : v; };
+    const w1s = parseWin('w1s'), w1e = parseWin('w1e');
+    const w2s = parseWin('w2s'), w2e = parseWin('w2e');
+    const payload = { type: 'analyze_brain', method };
+    if (w1s !== undefined) payload.window1_start = w1s;
+    if (w1e !== undefined) payload.window1_end   = w1e;
+    if (w2s !== undefined) payload.window2_start = w2s;
+    if (w2e !== undefined) payload.window2_end   = w2e;
+    ws.send(JSON.stringify(payload));
   } else {
     document.getElementById('analysis-status').textContent =
       '（需要后端连接才能运行大脑分析）';
   }
 });
+
+// Show window controls only for deviation method
+document.getElementById('analysis-method').addEventListener('change', e => {
+  const win = document.getElementById('analysis-windows');
+  if (win) win.style.display = e.target.value === 'deviation' ? '' : 'none';
+});
+// Initialise visibility
+(function () {
+  const win = document.getElementById('analysis-windows');
+  if (win) win.style.display = '';
+})();
 
 function handleBrainAnalysisResult(msg) {
   const el = document.getElementById('analysis-status');
@@ -898,11 +1088,12 @@ function handleBrainAnalysisResult(msg) {
   }
   const s = msg.summary || {};
   if (msg.method === 'deviation') {
+    const totalFrames = s.total_frames ? ` (共${s.total_frames}帧)` : '';
     el.innerHTML =
-      `偏差分析完成<br/>` +
+      `偏差分析完成${totalFrames}<br/>` +
       `均值z: <strong>${s.mean_z_score}</strong>  最大z: <strong>${s.max_z_score}</strong><br/>` +
-      `异常区域(>2σ): <strong>${s.n_outliers_2std}</strong><br/>` +
-      `窗口: ${s.window1} → ${s.window2}<br/>` +
+      `异常区域(>2σ): <strong>${s.n_outliers_2std}</strong>  (>3σ): <strong>${s.n_outliers_3std ?? '?'}</strong><br/>` +
+      `窗口1: ${s.window1} → 窗口2: ${s.window2}<br/>` +
       `<span style="color:#aaa">${s.interpretation || ''}</span>`;
   } else if (msg.method === 'graph_metrics') {
     el.innerHTML =
