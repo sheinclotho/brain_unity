@@ -205,4 +205,38 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 2. **代理 MLP（已运行 EC 推断）**: 使用 `predict_trajectory`，三阶段统一调用，n_warmup=0（预刺激自热身）
 3. **Wilson-Cowan（无任何模型）**: `_demo_simulate`，物理先验驱动，空间扩散+递归动力学
 
+
+
+### [2026-02-25] 对照轨迹、EC 验证、大脑状态分析模块
+
+#### 对照轨迹（Counterfactual Visualization）
+- **新功能**: `handle_simulate` 三条路径（Wilson-Cowan / 代理 MLP / GNN）均返回 `counterfactual_frames`（同初始状态、零刺激的自然演化预测）。
+- **原理**: WC 路径复用同一随机种子（`np.random.default_rng(0)`），代理 MLP 路径用 `stim_fn=lambda k: 0.0` 运行两次 `predict_trajectory`，两者差异完全来自刺激，与实验对照组等价。
+- **前端**: 接收到 `counterfactual_frames` 后，时间轴底栏出现"○ 对照轨迹"切换按钮，可在刺激轨迹和对照轨迹之间切换。
+- **规则**: `counterfactual_frames` 与 `frames` 必须帧数相同、初始状态相同；仅刺激幅度为零。
+
+#### EC 验证（`handle_validate_ec`）
+- **新端点**: 三种验证方法，无需重新训练代理：
+  1. `half_split`：将 `_input_X` 对半，用同一代理计算 EC₁/EC₂，报告 Pearson r
+  2. `distance`：`|EC[i,j]|` vs 解剖距离（Fibonacci 坐标），预期 r < −0.1
+  3. `fc_vs_ec`：EC 与 FC（Pearson 相关矩阵）的相关，r < 0.4 表示 EC 有额外因果信息
+- **规则**: EC 验证必须在 `infer_ec` 之后才能调用（需要 `_ec_analyzer_cache` 中有训练好的代理）。
+
+#### 大脑状态分析模块（`BrainStateAnalyzer` + `handle_analyze_brain`）
+- **设计决策**: 放弃疾病分类路线，改用无标签规范建模思路：自比较（时段偏差图谱）+ 图论分析（EC 枢纽分析）。
+- **新文件**: `unity_integration/brain_state_analyzer.py`（`BrainStateAnalyzer` 类）
+  - `compute_graph_metrics(ec_matrix)` → hub_scores, efficiency, density
+  - `compute_deviation_map(ref_ts, test_ts)` → per-region z-score deviation
+  - `compare_ec_matrices(ec1, ec2)` → diff overlay + Pearson r
+  - `ec_half_split_reliability(surrogate, X, N)` → reliability r
+  - `ec_vs_distance_correlation(ec)` → anatomical validation r
+  - `fingerprint(ec, ts)` → compact brain state descriptor
+- **`handle_analyze_brain`** 端点: `method="deviation"`（前/后半段偏差）或 `method="graph_metrics"`（EC 枢纽分析），返回可叠加在 3D 脑区上的活动覆盖层。
+- **规则**: `_loaded_time_series` 在 `handle_load_cache` 时存储，供后续分析调用。
+
+#### 疾病检测设计原则（重要）
+- **为什么不做分类**: 单被试、无标签、无标准解剖对齐、无跨中心验证——这四个条件缺失时，分类模型准确率无论多高都不可信。
+- **正确框架**: 规范建模（normative modeling），见 `项目规范说明书.md` 第 14 节。
+- **规则**: TwinBrain 的分析结论只说"与自身参考状态相比异常"，绝不使用"疾病"或"诊断"等词汇。
+
 *Last updated: 2026-02-25*

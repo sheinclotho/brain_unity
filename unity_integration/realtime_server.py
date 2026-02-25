@@ -29,6 +29,34 @@ except ImportError:
     logging.warning("ModelServer not available")
 
 
+def _import_brain_state_analyzer():
+    """Robustly import BrainStateAnalyzer regardless of the import context."""
+    # 1. Package-relative import (normal usage)
+    try:
+        from .brain_state_analyzer import BrainStateAnalyzer as _BSA
+        return _BSA
+    except (ImportError, SystemError):
+        pass
+    # 2. Absolute package import (when the package root is on sys.path)
+    try:
+        from unity_integration.brain_state_analyzer import BrainStateAnalyzer as _BSA
+        return _BSA
+    except ImportError:
+        pass
+    # 3. Direct file import via importlib (standalone / test scripts)
+    try:
+        import importlib.util
+        _spec = importlib.util.spec_from_file_location(
+            "brain_state_analyzer",
+            str(Path(__file__).parent / "brain_state_analyzer.py"),
+        )
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod.BrainStateAnalyzer
+    except Exception:
+        return None
+
+
 class BrainVisualizationServer:
     """
     WebSocket server for real-time brain visualization.
@@ -96,6 +124,11 @@ class BrainVisualizationServer:
         # Key: (cache_file_path_str, n_lags) so the surrogate is only retrained
         # when the source data or lag window changes, not on every infer_ec call.
         self._ec_analyzer_cache: dict = {}
+
+        # Last loaded time series — stored so handle_validate_ec and
+        # handle_analyze_brain can access it without re-loading the .pt file.
+        self._loaded_time_series: Optional["np.ndarray"] = None  # (T, 200)
+        self._loaded_cache_path:  Optional[str]          = None
     
     async def register_client(self, websocket):
         """Register a new client connection."""
@@ -181,6 +214,12 @@ class BrainVisualizationServer:
 
             elif request_type == "infer_ec":
                 return await self.handle_infer_ec(request)
+
+            elif request_type == "validate_ec":
+                return await self.handle_validate_ec(request)
+
+            elif request_type == "analyze_brain":
+                return await self.handle_analyze_brain(request)
             
             else:
                 self.logger.warning(f"Unknown request type: {request_type}")
@@ -484,11 +523,19 @@ class BrainVisualizationServer:
                 self.logger.info(f"✓ Stimulation results auto-saved to: {stim_output_dir}")
                 
                 frames = [{"activity": self._extract_activity_array(r)} for r in responses]
+                # Counterfactual (null stimulation) via WC dynamics from same initial state
+                cf_frames = self._demo_simulate(
+                    target_regions=target_regions, amplitude=0.0,
+                    pattern=pattern, frequency=frequency,
+                    duration=duration, n_regions=n_regions,
+                    initial_state=initial_state,
+                )
                 return {
                     "type": "simulation_result",
                     "success": True,
                     "n_frames": len(frames),
                     "frames": frames,
+                    "counterfactual_frames": cf_frames,
                     "modality": "simulation",
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
@@ -574,6 +621,17 @@ class BrainVisualizationServer:
                             stim_fn=_stim_fn_full,
                             n_steps=PRE_s + DUR_s + POST_s,
                         )
+
+                        # Counterfactual: same initial state, zero stimulation.
+                        # Because predict_trajectory is deterministic (no noise), the
+                        # pre-stim frames will be identical between stimulated and
+                        # counterfactual; they diverge from frame PRE_s onwards.
+                        surrogate_cf = analyzer.predict_trajectory(
+                            initial_state=init_arr,
+                            stim_weights=sw,
+                            stim_fn=lambda k: 0.0,
+                            n_steps=PRE_s + DUR_s + POST_s,
+                        )
                         self.logger.info(
                             f"使用已训练代理模型预测刺激轨迹 ({len(surrogate_frames)} 帧)"
                         )
@@ -582,6 +640,7 @@ class BrainVisualizationServer:
                             f"代理预测失败，回退到 Wilson-Cowan: {_exc}"
                         )
                         surrogate_frames = None
+                        surrogate_cf = None
 
             if surrogate_frames is not None:
                 return {
@@ -589,14 +648,28 @@ class BrainVisualizationServer:
                     "success": True,
                     "n_frames": len(surrogate_frames),
                     "frames": surrogate_frames,
+                    "counterfactual_frames": surrogate_cf,
                     "modality": "simulation",
                     "method": "surrogate_mlp",
                 }
 
             # Final fallback: Wilson-Cowan recurrent dynamics (no trained model needed).
+            # Generate stimulated trajectory, then null (amplitude=0) counterfactual.
+            # Both calls re-seed rng=np.random.default_rng(0) so noise is identical,
+            # making the comparison between stim and null scientifically clean.
             frames = self._demo_simulate(
                 target_regions=target_regions,
                 amplitude=amplitude,
+                pattern=pattern,
+                frequency=frequency,
+                duration=duration,
+                n_regions=n_regions,
+                initial_state=initial_state,
+            )
+            # Counterfactual: same dynamics but with amplitude=0
+            cf_frames = self._demo_simulate(
+                target_regions=target_regions,
+                amplitude=0.0,
                 pattern=pattern,
                 frequency=frequency,
                 duration=duration,
@@ -608,6 +681,7 @@ class BrainVisualizationServer:
                 "success": True,
                 "n_frames": len(frames),
                 "frames": frames,
+                "counterfactual_frames": cf_frames,
                 "modality": "simulation",
                 "method": "wilson_cowan",
             }
@@ -752,6 +826,220 @@ class BrainVisualizationServer:
             f"可靠: {result.get('fit_quality', {}).get('reliable', 'N/A')}"
         )
         return result
+
+    # ------------------------------------------------------------------ #
+    #  EC Validation                                                        #
+    # ------------------------------------------------------------------ #
+
+    async def handle_validate_ec(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate EC reliability using three complementary checks.
+
+        Checks (all use the EXISTING trained surrogate — no retraining):
+          half_split  – EC consistency between first-half vs second-half of
+                        training samples (higher Pearson r = more reliable)
+          distance    – |EC[i,j]| vs anatomical distance correlation
+                        (expected negative: nearby regions interact more strongly)
+          fc_compare  – Pearson r between |EC| and FC (correlation matrix);
+                        high similarity means EC is redundant with simpler FC.
+                        Well-calibrated EC should add information beyond FC.
+
+        Request: { type: "validate_ec" }
+        Response: { type: "ec_validation_result", success: True, results: {...} }
+        """
+        import numpy as np
+
+        BrainStateAnalyzer = _import_brain_state_analyzer()
+        if BrainStateAnalyzer is None:
+            return {"type": "error", "message": "BrainStateAnalyzer 模块未找到"}
+
+        # Require a trained EC analyzer
+        if not self._ec_analyzer_cache:
+            return {
+                "type": "error",
+                "success": False,
+                "message": "尚未推断 EC，请先点击「推断有效连接」",
+            }
+
+        analyzer = list(self._ec_analyzer_cache.values())[-1]
+        if analyzer._surrogate is None or analyzer._input_X is None:
+            return {
+                "type": "error",
+                "success": False,
+                "message": "代理模型未训练，请先推断 EC",
+            }
+
+        results = {}
+
+        # ── 1. Half-split reliability ──────────────────────────────────────
+        try:
+            r_hs, detail_hs = BrainStateAnalyzer.ec_half_split_reliability(
+                surrogate=analyzer._surrogate,
+                input_X=analyzer._input_X,
+                n_regions=analyzer.n_regions,
+            )
+            results["half_split"] = detail_hs
+        except Exception as exc:
+            results["half_split"] = {"error": str(exc)}
+
+        # ── 2. EC vs anatomical distance ───────────────────────────────────
+        if analyzer._last_ec is not None:
+            try:
+                dist_result = BrainStateAnalyzer.ec_vs_distance_correlation(
+                    ec_matrix=analyzer._last_ec,
+                )
+                results["distance"] = dist_result
+            except Exception as exc:
+                results["distance"] = {"error": str(exc)}
+
+        # ── 3. EC vs FC (functional connectivity from training data) ───────
+        if analyzer._last_ec is not None and self._loaded_time_series is not None:
+            try:
+                ts = self._loaded_time_series          # (T, 200)
+                # Pearson FC (correlation between time courses of all region pairs)
+                fc = np.corrcoef(ts.T)                 # (200, 200)
+                np.fill_diagonal(fc, 0.0)
+                ec_abs = np.abs(analyzer._last_ec)
+                np.fill_diagonal(ec_abs, 0.0)
+                f_ec = ec_abs.flatten()
+                f_fc = np.abs(fc.flatten())
+                r_ef = float(np.corrcoef(f_ec, f_fc)[0, 1]) if f_ec.std() > 0 else 0.0
+                interp = (
+                    "EC ≈ FC（因果关系与相关性高度重叠，EC 的额外信息有限）" if r_ef > 0.7
+                    else ("EC 与 FC 中度相关（因果关系略超过单纯相关）" if r_ef > 0.4
+                    else "EC 与 FC 差异明显（EC 提供了超出相关分析的因果信息）")
+                )
+                results["fc_vs_ec"] = {
+                    "ec_fc_pearson_r": round(r_ef, 3),
+                    "interpretation":  interp,
+                }
+            except Exception as exc:
+                results["fc_vs_ec"] = {"error": str(exc)}
+
+        self.logger.info(f"EC 验证完成: {list(results.keys())}")
+        return {
+            "type":    "ec_validation_result",
+            "success": True,
+            "results": results,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Brain State Analysis (label-free)                                   #
+    # ------------------------------------------------------------------ #
+
+    async def handle_analyze_brain(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Label-free brain state analysis: deviation map or graph metrics.
+
+        Methods:
+          deviation     – split loaded time series into two halves, compute
+                          per-region z-score deviation map (early vs late window)
+          graph_metrics – compute EC-based hub scores and overlay on 3D brain
+
+        Request: { type: "analyze_brain",
+                   method: "deviation" | "graph_metrics",
+                   window1_start: int, window1_end: int,  (optional)
+                   window2_start: int, window2_end: int   (optional)
+                 }
+        Response: { type: "brain_analysis_result",
+                    method: str,
+                    activity: [200 floats],   # overlay for 3D view
+                    summary: {…},
+                    regions_of_interest: [int],
+                    success: true
+                  }
+        """
+        import numpy as np
+
+        BrainStateAnalyzer = _import_brain_state_analyzer()
+        if BrainStateAnalyzer is None:
+            return {"type": "error", "message": "BrainStateAnalyzer 模块未找到"}
+
+        method = request.get("method", "deviation")
+
+        # ── graph_metrics: requires EC matrix ─────────────────────────────
+        if method == "graph_metrics":
+            if not self._ec_analyzer_cache:
+                return {
+                    "type": "error",
+                    "success": False,
+                    "message": "请先推断有效连接（EC），再使用图论分析",
+                }
+            analyzer = list(self._ec_analyzer_cache.values())[-1]
+            if analyzer._last_ec is None:
+                return {
+                    "type": "error",
+                    "success": False,
+                    "message": "EC 矩阵不可用，请先推断有效连接",
+                }
+            try:
+                metrics = BrainStateAnalyzer.compute_graph_metrics(analyzer._last_ec)
+                hub_scores = np.array(metrics["hub_scores"], dtype=np.float32)
+                hs_max = hub_scores.max()
+                overlay = (hub_scores / hs_max).tolist() if hs_max > 0 else hub_scores.tolist()
+                return {
+                    "type":    "brain_analysis_result",
+                    "method":  "graph_metrics",
+                    "activity": overlay,
+                    "summary": {
+                        "global_efficiency": metrics["global_eff"],
+                        "density":           metrics["density"],
+                        "top_hubs":          metrics["top_hubs"],
+                        "interpretation":    (
+                            f"全脑效率 {metrics['global_eff']:.3f}，"
+                            f"连接密度 {metrics['density']:.3f}。"
+                            f"最强枢纽区域（Hub）: {[r+1 for r in metrics['top_hubs'][:5]]}"
+                        ),
+                    },
+                    "regions_of_interest": metrics["top_hubs"][:10],
+                    "success": True,
+                }
+            except Exception as exc:
+                return {"type": "error", "message": f"图论分析失败: {exc}"}
+
+        # ── deviation: requires loaded time series ─────────────────────────
+        if self._loaded_time_series is None:
+            return {
+                "type": "error",
+                "success": False,
+                "message": "请先加载 .pt 文件，再使用偏差分析",
+            }
+
+        ts = self._loaded_time_series   # (T, 200)
+        T  = len(ts)
+        if T < 6:
+            return {"type": "error", "success": False,
+                    "message": f"时序数据太短（{T} 帧），至少需要 6 帧"}
+
+        # Default window split: caller can override
+        w1s = int(request.get("window1_start", 0))
+        w1e = int(request.get("window1_end",   T // 2))
+        w2s = int(request.get("window2_start", T // 2))
+        w2e = int(request.get("window2_end",   T))
+
+        w1s = max(0, min(w1s, T - 1));  w1e = max(w1s + 1, min(w1e, T))
+        w2s = max(0, min(w2s, T - 1));  w2e = max(w2s + 1, min(w2e, T))
+
+        ref_ts  = ts[w1s:w1e]
+        test_ts = ts[w2s:w2e]
+
+        try:
+            overlay, summary = BrainStateAnalyzer.compute_deviation_map(ref_ts, test_ts)
+            summary["window1"] = f"帧 {w1s}–{w1e}"
+            summary["window2"] = f"帧 {w2s}–{w2e}"
+            self.logger.info(
+                f"偏差分析完成: 均值z={summary['mean_z_score']}, "
+                f"最大z={summary['max_z_score']}, "
+                f"异常区域数={summary['n_outliers_2std']}"
+            )
+            return {
+                "type":    "brain_analysis_result",
+                "method":  "deviation",
+                "activity": overlay.tolist(),
+                "summary": summary,
+                "regions_of_interest": summary["top_regions"],
+                "success": True,
+            }
+        except Exception as exc:
+            return {"type": "error", "message": f"偏差分析失败: {exc}"}
 
     def _generate_demo_time_series(self, T: int = 300) -> "np.ndarray":
         """Generate synthetic 200-region time series using 7-network oscillators."""
@@ -1152,6 +1440,17 @@ class BrainVisualizationServer:
             f"✓ 缓存加载完成: {cache_path} → {len(primary)} 帧 "
             f"(模态: {modalities})"
         )
+
+        # Store the primary time series for later use by validate_ec / analyze_brain
+        import numpy as np
+        try:
+            self._loaded_time_series = np.array(
+                [f["activity"] for f in primary], dtype=np.float32
+            )   # (T, 200)
+            self._loaded_cache_path = str(cache_path)
+        except Exception:
+            pass
+
         return {
             "type":           "cache_loaded",
             "path":           str(cache_path),
