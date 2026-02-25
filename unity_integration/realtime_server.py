@@ -541,6 +541,7 @@ class BrainVisualizationServer:
                     "frames": frames,
                     "counterfactual_frames": cf_frames,
                     "modality": "simulation",
+                    "start_frame": 0,
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
                 }
@@ -655,6 +656,7 @@ class BrainVisualizationServer:
                     "counterfactual_frames": surrogate_cf,
                     "modality": "simulation",
                     "method": "surrogate_mlp",
+                    "start_frame": PRE_s,
                 }
 
             # Final fallback: Wilson-Cowan recurrent dynamics (no trained model needed).
@@ -688,6 +690,7 @@ class BrainVisualizationServer:
                 "counterfactual_frames": cf_frames,
                 "modality": "simulation",
                 "method": "wilson_cowan",
+                "start_frame": 10,
             }
                 
         except Exception as e:
@@ -1243,12 +1246,18 @@ class BrainVisualizationServer:
         frames = []
 
         if initial_state is not None and len(initial_state) >= n_regions:
-            # 1. Pre-stim: static snapshot of the user's selected brain state.
-            for _ in range(PRE):
-                frames.append({"activity": init_arr.tolist()})
-
-            # 2. Stimulation active: deviation-based WC dynamics from init_arr.
+            # 1. Pre-stim: WC evolution from initial state with no stimulation.
+            # Using _wc_step (not static copies) so frames 0..PRE-1 evolve
+            # naturally — the same continuous-dynamics convention used by the
+            # surrogate-MLP path.  The fixed seed ensures the pre-stim noise is
+            # reproducible across the stimulated and counterfactual trajectories.
             current = init_arr.copy()
+            for _ in range(PRE):
+                current = _wc_step(current, _NO_STIM)
+                frames.append({"activity": current.tolist()})
+
+            # 2. Stimulation active: deviation-based WC dynamics from end of
+            # pre-stim phase (continuous trajectory, not restarted from init_arr).
             for k in range(DUR):
                 current = _wc_step(current, _stim_amp(k) * spread_weights)
                 frames.append({"activity": current.tolist()})
