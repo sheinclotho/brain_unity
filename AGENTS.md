@@ -176,4 +176,33 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 
 ---
 
-*Last updated: 2026-02-23*
+
+### [2026-02-25] 虚拟刺激管线第二轮审查修复
+
+#### Bug A: `predict_trajectory` 扰动幅度被过度放大（`/ std_safe` 错误）
+- **问题**: `predict_trajectory` 在 z-score 空间施加扰动时用了 `amp * stim_weights / std_safe`。由于 `std_safe` ≈ 0.05–0.15（[0,1] 有界活动的典型 std），除以 std 相当于放大了 7–20 倍，使得即使 amplitude=0.5 也会产生 3–10σ 的扰动，MLP 完全饱和，输出全都贴近边界。
+- **修复**: 改为 `amp * stim_weights`，直接以 z-score 标准差为单位施加扰动（与 NPI 的 `pert_strength=0.05` 一致，直接加在 z-scored 输入上）。
+- **规则**: predict_trajectory 的 stim_fn 返回值**单位是 z-score 标准差**，不应再乘以或除以 std。amplitude=0.5 表示 0.5σ（中等可见效果）。
+
+#### Bug B: 正弦包络在端点为零（DUR=1,2 时刺激完全无效）
+- **问题**: `progress = k / max(DUR-1, 1)` 公式。DUR=1 时 progress=0，sin(π×0)=0；DUR=2 时两帧 progress=0,1，均为 0；DUR=3 时只有中间帧有效。所有整数参数的 DUR 都会导致第一帧和最后一帧的正弦包络为零。
+- **修复**: 改为 `progress = (k + 0.5) / max(DUR, 1)`，将每帧的采样点移到时间槽的中点，永远不会落在 0 或 1 处。同样修复了 `_stim_amp_s`（handle_simulate 的代理路径）和 `ModelServer._generate_stimulation_signal`。
+- **规则**: 正弦包络公式必须用 `(k+0.5)/DUR` 形式，确保边界帧有正值贡献。
+
+#### Bug C: `pulse` 模式 `slice step cannot be zero` 崩溃
+- **问题**: `pulse_interval = int(1.0 / frequency / 0.5)`，当 frequency > 2 Hz 时（如 5Hz, 10Hz, 20Hz），结果 < 1，`int` 截断为 0，触发 `signal[::0]` → `ValueError: slice step cannot be zero`。
+- **修复**: `pulse_interval = max(1, int(1.0 / frequency / 0.5))` 确保至少为 1。
+- **规则**: 任何用于 slice step 的动态计算值都必须用 `max(1, ...)` 保护。
+
+#### Bug D: 代理路径的预刺激帧是静态副本（无动态基线）
+- **问题**: 代理路径用 `[{"activity": init_arr.tolist()}] * PRE_s` 生成预刺激帧，10 帧完全相同，没有任何动力学。更大的问题是代理的 lag window 启动时所有 n_lags 槽都是同一个初始状态（"全等历史"假设），第一批预测帧受这个人工初始化的严重影响。
+- **修复**: 将三阶段（预刺激/刺激/刺激后）统一为一个 `predict_trajectory` 调用，stim_fn 在 k < PRE_s 时返回 0。预刺激帧现在是代理的真实自由演化预测，lag window 在预刺激阶段自然热身（warmup），大幅提升了刺激帧的预测准确性。
+- 同步新增 `n_warmup` 参数，允许调用方在记录帧之前额外运行若干热身步骤（不返回帧），进一步改善 lag window 的初始质量。
+- **规则**: 代理轨迹预测的预刺激阶段必须使用代理的真实预测而非静态副本，保证 lag window 具有有效的历史记忆。
+
+#### 刺激管线整体逻辑层次（三路优先级）
+1. **ModelServer（有训练好的 GNN）**: 使用 `simulate_stimulation`，初始状态从前端传递
+2. **代理 MLP（已运行 EC 推断）**: 使用 `predict_trajectory`，三阶段统一调用，n_warmup=0（预刺激自热身）
+3. **Wilson-Cowan（无任何模型）**: `_demo_simulate`，物理先验驱动，空间扩散+递归动力学
+
+*Last updated: 2026-02-25*

@@ -427,16 +427,15 @@ class BrainVisualizationServer:
                 self.logger.warning(f"Filtered {len(target_regions) - len(valid_regions)} invalid region IDs")
                 target_regions = valid_regions
             
-            # Create timestamped output directory for this stimulation
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_base = Path(self.model_server.output_dir if self.model_server else "unity_project/brain_data/model_output")
-            stim_output_dir = output_base / "stimulation" / f"stim_{timestamp}"
-            stim_output_dir.mkdir(parents=True, exist_ok=True)
-            
-            self.logger.info(f"Stimulation output directory: {stim_output_dir}")
-            
             # Use ModelServer if available
             if self.model_server:
+                # Create timestamped output directory only when ModelServer will actually
+                # use it — avoids leaving empty dirs on every demo/surrogate simulation.
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_base = Path(self.model_server.output_dir)
+                stim_output_dir = output_base / "stimulation" / f"stim_{timestamp}"
+                stim_output_dir.mkdir(parents=True, exist_ok=True)
+                self.logger.info(f"Stimulation output directory: {stim_output_dir}")
                 self.logger.info(f"Using ModelServer for stimulation simulation")
                 # Convert the user's initial_state list to a tensor so ModelServer
                 # starts from the actual brain state rather than random noise.
@@ -496,9 +495,9 @@ class BrainVisualizationServer:
                 }
 
             # ── Data-driven surrogate path (requires prior EC inference) ──────
-            # If the user has already run "推断有效连接", a trained MLP surrogate
-            # is available in _ec_analyzer_cache.  Use its predict_trajectory to
-            # produce a REAL data-driven forecast instead of generic Wilson-Cowan.
+            # If the user has already run "推断有效连接", a trained MLP surrogate is
+            # available in _ec_analyzer_cache.  Use predict_trajectory to produce a
+            # REAL data-driven forecast instead of generic Wilson-Cowan dynamics.
             surrogate_frames = None
             if initial_state is not None and self._ec_analyzer_cache:
                 analyzer = list(self._ec_analyzer_cache.values())[-1]
@@ -532,12 +531,15 @@ class BrainVisualizationServer:
                         if sw.max() > 0:
                             sw /= sw.max()
 
-                        PRE_s = 10
-                        DUR_s = min(int(duration), 60)
+                        PRE_s  = 10
+                        DUR_s  = min(int(duration), 60)
                         POST_s = 10
 
-                        def _stim_amp_s(k):
-                            progress = k / max(DUR_s - 1, 1)
+                        def _stim_amp_s(k: int) -> float:
+                            # (k+0.5)/DUR_s: centers each frame in its time slot so
+                            # the bell envelope is never evaluated at exactly 0 or 1,
+                            # ensuring non-zero amplitude even when DUR_s == 1 or 2.
+                            progress = (k + 0.5) / max(DUR_s, 1)
                             if pattern == "sine":
                                 slow_c = min(frequency / 10.0, 3.0)
                                 return amplitude * (np.sin(np.pi * progress)
@@ -549,22 +551,29 @@ class BrainVisualizationServer:
                             else:
                                 return amplitude * min(1.0, k / max(DUR_s * 0.15, 1.0))
 
-                        def _stim_fn(k):
-                            if k < DUR_s:
-                                return _stim_amp_s(k)
-                            return 0.0  # post-stim
+                        # Unified stim_fn covers all three phases:
+                        #   k < PRE_s            → pre-stim (surrogate runs, no external input)
+                        #   PRE_s ≤ k < PRE_s+DUR_s → stimulation active
+                        #   k ≥ PRE_s+DUR_s      → post-stim recovery (no external input)
+                        # Using a single call with n_warmup=0 (lag window warms up during
+                        # the pre-stim region where stim_fn returns 0), so the pre-stim
+                        # frames show genuine baseline dynamics, not static copies.
+                        def _stim_fn_full(k: int) -> float:
+                            if k < PRE_s:
+                                return 0.0
+                            stim_k = k - PRE_s
+                            if stim_k < DUR_s:
+                                return _stim_amp_s(stim_k)
+                            return 0.0
 
                         init_arr = np.array(initial_state[:n_regions], dtype=np.float32)
 
-                        traj = analyzer.predict_trajectory(
+                        surrogate_frames = analyzer.predict_trajectory(
                             initial_state=init_arr,
                             stim_weights=sw,
-                            stim_fn=_stim_fn,
-                            n_steps=DUR_s + POST_s,
+                            stim_fn=_stim_fn_full,
+                            n_steps=PRE_s + DUR_s + POST_s,
                         )
-                        # Pre-stim: static display of user's selected state
-                        pre_frames = [{"activity": init_arr.tolist()}] * PRE_s
-                        surrogate_frames = pre_frames + traj
                         self.logger.info(
                             f"使用已训练代理模型预测刺激轨迹 ({len(surrogate_frames)} 帧)"
                         )
@@ -863,16 +872,16 @@ class BrainVisualizationServer:
         # change in cortical excitability that is the brain's actual response to
         # sustained stimulation — which is the quantity of clinical interest.
         def _stim_amp(relative_t: int) -> float:
-            progress = relative_t / max(DUR - 1, 1)   # 0 → 1
+            # Center each step in its time slot so the bell envelope never evaluates
+            # at exactly 0 or 1 — this prevents zero-amplitude frames for small DUR.
+            # Formula: (k + 0.5) / DUR  ∈ (0, 1) exclusive, matching the NPI convention
+            # of a small perturbation applied mid-interval.
+            progress = (relative_t + 0.5) / max(DUR, 1)
             if pattern == "sine":
-                # Bell-shaped excitability envelope (rises, peaks, decays) plus a
-                # gentle visible oscillation whose rate is clamped well below Nyquist.
-                # The slow oscillation approximates rhythm-entrainment effects.
                 slow_cycles = min(frequency / 10.0, 3.0)   # ≤ 3 visible cycles
                 osc = 0.20 * np.sin(2 * np.pi * slow_cycles * progress)
                 return amplitude * (np.sin(np.pi * progress) + osc)
             elif pattern == "pulse":
-                # Sharp onset, exponential decay (models afterdischarge dynamics)
                 return amplitude * np.exp(-relative_t * 0.12)
             elif pattern == "ramp":
                 return amplitude * progress

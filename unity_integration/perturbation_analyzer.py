@@ -475,25 +475,43 @@ class PerturbationAnalyzer:
         stim_weights: np.ndarray,
         stim_fn: Callable[[int], float],
         n_steps: int = 60,
+        n_warmup: int = 0,
     ) -> List[dict]:
         """Auto-regressive stimulation trajectory prediction using the trained surrogate.
 
-        This is the scientifically correct way to answer "what will this brain
-        do after stimulation?": apply a perturbation to the current state, feed
-        it through the MLP that was fitted on the *actual* fMRI/EEG time series,
-        and auto-regressively unroll the prediction.
+        This is the scientifically correct way to simulate "what will this brain
+        do after stimulation?": apply a perturbation to the current state in z-score
+        space, feed it through the MLP fitted on *actual* fMRI/EEG time series, and
+        auto-regressively unroll the prediction.
+
+        Perturbation units (important):
+            ``stim_fn(k)`` returns a scalar that is interpreted as a **z-score
+            deviation** — i.e., how many standard deviations the stimulation shifts
+            the target regions' activity at step k.  The NPI convention (pert_strength
+            = 0.05) uses the same scale.  The caller should NOT pre-divide by
+            ``_ts_std``: that conversion is already baked into the z-scored lag window.
+            Perturbation in display space → z-score: divide by std.
+            But ``stim_fn`` already returns values in z-score-compatible magnitude
+            (small relative to ±3σ dynamic range), so no further scaling is needed.
 
         Args:
-            initial_state : (N,) float32 activity in the same normalised [0,1]
-                            display space used when fit_surrogate was called.
+            initial_state : (N,) float32 activity in [0,1] display space (same space
+                            as the time series used in fit_surrogate).
             stim_weights  : (N,) spatial distribution of the stimulation (0→1,
                             peak = 1 at target regions, Gaussian falloff elsewhere).
-            stim_fn       : callable(step_index) → scalar stimulation amplitude.
-                            Returns 0 after stimulation ends (post-stim phase).
-            n_steps       : total number of future frames to predict.
+            stim_fn       : callable(step_index) → z-score-scale amplitude.
+                            Returns 0 when stimulation is inactive.
+            n_steps       : total frames to return (including pre-stim if stim_fn
+                            returns 0 for early steps).
+            n_warmup      : number of surrogate steps to run *before* recording frames,
+                            using stim_fn returning 0.  Builds a realistic lag-window
+                            history from the initial state, so the first recorded frame
+                            reflects genuine predicted baseline dynamics rather than the
+                            artificial "all lags = initial state" assumption.
 
         Returns:
-            List of {"activity": [200 floats]} dicts, display space [0, 1].
+            List of {"activity": [N floats]} dicts in display space [0, 1],
+            length == n_steps.
         """
         self._require_surrogate()
         if self._ts_mean is None or self._ts_std is None:
@@ -502,40 +520,47 @@ class PerturbationAnalyzer:
                 "predict_trajectory."
             )
 
-        std_safe  = np.maximum(self._ts_std, 1e-6)        # (N,) – avoids div-by-zero
+        std_safe  = np.maximum(self._ts_std, 1e-6)        # (N,) — avoids div-by-zero
         init_norm = (initial_state.astype(np.float32) - self._ts_mean) / std_safe
 
-        # Build initial lag window by repeating the current z-scored state n_lags
-        # times.  This is the least-informative assumption when only one initial
-        # state is available; the surrogate quickly adapts after the first few
-        # auto-regressive steps.
+        # Build initial lag window by repeating the current z-scored state n_lags times.
+        # All lags start equal; the warmup phase (below) replaces this with genuine
+        # surrogate dynamics before stimulation is applied.
         lag_window = np.tile(init_norm, self.n_lags).astype(np.float32)  # (N*n_lags,)
 
-        frames = []
+        def _step(stim_amp: float) -> np.ndarray:
+            """One surrogate forward pass; returns z-scored prediction."""
+            x = lag_window.copy()
+            if stim_amp != 0.0:
+                # Perturbation is applied directly in z-score space.
+                # stim_weights ∈ [0,1] (spatial Gaussian), stim_amp is in z-score
+                # units (small relative to ±3σ range, e.g. 0.0–0.5 for visible effect).
+                # DO NOT divide by std_safe: amp is already in z-score units, and
+                # dividing by std (≈0.05–0.15) would amplify the perturbation 7–20×,
+                # completely saturating the MLP's nonlinearities.
+                x[-self.n_regions:] += (stim_amp * stim_weights).astype(np.float32)
+            x_t = torch.tensor(x, dtype=torch.float32, device=self.device)
+            pred = self._surrogate(x_t.unsqueeze(0)).squeeze(0).cpu().numpy()
+            # Slide lag window: drop oldest step, append newest prediction
+            lag_window[:-self.n_regions] = lag_window[self.n_regions:]
+            lag_window[-self.n_regions:] = pred
+            return pred
+
         self._surrogate.eval()
         with torch.no_grad():
+            # Warmup: run surrogate unperturbed to fill the lag window with
+            # genuine predicted dynamics (instead of the flat "all=init" window).
+            for _ in range(n_warmup):
+                _step(0.0)
+
+            # Recording phase: n_steps frames returned to the caller.
+            frames = []
             for k in range(n_steps):
-                amp = float(stim_fn(k))
-                x = lag_window.copy()
-                if amp != 0.0:
-                    # Perturb the most-recent step (last N elements of the window)
-                    # in z-score space; stim_weights are in [0,1] display space so
-                    # we divide by std to bring them into z-score units.
-                    x[-self.n_regions:] += (amp * stim_weights / std_safe).astype(np.float32)
-
-                # Forward pass through the surrogate
-                x_t     = torch.tensor(x, dtype=torch.float32, device=self.device)
-                pred_zs = self._surrogate(x_t.unsqueeze(0)).squeeze(0).cpu().numpy()
-
-                # De-normalise back to display space
+                pred_zs = _step(float(stim_fn(k)))
                 pred_display = np.clip(
                     pred_zs * std_safe + self._ts_mean, 0.0, 1.0
                 ).astype(np.float32)
                 frames.append({"activity": pred_display.tolist()})
-
-                # Slide lag window: drop oldest step, append newest prediction
-                lag_window[:-self.n_regions] = lag_window[self.n_regions:]
-                lag_window[-self.n_regions:] = pred_zs
 
         return frames
 
