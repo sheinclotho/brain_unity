@@ -616,9 +616,14 @@ document.getElementById('btn-stim').addEventListener('click', () => {
   let targets     = [...selected];
 
   if (targets.length === 0) {
-    const rnd = new Set();
-    while (rnd.size < 5) rnd.add(Math.floor(Math.random() * N_REGIONS));
-    targets = [...rnd];
+    const fi = document.getElementById('frame-info');
+    if (fi) {
+      const prev = fi.textContent;
+      fi.textContent = '⚠ 请先点击脑区球体选择刺激目标（可多选）';
+      fi.style.color = '#ff8844';
+      setTimeout(() => { fi.textContent = prev; fi.style.color = ''; }, 3000);
+    }
+    return;
   }
 
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
