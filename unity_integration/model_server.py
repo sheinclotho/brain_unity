@@ -343,12 +343,19 @@ class ModelServer:
         t = np.linspace(0, n_steps * 0.5, n_steps)  # 时间轴（秒）
         
         if pattern == "sine":
-            # 正弦波
-            signal = amplitude * np.sin(2 * np.pi * frequency * t)
+            # Use (k+0.5)/n_steps instead of linspace(0,1,n) so the progress values
+            # are centered in each time slot and never hit 0 or 1 exactly.
+            # This prevents zero-amplitude frames when n_steps is 1 or 2 (where
+            # linspace(0,1,n)[0] = 0 and linspace(0,1,n)[-1] = 1 both give sin=0).
+            progress    = (np.arange(n_steps) + 0.5) / max(n_steps, 1)
+            slow_cycles = min(frequency / 10.0, 3.0)   # ≤ 3 visible cycles
+            signal = amplitude * (np.sin(np.pi * progress)
+                                  + 0.20 * np.sin(2 * np.pi * slow_cycles * progress))
         
         elif pattern == "pulse":
-            # 脉冲
-            pulse_interval = int(1.0 / frequency / 0.5)  # 转换为步数
+            # Guard: at frequency > 2 Hz the raw interval rounds to 0, causing
+            # a "slice step cannot be zero" ValueError.  Clamp to at least 1.
+            pulse_interval = max(1, int(1.0 / frequency / 0.5))  # steps between pulses
             signal = np.zeros(n_steps)
             signal[::pulse_interval] = amplitude
         

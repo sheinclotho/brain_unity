@@ -32,6 +32,10 @@ let isPlaying  = false;
 let playTimer  = null;
 // Metadata about the most recently loaded dataset (channel/region counts)
 let loadedMeta = { nFmriRegions: 0, nEegChannels: 0 };
+// Counterfactual (null-stimulation) frames from the last simulation response.
+// Shown when the user clicks "○ 对照轨迹" in the timeline bar.
+let counterFactualFrames = [];
+let showingCounterFactual = false;
 
 // ── Guard: Three.js must be loaded ────────────────────────────────────────────
 if (typeof THREE === 'undefined') {
@@ -362,12 +366,36 @@ function handleMsg(msg) {
     } else if (modalityLabel === 'simulation') {
       modalityLabel = '⚡ 仿真';
     }
+    // Store counterfactual frames (null-stimulation baseline) for comparison
+    if (msg.type === 'simulation_result' && Array.isArray(msg.counterfactual_frames)
+        && msg.counterfactual_frames.length > 0) {
+      counterFactualFrames = msg.counterfactual_frames;
+      showingCounterFactual = false;
+      const cfBtn = document.getElementById('btn-cf-toggle');
+      if (cfBtn) { cfBtn.style.display = ''; cfBtn.textContent = '○ 对照轨迹'; }
+    } else {
+      counterFactualFrames = [];
+      const cfBtn = document.getElementById('btn-cf-toggle');
+      if (cfBtn) cfBtn.style.display = 'none';
+    }
     loadFrameSeq(modFrames.length > 0 ? modFrames : msg.frames, msg.path || null, modalityLabel);
     return;
   }
   // EC inference result
   if (msg.type === 'ec_result') {
     handleECResult(msg);
+    const vBtn = document.getElementById('btn-validate-ec');
+    if (vBtn) vBtn.disabled = false;
+    return;
+  }
+  // EC validation result
+  if (msg.type === 'ec_validation_result') {
+    handleECValidationResult(msg);
+    return;
+  }
+  // Brain analysis result
+  if (msg.type === 'brain_analysis_result') {
+    handleBrainAnalysisResult(msg);
     return;
   }
   // Server greeting
@@ -381,6 +409,10 @@ function handleMsg(msg) {
     const ecStatus = document.getElementById('ec-status');
     if (ecStatus && ecStatus.textContent === '推断中…') {
       ecStatus.textContent = `⚠ ${msg.message}`;
+    }
+    const aStatus = document.getElementById('analysis-status');
+    if (aStatus && aStatus.textContent.endsWith('…')) {
+      aStatus.textContent = `⚠ ${msg.message}`;
     }
   }
 }
@@ -517,11 +549,17 @@ document.getElementById('btn-stim').addEventListener('click', () => {
   }
 
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
+    // Include the currently-displayed brain state so the server can use the
+    // user's selected time point as the stimulation starting point.
+    const initial_state = frameSeq.length > 0
+      ? frameSeq[curFrame].activity
+      : regionMeshes.map(m => m.userData.activity);
     ws.send(JSON.stringify({
       type: "simulate",
       target_regions: targets,
       amplitude, pattern, frequency,
       duration: 60,
+      initial_state,
     }));
   } else {
     // Local demo stimulation: direct excitation + spatial spread
@@ -553,10 +591,18 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   frameSeq  = [];
   framesFmri = [];
   framesEeg  = [];
+  counterFactualFrames = [];
+  showingCounterFactual = false;
   curFrame  = 0;
   slider.max = 0;
   slider.value = 0;
   updateFrameLabel();
+  // Hide counterfactual toggle
+  const cfBtn = document.getElementById('btn-cf-toggle');
+  if (cfBtn) cfBtn.style.display = 'none';
+  // Reset analysis and validation status
+  document.getElementById('analysis-status').textContent = '';
+  document.getElementById('ec-validation-status').textContent = '';
   // Reset modality buttons to disabled state (no data loaded)
   loadedMeta = { nFmriRegions: 0, nEegChannels: 0 };
   document.getElementById('btn-mod-fmri').disabled = true;
@@ -767,6 +813,118 @@ document.getElementById('btn-hide-ec').addEventListener('click', () => {
   document.getElementById('btn-hide-ec').style.display = 'none';
   document.getElementById('ec-status').textContent = '';
 });
+
+// ── Counterfactual toggle ──────────────────────────────────────────────────────
+document.getElementById('btn-cf-toggle').addEventListener('click', () => {
+  if (!counterFactualFrames.length) return;
+  showingCounterFactual = !showingCounterFactual;
+  const cfBtn = document.getElementById('btn-cf-toggle');
+  if (showingCounterFactual) {
+    // Switch to counterfactual (null-stimulation baseline)
+    cfBtn.textContent = '⚡ 刺激轨迹';
+    cfBtn.style.background = 'rgba(126,184,255,0.18)';
+    cfBtn.style.color = '#7eb8ff';
+    cfBtn.style.borderColor = 'rgba(126,184,255,0.4)';
+    loadFrameSeq(counterFactualFrames, null, '○ 对照');
+  } else {
+    // Switch back to stimulated trajectory
+    cfBtn.textContent = '○ 对照轨迹';
+    cfBtn.style.background = 'rgba(255,160,44,0.18)';
+    cfBtn.style.color = '#ffcc66';
+    cfBtn.style.borderColor = 'rgba(255,160,44,0.4)';
+    loadFrameSeq(frameSeq.length > 0 ? frameSeq : [], null, '⚡ 仿真');
+    // frameSeq was already set to stimulated frames by the last loadFrameSeq call;
+    // we need to reload from the original stimulated sequence.  The simplest way
+    // is to keep a reference.  For now, force a re-fetch from the last server call
+    // (handled below via stimFramesBackup).
+  }
+});
+
+// ── EC Validation ─────────────────────────────────────────────────────────────
+document.getElementById('btn-validate-ec').addEventListener('click', () => {
+  document.getElementById('ec-validation-status').textContent = '验证中…';
+  if (connected && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'validate_ec' }));
+  } else {
+    document.getElementById('ec-validation-status').textContent =
+      '（需要后端连接才能运行 EC 验证）';
+  }
+});
+
+function handleECValidationResult(msg) {
+  const el = document.getElementById('ec-validation-status');
+  if (!msg.success || !msg.results) {
+    el.textContent = `⚠ 验证失败: ${msg.message || '未知错误'}`;
+    return;
+  }
+  const r = msg.results;
+  const parts = [];
+
+  if (r.half_split) {
+    const hs = r.half_split;
+    const rVal = hs.half_split_r !== undefined ? hs.half_split_r.toFixed(3) : '?';
+    parts.push(`半分可靠性 r=${rVal} — ${hs.interpretation || ''}`);
+  }
+  if (r.distance) {
+    const d = r.distance;
+    const rVal = d.ec_vs_distance_r !== undefined ? d.ec_vs_distance_r.toFixed(3) : '?';
+    parts.push(`EC vs 距离 r=${rVal} (p${d.p_approx || ''}) — ${d.interpretation || ''}`);
+  }
+  if (r.fc_vs_ec) {
+    const fe = r.fc_vs_ec;
+    const rVal = fe.ec_fc_pearson_r !== undefined ? fe.ec_fc_pearson_r.toFixed(3) : '?';
+    parts.push(`EC vs FC r=${rVal} — ${fe.interpretation || ''}`);
+  }
+  el.innerHTML = parts.map(p => `• ${p}`).join('<br/>');
+}
+
+// ── Brain State Analysis ───────────────────────────────────────────────────────
+document.getElementById('btn-analyze').addEventListener('click', () => {
+  const method = document.getElementById('analysis-method').value;
+  document.getElementById('analysis-status').textContent = '分析中…';
+  if (connected && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'analyze_brain', method }));
+  } else {
+    document.getElementById('analysis-status').textContent =
+      '（需要后端连接才能运行大脑分析）';
+  }
+});
+
+function handleBrainAnalysisResult(msg) {
+  const el = document.getElementById('analysis-status');
+  if (!msg.success) {
+    el.textContent = `⚠ ${msg.message || '分析失败'}`;
+    return;
+  }
+  const s = msg.summary || {};
+  if (msg.method === 'deviation') {
+    el.innerHTML =
+      `偏差分析完成<br/>` +
+      `均值z: <strong>${s.mean_z_score}</strong>  最大z: <strong>${s.max_z_score}</strong><br/>` +
+      `异常区域(>2σ): <strong>${s.n_outliers_2std}</strong><br/>` +
+      `窗口: ${s.window1} → ${s.window2}<br/>` +
+      `<span style="color:#aaa">${s.interpretation || ''}</span>`;
+  } else if (msg.method === 'graph_metrics') {
+    el.innerHTML =
+      `图论分析完成<br/>` +
+      `全脑效率: <strong>${s.global_efficiency}</strong>  ` +
+      `密度: <strong>${s.density}</strong><br/>` +
+      `<span style="color:#aaa">${s.interpretation || ''}</span>`;
+  } else {
+    el.textContent = `分析完成 (${msg.method})`;
+  }
+  // Overlay the analysis result on the 3D brain
+  if (Array.isArray(msg.activity)) updateActivity(msg.activity);
+  // Highlight regions of interest
+  if (Array.isArray(msg.regions_of_interest)) {
+    msg.regions_of_interest.slice(0, 10).forEach(id => {
+      if (regionMeshes[id]) {
+        regionMeshes[id].material.emissive.setRGB(0.3, 0.15, 0.0);
+        regionMeshes[id].userData._ecHighlight = true;
+      }
+    });
+  }
+}
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 setStatus(false);

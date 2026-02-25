@@ -137,6 +137,10 @@ class PerturbationAnalyzer:
         self._input_X:   Optional[np.ndarray]    = None   # (M, N*lags) – cached training inputs
         self._last_ec:   Optional[np.ndarray]    = None   # (N, N) – last computed EC matrix
         self._fit_quality: dict                  = {}     # last fit metrics (train/val MSE)
+        # Per-region z-score statistics from fit_surrogate, used in predict_trajectory
+        # to normalise new initial states into the same space the surrogate was trained on.
+        self._ts_mean: Optional[np.ndarray] = None   # (N,) float32
+        self._ts_std:  Optional[np.ndarray] = None   # (N,) float32
 
     # ── Surrogate training ──────────────────────────────────────────────────
 
@@ -177,6 +181,10 @@ class PerturbationAnalyzer:
         ts_mean = time_series.mean(axis=0, keepdims=True)
         ts_std  = np.maximum(time_series.std(axis=0, keepdims=True), 1e-6)
         ts_norm = (time_series - ts_mean) / ts_std
+
+        # Store per-region stats so predict_trajectory can re-normalise new states.
+        self._ts_mean = ts_mean.flatten().astype(np.float32)   # (N,)
+        self._ts_std  = ts_std.flatten().astype(np.float32)    # (N,)
 
         X, Y = _build_lag_dataset(ts_norm, self.n_lags)
         self._input_X = X          # 保存用于后续 EC 推断
@@ -232,8 +240,10 @@ class PerturbationAnalyzer:
             train_hist.append(tl)
             val_hist.append(vl)
 
-            # Early stopping: restore best weights when val loss stops improving
-            if vl < best_val - 1e-7:
+            # Early stopping: restore best weights when val loss stops improving.
+            # 1e-4 threshold avoids halting on pure floating-point noise while
+            # still detecting genuine plateaus (original 1e-7 was too strict).
+            if vl < best_val - 1e-4:
                 best_val   = vl
                 no_improve = 0
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
@@ -457,6 +467,103 @@ class PerturbationAnalyzer:
         top_idx = np.argsort(scores)[::-1][:n_targets]
         return top_idx.tolist()
 
+    # ── Data-driven trajectory prediction ────────────────────────────────────
+
+    def predict_trajectory(
+        self,
+        initial_state: np.ndarray,
+        stim_weights: np.ndarray,
+        stim_fn: Callable[[int], float],
+        n_steps: int = 60,
+        n_warmup: int = 0,
+    ) -> List[dict]:
+        """Auto-regressive stimulation trajectory prediction using the trained surrogate.
+
+        This is the scientifically correct way to simulate "what will this brain
+        do after stimulation?": apply a perturbation to the current state in z-score
+        space, feed it through the MLP fitted on *actual* fMRI/EEG time series, and
+        auto-regressively unroll the prediction.
+
+        Perturbation units (important):
+            ``stim_fn(k)`` returns a scalar that is interpreted as a **z-score
+            deviation** — i.e., how many standard deviations the stimulation shifts
+            the target regions' activity at step k.  The NPI convention (pert_strength
+            = 0.05) uses the same scale.  The caller should NOT pre-divide by
+            ``_ts_std``: that conversion is already baked into the z-scored lag window.
+            Perturbation in display space → z-score: divide by std.
+            But ``stim_fn`` already returns values in z-score-compatible magnitude
+            (small relative to ±3σ dynamic range), so no further scaling is needed.
+
+        Args:
+            initial_state : (N,) float32 activity in [0,1] display space (same space
+                            as the time series used in fit_surrogate).
+            stim_weights  : (N,) spatial distribution of the stimulation (0→1,
+                            peak = 1 at target regions, Gaussian falloff elsewhere).
+            stim_fn       : callable(step_index) → z-score-scale amplitude.
+                            Returns 0 when stimulation is inactive.
+            n_steps       : total frames to return (including pre-stim if stim_fn
+                            returns 0 for early steps).
+            n_warmup      : number of surrogate steps to run *before* recording frames,
+                            using stim_fn returning 0.  Builds a realistic lag-window
+                            history from the initial state, so the first recorded frame
+                            reflects genuine predicted baseline dynamics rather than the
+                            artificial "all lags = initial state" assumption.
+
+        Returns:
+            List of {"activity": [N floats]} dicts in display space [0, 1],
+            length == n_steps.
+        """
+        self._require_surrogate()
+        if self._ts_mean is None or self._ts_std is None:
+            raise RuntimeError(
+                "Normalization stats missing; fit_surrogate must be called before "
+                "predict_trajectory."
+            )
+
+        std_safe  = np.maximum(self._ts_std, 1e-6)        # (N,) — avoids div-by-zero
+        init_norm = (initial_state.astype(np.float32) - self._ts_mean) / std_safe
+
+        # Build initial lag window by repeating the current z-scored state n_lags times.
+        # All lags start equal; the warmup phase (below) replaces this with genuine
+        # surrogate dynamics before stimulation is applied.
+        lag_window = np.tile(init_norm, self.n_lags).astype(np.float32)  # (N*n_lags,)
+
+        def _step(stim_amp: float) -> np.ndarray:
+            """One surrogate forward pass; returns z-scored prediction."""
+            x = lag_window.copy()
+            if stim_amp != 0.0:
+                # Perturbation is applied directly in z-score space.
+                # stim_weights ∈ [0,1] (spatial Gaussian), stim_amp is in z-score
+                # units (small relative to ±3σ range, e.g. 0.0–0.5 for visible effect).
+                # DO NOT divide by std_safe: amp is already in z-score units, and
+                # dividing by std (≈0.05–0.15) would amplify the perturbation 7–20×,
+                # completely saturating the MLP's nonlinearities.
+                x[-self.n_regions:] += (stim_amp * stim_weights).astype(np.float32)
+            x_t = torch.tensor(x, dtype=torch.float32, device=self.device)
+            pred = self._surrogate(x_t.unsqueeze(0)).squeeze(0).cpu().numpy()
+            # Slide lag window: drop oldest step, append newest prediction
+            lag_window[:-self.n_regions] = lag_window[self.n_regions:]
+            lag_window[-self.n_regions:] = pred
+            return pred
+
+        self._surrogate.eval()
+        with torch.no_grad():
+            # Warmup: run surrogate unperturbed to fill the lag window with
+            # genuine predicted dynamics (instead of the flat "all=init" window).
+            for _ in range(n_warmup):
+                _step(0.0)
+
+            # Recording phase: n_steps frames returned to the caller.
+            frames = []
+            for k in range(n_steps):
+                pred_zs = _step(float(stim_fn(k)))
+                pred_display = np.clip(
+                    pred_zs * std_safe + self._ts_mean, 0.0, 1.0
+                ).astype(np.float32)
+                frames.append({"activity": pred_display.tolist()})
+
+        return frames
+
     # ── Activity delta prediction ────────────────────────────────────────────
 
     def predict_activity_delta(
@@ -499,7 +606,15 @@ class PerturbationAnalyzer:
             )
 
     def ec_to_dict(self, ec_matrix: Optional[np.ndarray] = None) -> dict:
-        """将 EC 矩阵转换为前端可用的 JSON 友好字典。"""
+        """将 EC 矩阵转换为前端可用的 JSON 友好字典。
+
+        The returned ``ec_flat`` is globally normalised so that the maximum
+        absolute value equals 1.0.  Without this step the raw Jacobian /
+        finite-difference values are typically O(0.001–0.01), which fall below
+        the 0.05 draw-threshold in the frontend and result in zero visible
+        connection lines.  Relative rankings (top_sources, top_targets) are
+        unaffected by scaling.
+        """
         if ec_matrix is None:
             ec_matrix = self._last_ec
         if ec_matrix is None:
@@ -507,8 +622,13 @@ class PerturbationAnalyzer:
         n = self.n_regions
         top_sources = self.suggest_targets(ec_matrix, 10, "outgoing")
         top_targets = self.suggest_targets(ec_matrix, 10, "incoming")
+        # Normalise to [-1, 1] so the frontend threshold (0.05) is meaningful.
+        # Use a small epsilon guard and explicitly copy to avoid returning a
+        # reference to the original matrix.
+        ec_max = float(np.abs(ec_matrix).max())
+        ec_norm = ec_matrix / ec_max if ec_max > 1e-12 else ec_matrix.copy()
         result = {
-            "ec_flat":      ec_matrix.flatten().tolist(),   # 200×200
+            "ec_flat":      ec_norm.flatten().tolist(),   # 200×200, normalised
             "top_sources":  top_sources,
             "top_targets":  top_targets,
             "n_regions":    n,

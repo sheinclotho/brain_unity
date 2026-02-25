@@ -238,10 +238,27 @@
       <div class="gap6"></div>
       <button id="btn-infer-ec" class="btn-primary">🧠 推断有效连接</button>
       <div class="gap6"></div>
+      <button id="btn-validate-ec" class="btn-secondary" disabled>🔬 验证 EC 可靠性</button>
+      <div class="gap6"></div>
       <button id="btn-ec-stim" class="btn-success" disabled>🎯 刺激推荐靶点</button>
       <div class="gap6"></div>
       <button id="btn-hide-ec" class="btn-secondary" style="display:none">隐藏连接线</button>
       <p id="ec-status" style="font-size:0.73rem;color:#666;margin-top:6px"></p>
+      <p id="ec-validation-status" style="font-size:0.72rem;color:#555;margin-top:4px;line-height:1.5"></p>
+    </div>
+
+    <div class="card">
+      <h3>大脑状态分析</h3>
+      <p style="font-size:0.75rem;color:#555;margin-bottom:7px">
+        无标签异常检测：偏差图谱 / 连接枢纽分析
+      </p>
+      <select id="analysis-method">
+        <option value="deviation">时段偏差图谱（前半 vs 后半）</option>
+        <option value="graph_metrics">连接枢纽分析（需先推断 EC）</option>
+      </select>
+      <div class="gap6"></div>
+      <button id="btn-analyze" class="btn-primary">📊 分析大脑状态</button>
+      <p id="analysis-status" style="font-size:0.73rem;color:#666;margin-top:6px;line-height:1.5"></p>
     </div>
 
     <div class="card">
@@ -270,6 +287,12 @@
   <input type="range" id="timeline-slider" min="0" max="0" value="0" />
   <span id="modality-badge"></span>
   <span id="frame-label">—</span>
+  <button id="btn-cf-toggle" title="切换至对照轨迹（无刺激基线）"
+          style="display:none;width:auto;padding:4px 10px;font-size:0.75rem;
+                 background:rgba(255,160,44,0.18);border:1px solid rgba(255,160,44,0.4);
+                 color:#ffcc66;border-radius:5px;white-space:nowrap;flex-shrink:0">
+    ○ 对照轨迹
+  </button>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"

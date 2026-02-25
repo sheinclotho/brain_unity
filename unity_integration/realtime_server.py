@@ -29,6 +29,34 @@ except ImportError:
     logging.warning("ModelServer not available")
 
 
+def _import_brain_state_analyzer():
+    """Robustly import BrainStateAnalyzer regardless of the import context."""
+    # 1. Package-relative import (normal usage)
+    try:
+        from .brain_state_analyzer import BrainStateAnalyzer as _BSA
+        return _BSA
+    except (ImportError, SystemError):
+        pass
+    # 2. Absolute package import (when the package root is on sys.path)
+    try:
+        from unity_integration.brain_state_analyzer import BrainStateAnalyzer as _BSA
+        return _BSA
+    except ImportError:
+        pass
+    # 3. Direct file import via importlib (standalone / test scripts)
+    try:
+        import importlib.util
+        _spec = importlib.util.spec_from_file_location(
+            "brain_state_analyzer",
+            str(Path(__file__).parent / "brain_state_analyzer.py"),
+        )
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod.BrainStateAnalyzer
+    except Exception:
+        return None
+
+
 class BrainVisualizationServer:
     """
     WebSocket server for real-time brain visualization.
@@ -96,6 +124,11 @@ class BrainVisualizationServer:
         # Key: (cache_file_path_str, n_lags) so the surrogate is only retrained
         # when the source data or lag window changes, not on every infer_ec call.
         self._ec_analyzer_cache: dict = {}
+
+        # Last loaded time series — stored so handle_validate_ec and
+        # handle_analyze_brain can access it without re-loading the .pt file.
+        self._loaded_time_series: Optional["np.ndarray"] = None  # (T, 200)
+        self._loaded_cache_path:  Optional[str]          = None
     
     async def register_client(self, websocket):
         """Register a new client connection."""
@@ -181,6 +214,12 @@ class BrainVisualizationServer:
 
             elif request_type == "infer_ec":
                 return await self.handle_infer_ec(request)
+
+            elif request_type == "validate_ec":
+                return await self.handle_validate_ec(request)
+
+            elif request_type == "analyze_brain":
+                return await self.handle_analyze_brain(request)
             
             else:
                 self.logger.warning(f"Unknown request type: {request_type}")
@@ -395,6 +434,9 @@ class BrainVisualizationServer:
             pattern = stimulation.get("pattern", "sine")
             frequency = stimulation.get("frequency", 10.0)
             duration = stimulation.get("duration", 20)
+            # The frontend sends the currently-displayed frame's activity so the
+            # stimulation starts from the user's actual selected brain state.
+            initial_state = stimulation.get("initial_state", None)
             
             # Validate target regions
             if not isinstance(target_regions, list) or len(target_regions) == 0:
@@ -424,23 +466,29 @@ class BrainVisualizationServer:
                 self.logger.warning(f"Filtered {len(target_regions) - len(valid_regions)} invalid region IDs")
                 target_regions = valid_regions
             
-            # Create timestamped output directory for this stimulation
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_base = Path(self.model_server.output_dir if self.model_server else "unity_project/brain_data/model_output")
-            stim_output_dir = output_base / "stimulation" / f"stim_{timestamp}"
-            stim_output_dir.mkdir(parents=True, exist_ok=True)
-            
-            self.logger.info(f"Stimulation output directory: {stim_output_dir}")
-            
             # Use ModelServer if available
             if self.model_server:
+                # Create timestamped output directory only when ModelServer will actually
+                # use it — avoids leaving empty dirs on every demo/surrogate simulation.
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_base = Path(self.model_server.output_dir)
+                stim_output_dir = output_base / "stimulation" / f"stim_{timestamp}"
+                stim_output_dir.mkdir(parents=True, exist_ok=True)
+                self.logger.info(f"Stimulation output directory: {stim_output_dir}")
                 self.logger.info(f"Using ModelServer for stimulation simulation")
+                # Convert the user's initial_state list to a tensor so ModelServer
+                # starts from the actual brain state rather than random noise.
+                init_tensor = None
+                if initial_state is not None:
+                    arr = np.array(initial_state[:n_regions], dtype=np.float32)
+                    init_tensor = torch.tensor(arr).unsqueeze(-1)  # (n_regions, 1)
                 responses = self.model_server.simulate_stimulation(
                     target_regions=target_regions,
                     amplitude=amplitude,
                     pattern=pattern,
                     frequency=frequency,
                     duration=duration,
+                    initial_state=init_tensor,
                     subject_id="stimulation"
                 )
                 
@@ -475,17 +523,140 @@ class BrainVisualizationServer:
                 self.logger.info(f"✓ Stimulation results auto-saved to: {stim_output_dir}")
                 
                 frames = [{"activity": self._extract_activity_array(r)} for r in responses]
+                # Counterfactual (null stimulation) via WC dynamics from same initial state
+                cf_frames = self._demo_simulate(
+                    target_regions=target_regions, amplitude=0.0,
+                    pattern=pattern, frequency=frequency,
+                    duration=duration, n_regions=n_regions,
+                    initial_state=initial_state,
+                )
                 return {
                     "type": "simulation_result",
                     "success": True,
                     "n_frames": len(frames),
                     "frames": frames,
+                    "counterfactual_frames": cf_frames,
                     "modality": "simulation",
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
                 }
-            # Demo simulation: realistic network-oscillation baseline + stimulation dynamics.
-            # This path is used when no trained model is available.
+
+            # ── Data-driven surrogate path (requires prior EC inference) ──────
+            # If the user has already run "推断有效连接", a trained MLP surrogate is
+            # available in _ec_analyzer_cache.  Use predict_trajectory to produce a
+            # REAL data-driven forecast instead of generic Wilson-Cowan dynamics.
+            surrogate_frames = None
+            if initial_state is not None and self._ec_analyzer_cache:
+                analyzer = list(self._ec_analyzer_cache.values())[-1]
+                if (analyzer._surrogate is not None
+                        and analyzer._ts_mean is not None
+                        and analyzer.n_regions == n_regions):
+                    try:
+                        # Compute Gaussian spatial spread weights (same as _demo_simulate)
+                        def _bp():
+                            daz = 2 * np.pi * (2 - (1 + np.sqrt(5)) / 2)
+                            pos = []
+                            for h in range(2):
+                                sign = -1 if h == 0 else 1
+                                for i in range(100):
+                                    t_ = (i + 0.5) / 100.0
+                                    el = 1.0 - 1.85 * t_
+                                    r  = np.sqrt(max(0.0, 1 - el * el))
+                                    az = daz * i
+                                    lat = abs(r * np.cos(az)) * 0.85 + 0.15
+                                    bulge = 9 * np.exp(-((el + 0.22) ** 2) * 5)
+                                    pos.append([sign * (lat * 55 + bulge + 9),
+                                                el * 63 - 4, r * np.sin(az) * 76 - 8])
+                            return np.array(pos, dtype=np.float32)
+
+                        _pos = _bp()
+                        sw = np.zeros(n_regions, dtype=np.float32)
+                        for tid in target_regions:
+                            if 0 <= tid < n_regions:
+                                d = np.linalg.norm(_pos - _pos[tid], axis=1)
+                                sw += np.exp(-(d ** 2) / (2 * 30.0 ** 2))
+                        if sw.max() > 0:
+                            sw /= sw.max()
+
+                        PRE_s  = 10
+                        DUR_s  = min(int(duration), 60)
+                        POST_s = 10
+
+                        def _stim_amp_s(k: int) -> float:
+                            # (k+0.5)/DUR_s: centers each frame in its time slot so
+                            # the bell envelope is never evaluated at exactly 0 or 1,
+                            # ensuring non-zero amplitude even when DUR_s == 1 or 2.
+                            progress = (k + 0.5) / max(DUR_s, 1)
+                            if pattern == "sine":
+                                slow_c = min(frequency / 10.0, 3.0)
+                                return amplitude * (np.sin(np.pi * progress)
+                                                    + 0.20 * np.sin(2 * np.pi * slow_c * progress))
+                            elif pattern == "pulse":
+                                return amplitude * np.exp(-k * 0.12)
+                            elif pattern == "ramp":
+                                return amplitude * progress
+                            else:
+                                return amplitude * min(1.0, k / max(DUR_s * 0.15, 1.0))
+
+                        # Unified stim_fn covers all three phases:
+                        #   k < PRE_s            → pre-stim (surrogate runs, no external input)
+                        #   PRE_s ≤ k < PRE_s+DUR_s → stimulation active
+                        #   k ≥ PRE_s+DUR_s      → post-stim recovery (no external input)
+                        # Using a single call with n_warmup=0 (lag window warms up during
+                        # the pre-stim region where stim_fn returns 0), so the pre-stim
+                        # frames show genuine baseline dynamics, not static copies.
+                        def _stim_fn_full(k: int) -> float:
+                            if k < PRE_s:
+                                return 0.0
+                            stim_k = k - PRE_s
+                            if stim_k < DUR_s:
+                                return _stim_amp_s(stim_k)
+                            return 0.0
+
+                        init_arr = np.array(initial_state[:n_regions], dtype=np.float32)
+
+                        surrogate_frames = analyzer.predict_trajectory(
+                            initial_state=init_arr,
+                            stim_weights=sw,
+                            stim_fn=_stim_fn_full,
+                            n_steps=PRE_s + DUR_s + POST_s,
+                        )
+
+                        # Counterfactual: same initial state, zero stimulation.
+                        # Because predict_trajectory is deterministic (no noise), the
+                        # pre-stim frames will be identical between stimulated and
+                        # counterfactual; they diverge from frame PRE_s onwards.
+                        surrogate_cf = analyzer.predict_trajectory(
+                            initial_state=init_arr,
+                            stim_weights=sw,
+                            stim_fn=lambda k: 0.0,
+                            n_steps=PRE_s + DUR_s + POST_s,
+                        )
+                        self.logger.info(
+                            f"使用已训练代理模型预测刺激轨迹 ({len(surrogate_frames)} 帧)"
+                        )
+                    except Exception as _exc:
+                        self.logger.warning(
+                            f"代理预测失败，回退到 Wilson-Cowan: {_exc}"
+                        )
+                        surrogate_frames = None
+                        surrogate_cf = None
+
+            if surrogate_frames is not None:
+                return {
+                    "type": "simulation_result",
+                    "success": True,
+                    "n_frames": len(surrogate_frames),
+                    "frames": surrogate_frames,
+                    "counterfactual_frames": surrogate_cf,
+                    "modality": "simulation",
+                    "method": "surrogate_mlp",
+                }
+
+            # Final fallback: Wilson-Cowan recurrent dynamics (no trained model needed).
+            # Generate stimulated trajectory, then null (amplitude=0) counterfactual.
+            # Both calls re-seed rng=np.random.default_rng(0) so noise is identical,
+            # making the comparison between stim and null scientifically clean.
             frames = self._demo_simulate(
                 target_regions=target_regions,
                 amplitude=amplitude,
@@ -493,13 +664,26 @@ class BrainVisualizationServer:
                 frequency=frequency,
                 duration=duration,
                 n_regions=n_regions,
+                initial_state=initial_state,
+            )
+            # Counterfactual: same dynamics but with amplitude=0
+            cf_frames = self._demo_simulate(
+                target_regions=target_regions,
+                amplitude=0.0,
+                pattern=pattern,
+                frequency=frequency,
+                duration=duration,
+                n_regions=n_regions,
+                initial_state=initial_state,
             )
             return {
                 "type": "simulation_result",
                 "success": True,
                 "n_frames": len(frames),
                 "frames": frames,
+                "counterfactual_frames": cf_frames,
                 "modality": "simulation",
+                "method": "wilson_cowan",
             }
                 
         except Exception as e:
@@ -643,6 +827,220 @@ class BrainVisualizationServer:
         )
         return result
 
+    # ------------------------------------------------------------------ #
+    #  EC Validation                                                        #
+    # ------------------------------------------------------------------ #
+
+    async def handle_validate_ec(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate EC reliability using three complementary checks.
+
+        Checks (all use the EXISTING trained surrogate — no retraining):
+          half_split  – EC consistency between first-half vs second-half of
+                        training samples (higher Pearson r = more reliable)
+          distance    – |EC[i,j]| vs anatomical distance correlation
+                        (expected negative: nearby regions interact more strongly)
+          fc_compare  – Pearson r between |EC| and FC (correlation matrix);
+                        high similarity means EC is redundant with simpler FC.
+                        Well-calibrated EC should add information beyond FC.
+
+        Request: { type: "validate_ec" }
+        Response: { type: "ec_validation_result", success: True, results: {...} }
+        """
+        import numpy as np
+
+        BrainStateAnalyzer = _import_brain_state_analyzer()
+        if BrainStateAnalyzer is None:
+            return {"type": "error", "message": "BrainStateAnalyzer 模块未找到"}
+
+        # Require a trained EC analyzer
+        if not self._ec_analyzer_cache:
+            return {
+                "type": "error",
+                "success": False,
+                "message": "尚未推断 EC，请先点击「推断有效连接」",
+            }
+
+        analyzer = list(self._ec_analyzer_cache.values())[-1]
+        if analyzer._surrogate is None or analyzer._input_X is None:
+            return {
+                "type": "error",
+                "success": False,
+                "message": "代理模型未训练，请先推断 EC",
+            }
+
+        results = {}
+
+        # ── 1. Half-split reliability ──────────────────────────────────────
+        try:
+            r_hs, detail_hs = BrainStateAnalyzer.ec_half_split_reliability(
+                surrogate=analyzer._surrogate,
+                input_X=analyzer._input_X,
+                n_regions=analyzer.n_regions,
+            )
+            results["half_split"] = detail_hs
+        except Exception as exc:
+            results["half_split"] = {"error": str(exc)}
+
+        # ── 2. EC vs anatomical distance ───────────────────────────────────
+        if analyzer._last_ec is not None:
+            try:
+                dist_result = BrainStateAnalyzer.ec_vs_distance_correlation(
+                    ec_matrix=analyzer._last_ec,
+                )
+                results["distance"] = dist_result
+            except Exception as exc:
+                results["distance"] = {"error": str(exc)}
+
+        # ── 3. EC vs FC (functional connectivity from training data) ───────
+        if analyzer._last_ec is not None and self._loaded_time_series is not None:
+            try:
+                ts = self._loaded_time_series          # (T, 200)
+                # Pearson FC (correlation between time courses of all region pairs)
+                fc = np.corrcoef(ts.T)                 # (200, 200)
+                np.fill_diagonal(fc, 0.0)
+                ec_abs = np.abs(analyzer._last_ec)
+                np.fill_diagonal(ec_abs, 0.0)
+                f_ec = ec_abs.flatten()
+                f_fc = np.abs(fc.flatten())
+                r_ef = float(np.corrcoef(f_ec, f_fc)[0, 1]) if f_ec.std() > 0 else 0.0
+                interp = (
+                    "EC ≈ FC（因果关系与相关性高度重叠，EC 的额外信息有限）" if r_ef > 0.7
+                    else ("EC 与 FC 中度相关（因果关系略超过单纯相关）" if r_ef > 0.4
+                    else "EC 与 FC 差异明显（EC 提供了超出相关分析的因果信息）")
+                )
+                results["fc_vs_ec"] = {
+                    "ec_fc_pearson_r": round(r_ef, 3),
+                    "interpretation":  interp,
+                }
+            except Exception as exc:
+                results["fc_vs_ec"] = {"error": str(exc)}
+
+        self.logger.info(f"EC 验证完成: {list(results.keys())}")
+        return {
+            "type":    "ec_validation_result",
+            "success": True,
+            "results": results,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Brain State Analysis (label-free)                                   #
+    # ------------------------------------------------------------------ #
+
+    async def handle_analyze_brain(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Label-free brain state analysis: deviation map or graph metrics.
+
+        Methods:
+          deviation     – split loaded time series into two halves, compute
+                          per-region z-score deviation map (early vs late window)
+          graph_metrics – compute EC-based hub scores and overlay on 3D brain
+
+        Request: { type: "analyze_brain",
+                   method: "deviation" | "graph_metrics",
+                   window1_start: int, window1_end: int,  (optional)
+                   window2_start: int, window2_end: int   (optional)
+                 }
+        Response: { type: "brain_analysis_result",
+                    method: str,
+                    activity: [200 floats],   # overlay for 3D view
+                    summary: {…},
+                    regions_of_interest: [int],
+                    success: true
+                  }
+        """
+        import numpy as np
+
+        BrainStateAnalyzer = _import_brain_state_analyzer()
+        if BrainStateAnalyzer is None:
+            return {"type": "error", "message": "BrainStateAnalyzer 模块未找到"}
+
+        method = request.get("method", "deviation")
+
+        # ── graph_metrics: requires EC matrix ─────────────────────────────
+        if method == "graph_metrics":
+            if not self._ec_analyzer_cache:
+                return {
+                    "type": "error",
+                    "success": False,
+                    "message": "请先推断有效连接（EC），再使用图论分析",
+                }
+            analyzer = list(self._ec_analyzer_cache.values())[-1]
+            if analyzer._last_ec is None:
+                return {
+                    "type": "error",
+                    "success": False,
+                    "message": "EC 矩阵不可用，请先推断有效连接",
+                }
+            try:
+                metrics = BrainStateAnalyzer.compute_graph_metrics(analyzer._last_ec)
+                hub_scores = np.array(metrics["hub_scores"], dtype=np.float32)
+                hs_max = hub_scores.max()
+                overlay = (hub_scores / hs_max).tolist() if hs_max > 0 else hub_scores.tolist()
+                return {
+                    "type":    "brain_analysis_result",
+                    "method":  "graph_metrics",
+                    "activity": overlay,
+                    "summary": {
+                        "global_efficiency": metrics["global_eff"],
+                        "density":           metrics["density"],
+                        "top_hubs":          metrics["top_hubs"],
+                        "interpretation":    (
+                            f"全脑效率 {metrics['global_eff']:.3f}，"
+                            f"连接密度 {metrics['density']:.3f}。"
+                            f"最强枢纽区域（Hub）: {[r+1 for r in metrics['top_hubs'][:5]]}"
+                        ),
+                    },
+                    "regions_of_interest": metrics["top_hubs"][:10],
+                    "success": True,
+                }
+            except Exception as exc:
+                return {"type": "error", "message": f"图论分析失败: {exc}"}
+
+        # ── deviation: requires loaded time series ─────────────────────────
+        if self._loaded_time_series is None:
+            return {
+                "type": "error",
+                "success": False,
+                "message": "请先加载 .pt 文件，再使用偏差分析",
+            }
+
+        ts = self._loaded_time_series   # (T, 200)
+        T  = len(ts)
+        if T < 6:
+            return {"type": "error", "success": False,
+                    "message": f"时序数据太短（{T} 帧），至少需要 6 帧"}
+
+        # Default window split: caller can override
+        w1s = int(request.get("window1_start", 0))
+        w1e = int(request.get("window1_end",   T // 2))
+        w2s = int(request.get("window2_start", T // 2))
+        w2e = int(request.get("window2_end",   T))
+
+        w1s = max(0, min(w1s, T - 1));  w1e = max(w1s + 1, min(w1e, T))
+        w2s = max(0, min(w2s, T - 1));  w2e = max(w2s + 1, min(w2e, T))
+
+        ref_ts  = ts[w1s:w1e]
+        test_ts = ts[w2s:w2e]
+
+        try:
+            overlay, summary = BrainStateAnalyzer.compute_deviation_map(ref_ts, test_ts)
+            summary["window1"] = f"帧 {w1s}–{w1e}"
+            summary["window2"] = f"帧 {w2s}–{w2e}"
+            self.logger.info(
+                f"偏差分析完成: 均值z={summary['mean_z_score']}, "
+                f"最大z={summary['max_z_score']}, "
+                f"异常区域数={summary['n_outliers_2std']}"
+            )
+            return {
+                "type":    "brain_analysis_result",
+                "method":  "deviation",
+                "activity": overlay.tolist(),
+                "summary": summary,
+                "regions_of_interest": summary["top_regions"],
+                "success": True,
+            }
+        except Exception as exc:
+            return {"type": "error", "message": f"偏差分析失败: {exc}"}
+
     def _generate_demo_time_series(self, T: int = 300) -> "np.ndarray":
         """Generate synthetic 200-region time series using 7-network oscillators."""
         import numpy as np
@@ -673,6 +1071,7 @@ class BrainVisualizationServer:
         frequency: float,
         duration: int,
         n_regions: int = 200,
+        initial_state: list = None,
     ) -> list:
         """Generate a realistic stimulation animation without a trained model.
 
@@ -681,8 +1080,12 @@ class BrainVisualizationServer:
           2. Stimulation active (``duration`` frames, capped at 60)
           3. Post-stim recovery (10 frames)
 
-        The baseline uses the same 7-network sinusoidal model as
-        ``handle_get_state`` so the stimulation starts from a plausible state.
+        When ``initial_state`` is provided (the user's selected time point
+        from loaded data), it is used as the starting brain state so the
+        stimulation is clearly anchored to the user's actual data rather than
+        a freshly generated synthetic baseline.  When omitted, the 7-network
+        sinusoidal model from ``handle_get_state`` is used as a fallback.
+
         Spatial spread is approximated via a Gaussian kernel over the
         Fibonacci-sphere positions baked into the visualisation (same formula
         as ``makeBrainPositions`` in app.js).
@@ -757,47 +1160,105 @@ class BrainVisualizationServer:
         # change in cortical excitability that is the brain's actual response to
         # sustained stimulation — which is the quantity of clinical interest.
         def _stim_amp(relative_t: int) -> float:
-            progress = relative_t / max(DUR - 1, 1)   # 0 → 1
+            # Center each step in its time slot so the bell envelope never evaluates
+            # at exactly 0 or 1 — this prevents zero-amplitude frames for small DUR.
+            # Formula: (k + 0.5) / DUR  ∈ (0, 1) exclusive, matching the NPI convention
+            # of a small perturbation applied mid-interval.
+            progress = (relative_t + 0.5) / max(DUR, 1)
             if pattern == "sine":
-                # Bell-shaped excitability envelope (rises, peaks, decays) plus a
-                # gentle visible oscillation whose rate is clamped well below Nyquist.
-                # The slow oscillation approximates rhythm-entrainment effects.
                 slow_cycles = min(frequency / 10.0, 3.0)   # ≤ 3 visible cycles
                 osc = 0.20 * np.sin(2 * np.pi * slow_cycles * progress)
                 return amplitude * (np.sin(np.pi * progress) + osc)
             elif pattern == "pulse":
-                # Sharp onset, exponential decay (models afterdischarge dynamics)
                 return amplitude * np.exp(-relative_t * 0.12)
             elif pattern == "ramp":
                 return amplitude * progress
             else:  # constant / unknown — smooth ramp-up to avoid sudden color jump
                 return amplitude * min(1.0, relative_t / max(DUR * 0.15, 1.0))
-        POST = 10
+        # ── Connectivity matrix for recurrent neural dynamics ─────────────
+        # Gaussian coupling strength using the same Fibonacci positions already
+        # computed above.  Sigma is 50% wider than stimulation spread so that
+        # excitation can propagate into neighbouring networks over time.
+        # Rows are L1-normalised so the network activity stays bounded.
+        _CONN_SIGMA_MM = _SPREAD_SIGMA_MM * 1.5
+        D = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=2)
+        W = np.exp(-(D ** 2) / (2 * _CONN_SIGMA_MM ** 2))
+        np.fill_diagonal(W, 0.0)
+        row_sums = W.sum(axis=1, keepdims=True)
+        W = np.where(row_sums > 0, W / row_sums, W).astype(np.float32)
+
+        # Fixed seed so the noise is reproducible (same run → same animation).
+        rng = np.random.default_rng(0)
+
+        def _wc_step(state: np.ndarray, stim_in: np.ndarray) -> np.ndarray:
+            """One Wilson-Cowan recurrent update step.
+
+            state   : (N,) float32, current normalised activity in [0, 1]
+            stim_in : (N,) float32, external stimulation input (0 = no stim)
+
+            Each region's next-state depends on:
+              - its own current state   (memory, via decay coefficient 0.82)
+              - direct stimulation      (stim_in)
+              - connectivity-weighted input from all other regions (W @ state)
+            This matches the Wilson-Cowan model in ModelServer.simulate_stimulation
+            so both code paths are behaviourally consistent.
+            """
+            net        = W @ state                                 # (N,) recurrent input
+            excitation = np.tanh(state + stim_in + net * 0.25)    # WC activation
+            noise      = rng.standard_normal(n_regions).astype(np.float32) * 0.015
+            return np.clip(state * 0.82 + excitation * 0.18 + noise, 0.0, 1.0)
+
+        _NO_STIM = np.zeros(n_regions, dtype=np.float32)
+        POST  = 10
         frames = []
 
-        # 1. Pre-stim baseline
-        for k in range(PRE):
-            tick = t0 * 200 + k * 4
-            act = _baseline(tick)
-            frames.append({"activity": act.tolist()})
+        if initial_state is not None and len(initial_state) >= n_regions:
+            if len(initial_state) > n_regions:
+                self.logger.warning(
+                    f"initial_state has {len(initial_state)} elements but n_regions={n_regions}; "
+                    "truncating — check frontend/backend region count mismatch"
+                )
+            init_arr = np.array(initial_state[:n_regions], dtype=np.float32)
 
-        # 2. Stimulation active
-        for k in range(DUR):
-            tick = t0 * 200 + (PRE + k) * 4
-            act  = _baseline(tick)
-            amp  = _stim_amp(k)
-            if amp != 0.0:
-                act = np.clip(act + amp * spread_weights, 0.0, 1.0)
-            frames.append({"activity": act.tolist()})
+            # 1. Pre-stim: show the user's selected brain state (static snapshot)
+            for _ in range(PRE):
+                frames.append({"activity": init_arr.tolist()})
 
-        # 3. Post-stim recovery (exponential decay of residual excitation)
-        post_baseline = _baseline(t0 * 200 + (PRE + DUR) * 4)
-        last_stim_act = np.array(frames[-1]["activity"], dtype=np.float32)
-        for k in range(POST):
-            decay = np.exp(-k / 4.0)
-            act   = post_baseline + (last_stim_act - post_baseline) * decay
-            act   = np.clip(act, 0.0, 1.0)
-            frames.append({"activity": act.tolist()})
+            # 2. Stimulation active: Wilson-Cowan recurrent dynamics.
+            #    CRITICALLY: each step evolves from the *previous step's state*,
+            #    NOT from init_arr.  This means the stimulation effect accumulates
+            #    and propagates through the connectivity matrix over time — the
+            #    simulation has genuine temporal memory.
+            current = init_arr.copy()
+            for k in range(DUR):
+                current = _wc_step(current, _stim_amp(k) * spread_weights)
+                frames.append({"activity": current.tolist()})
+
+            # 3. Post-stim: continued recurrent dynamics with no external input.
+            #    The brain naturally evolves (and gradually relaxes) from the
+            #    post-stim state rather than jumping back to init_arr.
+            for _ in range(POST):
+                current = _wc_step(current, _NO_STIM)
+                frames.append({"activity": current.tolist()})
+
+        else:
+            # Fallback: no data loaded — start from sinusoidal 7-network baseline.
+            # 1. Pre-stim baseline (sinusoidal)
+            for k in range(PRE):
+                frames.append({"activity": _baseline(t0 * 200 + k * 4).tolist()})
+
+            # 2. Stimulation active: begin from the *last* pre-stim state, then
+            #    apply recurrent Wilson-Cowan dynamics — not a fresh baseline each
+            #    frame.  Stimulation effect now accumulates over time.
+            current = np.array(frames[-1]["activity"], dtype=np.float32)
+            for k in range(DUR):
+                current = _wc_step(current, _stim_amp(k) * spread_weights)
+                frames.append({"activity": current.tolist()})
+
+            # 3. Post-stim: continued recurrent dynamics without stimulation
+            for _ in range(POST):
+                current = _wc_step(current, _NO_STIM)
+                frames.append({"activity": current.tolist()})
 
         return frames
 
@@ -979,6 +1440,17 @@ class BrainVisualizationServer:
             f"✓ 缓存加载完成: {cache_path} → {len(primary)} 帧 "
             f"(模态: {modalities})"
         )
+
+        # Store the primary time series for later use by validate_ec / analyze_brain
+        import numpy as np
+        try:
+            self._loaded_time_series = np.array(
+                [f["activity"] for f in primary], dtype=np.float32
+            )   # (T, 200)
+            self._loaded_cache_path = str(cache_path)
+        except Exception:
+            pass
+
         return {
             "type":           "cache_loaded",
             "path":           str(cache_path),
