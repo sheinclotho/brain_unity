@@ -44,6 +44,11 @@ let origCurFrame = 0;     // frame index the user was at in the original data
 let viewingSimulation = false;  // true when frameSeq holds simulation output
 // Backup of the last stimulation frames (used to restore after CF toggle).
 let stimFrames  = [];
+// The frame index within the simulation sequence where stimulation begins
+// (i.e., how many pre-stim frames precede the first stimulated frame).
+// Returned by the server as start_frame; used so the user sees the stimulation
+// effect immediately rather than the boring static pre-stim baseline.
+let simStartFrame = 0;
 // Track whether a stimulation request is pending (waiting for server response).
 // Used to lock the stim button until the result arrives, preventing duplicate
 // requests if the server takes longer than the original 3-second timeout.
@@ -400,8 +405,11 @@ function handleMsg(msg) {
     if (isStim) {
       // Backup stimulation frames so the CF toggle can restore them later
       stimFrames = finalFrames.slice();
+      // Remember where stimulation begins so both the main sequence and
+      // the CF toggle start at the first stimulated frame (not pre-stim baseline).
+      simStartFrame = (typeof msg.start_frame === 'number') ? msg.start_frame : 0;
     }
-    loadFrameSeq(finalFrames, msg.path || null, modalityLabel, isStim);
+    loadFrameSeq(finalFrames, msg.path || null, modalityLabel, isStim, isStim ? simStartFrame : 0);
     return;
   }
   // EC inference result
@@ -687,15 +695,25 @@ document.getElementById('btn-stim').addEventListener('click', () => {
     const swMax = sw.reduce((a, b) => Math.max(a, b), 0);
     if (swMax > 0) sw.forEach((_, i) => sw[i] /= swMax);
 
-    // Simple single-step WC stimulation (no connectivity) for offline preview
+    // Offline WC stimulation preview — deviation-based leaky integrator.
+    // Matches the server-side _demo_simulate WC formula (no connectivity matrix W
+    // for simplicity, but same equilibrium-point mechanics):
+    //   delta = tanh(stimIn * 2.0) * 0.04   — response to external drive
+    //   leak  = (v - act0[i]) * 0.10         — restores to act0 in ~10 steps
+    // Without stimulation: v stays at act0 (zero deviation → zero leak).
+    // With stimulation:    target rises above act0; recovers after stim ends.
+    // The old formula (v*0.85 + tanh(v+stim)*0.15) had a convergence-to-zero
+    // attractor: pre-stim regions drifted 0.06 toward black, post-stim regions
+    // decayed toward 0 instead of recovering to act0.
     const PRE = 5, DUR = 20, POST = 5;
     const localFrames = [];
     let curr = act0.slice();
 
     function stepLocal(state, stimIn) {
       return state.map((v, i) => {
-        const exc = Math.tanh(v + stimIn[i]);
-        return Math.max(0, Math.min(1, v * 0.85 + exc * 0.15));
+        const delta = Math.tanh(stimIn[i] * 2.0) * 0.04;
+        const leak  = (v - act0[i]) * 0.10;
+        return Math.max(0, Math.min(1, v + delta - leak));
       });
     }
 
@@ -714,7 +732,8 @@ document.getElementById('btn-stim').addEventListener('click', () => {
       localFrames.push({ activity: curr.slice() });
     }
     stimFrames = localFrames;
-    loadFrameSeq(localFrames, null, '⚡ 仿真 (离线)', true);
+    simStartFrame = PRE + Math.floor(DUR / 2);
+    loadFrameSeq(localFrames, null, '⚡ 仿真 (离线)', true, PRE + Math.floor(DUR / 2));
   }
 });
 
@@ -970,14 +989,14 @@ document.getElementById('btn-cf-toggle').addEventListener('click', () => {
     cfBtn.style.background = 'rgba(126,184,255,0.18)';
     cfBtn.style.color = '#7eb8ff';
     cfBtn.style.borderColor = 'rgba(126,184,255,0.4)';
-    loadFrameSeq(counterFactualFrames, null, '○ 对照', true);
+    loadFrameSeq(counterFactualFrames, null, '○ 对照', true, simStartFrame);
   } else {
     // Switch back to stimulated trajectory using the backed-up stimFrames
     cfBtn.textContent = '○ 对照轨迹';
     cfBtn.style.background = 'rgba(255,160,44,0.18)';
     cfBtn.style.color = '#ffcc66';
     cfBtn.style.borderColor = 'rgba(255,160,44,0.4)';
-    loadFrameSeq(stimFrames.length > 0 ? stimFrames : [], null, '⚡ 仿真', true);
+    loadFrameSeq(stimFrames.length > 0 ? stimFrames : [], null, '⚡ 仿真', true, simStartFrame);
   }
 });
 
