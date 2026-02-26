@@ -248,8 +248,8 @@ class ModelServer:
             # Basic validation fallback
             if not target_regions:
                 raise ValueError("target_regions cannot be empty")
-            if not 0.01 <= amplitude <= 10.0:
-                raise ValueError(f"amplitude must be between 0.01 and 10.0, got {amplitude}")
+            if not 0.0 <= amplitude <= 10.0:
+                raise ValueError(f"amplitude must be between 0.0 and 10.0, got {amplitude}")
             if not 1 <= duration <= 1000:
                 raise ValueError(f"duration must be between 1 and 1000, got {duration}")
             # Filter invalid region IDs
@@ -367,19 +367,23 @@ class ModelServer:
                                   + 0.20 * np.sin(2 * np.pi * slow_cycles * progress))
         
         elif pattern == "pulse":
-            # Guard: at frequency > 2 Hz the raw interval rounds to 0, causing
-            # a "slice step cannot be zero" ValueError.  Clamp to at least 1.
-            pulse_interval = max(1, int(1.0 / frequency / 0.5))  # steps between pulses
-            signal = np.zeros(n_steps)
-            signal[::pulse_interval] = amplitude
+            # Exponential-decay neural-response envelope — same as _demo_simulate and
+            # predict_trajectory.  The old square-wave (signal[::interval] = amplitude)
+            # degenerated to constant amplitude for frequency ≥ 2 Hz because the
+            # interval formula rounded to 0 → max(1,0) = 1 → every frame was "on".
+            signal = amplitude * np.exp(-np.arange(n_steps, dtype=np.float32) * 0.12)
         
         elif pattern == "ramp":
-            # 渐变
-            signal = amplitude * np.linspace(0, 1, n_steps)
+            # Use (k+0.5)/n_steps so the first frame is non-zero, matching the
+            # _demo_simulate and predict_trajectory convention (avoids exact 0 at k=0).
+            progress = (np.arange(n_steps, dtype=np.float32) + 0.5) / max(n_steps, 1)
+            signal = amplitude * progress
         
         elif pattern == "constant":
-            # 恒定
-            signal = np.ones(n_steps) * amplitude
+            # 15%-duration ramp-up, then sustained — matches _demo_simulate and offline JS
+            # (avoids sudden color jump while keeping full amplitude for most of DUR).
+            progress = np.arange(n_steps, dtype=np.float32)
+            signal = amplitude * np.minimum(1.0, progress / max(n_steps * 0.15, 1.0))
         
         else:
             # 默认恒定

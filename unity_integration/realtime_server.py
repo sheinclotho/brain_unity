@@ -527,13 +527,31 @@ class BrainVisualizationServer:
                 self.logger.info(f"✓ Stimulation results auto-saved to: {stim_output_dir}")
                 
                 frames = [{"activity": self._extract_activity_array(r)} for r in responses]
-                # Counterfactual (null stimulation) via WC dynamics from same initial state
-                cf_frames = self._demo_simulate(
-                    target_regions=target_regions, amplitude=0.0,
-                    pattern=pattern, frequency=frequency,
-                    duration=duration, n_regions=n_regions,
-                    initial_state=initial_state,
+                # Counterfactual: run ModelServer with amplitude=0 so frame count and
+                # dynamics exactly match the stimulated run (valid scientific comparison).
+                # Using _demo_simulate here gave a different frame count (PRE+DUR+POST vs
+                # DUR) and different dynamics, making the CF toggle misleading.
+                cf_responses = self.model_server.simulate_stimulation(
+                    target_regions=target_regions,
+                    amplitude=0.0,
+                    pattern=pattern,
+                    frequency=frequency,
+                    duration=duration,
+                    initial_state=init_tensor,
+                    subject_id="stimulation_cf",
                 )
+                cf_frames = [{"activity": self._extract_activity_array(r)} for r in cf_responses]
+                # Pattern-aware start_frame: point to the frame with maximum stim effect.
+                # ModelServer has no pre-stim frames (frame 0 = first stim step), so we
+                # index directly without adding a PRE offset.
+                _PULSE_PEAK_K = 9
+                _ms_dur = min(int(duration), 60)
+                if pattern == "pulse":
+                    _ms_peak_k = min(_PULSE_PEAK_K, _ms_dur - 1)
+                elif pattern == "ramp":
+                    _ms_peak_k = max(0, _ms_dur * 3 // 4)
+                else:  # sine, constant
+                    _ms_peak_k = _ms_dur // 2
                 return {
                     "type": "simulation_result",
                     "success": True,
@@ -541,7 +559,8 @@ class BrainVisualizationServer:
                     "frames": frames,
                     "counterfactual_frames": cf_frames,
                     "modality": "simulation",
-                    "start_frame": 0,
+                    "method": "model_server",
+                    "start_frame": _ms_peak_k,
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
                 }
@@ -673,6 +692,14 @@ class BrainVisualizationServer:
             # Generate stimulated trajectory, then null (amplitude=0) counterfactual.
             # Both calls re-seed rng=np.random.default_rng(0) so noise is identical,
             # making the comparison between stim and null scientifically clean.
+            #
+            # When the frontend provides no initial_state (no data loaded), each
+            # _demo_simulate call would independently call time.time(), giving slightly
+            # different t0 values and therefore slightly different baselines.  Pre-generate
+            # one deterministic baseline here so both runs start from the same state.
+            if initial_state is None:
+                _fallback = self._generate_demo_time_series(T=1)
+                initial_state = _fallback[0].tolist()
             frames = self._demo_simulate(
                 target_regions=target_regions,
                 amplitude=amplitude,

@@ -70,7 +70,7 @@ def validate_region_ids(
 
 def validate_amplitude(
     amplitude: float,
-    min_amp: float = 0.01,
+    min_amp: float = 0.0,
     max_amp: float = 10.0
 ) -> float:
     """
@@ -78,7 +78,7 @@ def validate_amplitude(
     
     Args:
         amplitude: Amplitude value to validate
-        min_amp: Minimum allowed amplitude
+        min_amp: Minimum allowed amplitude (0.0 = no stimulation, valid for counterfactual)
         max_amp: Maximum allowed amplitude
     
     Returns:
@@ -91,7 +91,7 @@ def validate_amplitude(
         >>> validate_amplitude(0.5)
         0.5
         >>> validate_amplitude(20.0)
-        ValidationError: Amplitude must be between 0.01 and 10.0
+        ValidationError: Amplitude must be between 0.0 and 10.0
     """
     if not isinstance(amplitude, (int, float)):
         raise ValidationError(f"amplitude must be numeric, got {type(amplitude)}")
