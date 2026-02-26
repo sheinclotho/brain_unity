@@ -1002,20 +1002,22 @@ document.getElementById('btn-cf-toggle').addEventListener('click', () => {
   if (!counterFactualFrames.length) return;
   showingCounterFactual = !showingCounterFactual;
   const cfBtn = document.getElementById('btn-cf-toggle');
+  // Preserve the current frame position so the two trajectories stay in sync.
+  const switchFrame = curFrame;
   if (showingCounterFactual) {
     // Switch to counterfactual (null-stimulation baseline)
     cfBtn.textContent = '⚡ 刺激轨迹';
     cfBtn.style.background = 'rgba(126,184,255,0.18)';
     cfBtn.style.color = '#7eb8ff';
     cfBtn.style.borderColor = 'rgba(126,184,255,0.4)';
-    loadFrameSeq(counterFactualFrames, null, '○ 对照', true, simStartFrame);
+    loadFrameSeq(counterFactualFrames, null, '○ 对照', true, switchFrame);
   } else {
     // Switch back to stimulated trajectory using the backed-up stimFrames
     cfBtn.textContent = '○ 对照轨迹';
     cfBtn.style.background = 'rgba(255,160,44,0.18)';
     cfBtn.style.color = '#ffcc66';
     cfBtn.style.borderColor = 'rgba(255,160,44,0.4)';
-    loadFrameSeq(stimFrames.length > 0 ? stimFrames : [], null, '⚡ 仿真', true, simStartFrame);
+    loadFrameSeq(stimFrames.length > 0 ? stimFrames : [], null, '⚡ 仿真', true, switchFrame);
   }
 });
 

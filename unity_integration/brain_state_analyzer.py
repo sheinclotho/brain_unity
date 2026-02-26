@@ -365,10 +365,28 @@ class BrainStateAnalyzer:
     ) -> dict:
         """Measure how much EC reflects anatomical proximity.
 
-        In healthy brains, EC tends to be stronger between nearby regions
-        (Euclidean distance in MNI space correlates negatively with |EC|).
-        A significant negative correlation provides partial validation that
-        the EC matrix captures real neural structure rather than noise.
+        In structural connectivity, connection density decreases with
+        Euclidean distance (distance-decay principle).  A significant
+        negative Pearson r between |EC[i,j]| and D[i,j] is therefore
+        *consistent with* anatomical plausibility — but a near-zero or
+        weakly-positive r does NOT automatically mean the EC is noise.
+
+        Two neurobiologically legitimate reasons for r ≈ 0:
+          1. **Long-range connectivity dominates**: default-mode network,
+             homotopic (interhemispheric), and top-down prefrontal control
+             connections couple *distant* regions just as strongly as local
+             ones.  At whole-brain 200-region scale this is common.
+          2. **Mixed regime**: local and long-range effects coexist and
+             cancel in the aggregate correlation.
+
+        Note: the positions used here are Fibonacci-sphere approximations,
+        not real MNI coordinates, which further reduces the sensitivity of
+        this test.
+
+        Recommendation: always interpret this result jointly with the
+        half-split reliability (r > 0.5 = stable) and the overfit ratio
+        from fit_quality.  A reliable surrogate with r ≈ 0 here more likely
+        reflects genuine long-range connectivity than noise.
 
         Args:
             ec_matrix : (N, N) EC matrix
@@ -415,11 +433,23 @@ class BrainStateAnalyzer:
         # p < 0.001 if |t| > 3.29 (two-tailed, df ≈ ∞)
         p_approx = "<0.001" if abs(t_stat) > 3.29 else ("<0.01" if abs(t_stat) > 2.58 else ">0.01")
 
-        interp = (
-            "EC 与解剖距离显著相关（符合生理预期）" if r < -0.1
-            else ("EC 与解剖距离无显著相关（可能为噪声主导）" if abs(r) < 0.05
-            else "EC 结果需进一步核查（正相关不符合预期）")
-        )
+        # Five-tier interpretation covering all r ranges correctly.
+        # Previous implementation had a gap: -0.10 ≤ r < -0.05 fell into the
+        # "else" branch and was mislabelled as "positive correlation".
+        if r < -0.1:
+            interp = "EC 与解剖距离显著负相关（符合局部连接假设，支持 EC 有效性）"
+        elif r < -0.05:
+            interp = "EC 呈弱距离衰减（r ∈ [−0.10, −0.05)），局部优先连接模式存在但不突出"
+        elif r < 0.05:
+            interp = (
+                "EC 与解剖距离几乎无相关（r ≈ 0）：①可能反映长程连接主导的网络（默认模式网络、"
+                "半球间连合纤维等），这在全脑 EC 中很常见，具有神经科学意义；"
+                "②也可能是数据量不足导致噪声主导。建议结合半分可靠性和过拟合指标综合判断。"
+            )
+        elif r < 0.1:
+            interp = "⚠ EC 呈弱正相关（r ∈ [0.05, 0.10)），与距离衰减预期相反；可能是模型噪声所致，建议增加数据量"
+        else:
+            interp = "⚠ EC 呈显著正相关（r ≥ 0.10），强烈不符合生理预期；建议检查数据质量和模型可靠性"
         return {
             "ec_vs_distance_r":  round(r, 3),
             "p_approx":          p_approx,
