@@ -417,8 +417,8 @@ class BrainStateAnalyzer:
 
         interp = (
             "EC 与解剖距离显著相关（符合生理预期）" if r < -0.1
-            else ("EC 与解剖距离无显著相关（可能为噪声主导）" if abs(r) < 0.05
-            else "EC 结果需进一步核查（正相关不符合预期）")
+            else ("⚠ EC 未呈现预期距离衰减（预期 r<−0.1，实测接近零），EC 结果可能以噪声为主，建议增加数据量后重试" if abs(r) < 0.05
+            else "⚠ EC 结果需进一步核查（实测正相关，与生理预期相反）")
         )
         return {
             "ec_vs_distance_r":  round(r, 3),

@@ -284,4 +284,16 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 - **量化验证**: 预刺激漂移 0.065→0.000，非靶区偏差 ~0→0.000，后刺激恢复方向正确。
 - **规则**: 任何用于预览刺激效果的 WC 公式都必须使用偏差驱动漏积分器，以 `act0`（用户当前脑状态）为稳定平衡点，绝不使用绝对值驱动的 `tanh(v + stim)` 形式。
 
+### [2026-02-26] CF 切换按钮每次都重置帧号 & EC 距离描述歧义
+
+#### CF 切换按钮每次都跳回 simStartFrame（已修复）
+- **问题**: 每次点击"○ 对照轨迹"/"⚡ 刺激轨迹"切换按钮后，`loadFrameSeq` 都以 `simStartFrame`（约第 30 帧）为起始帧，而非用户当前所在帧，导致每次切换都产生跳转，用户无法在同一时间点比较两条轨迹。
+- **修复**: `btn-cf-toggle` 的 click handler 改为先缓存 `curFrame`（`const switchFrame = curFrame`），再把 `switchFrame` 传给两次 `loadFrameSeq` 调用，取代原来的 `simStartFrame`。首次接收 `simulation_result` 时的 `loadFrameSeq(..., simStartFrame)` 行为不变（仍跳到峰值帧）。
+- **规则**: CF 切换必须在当前帧位置原地切换，不允许重置帧号；峰值帧跳转只在首次加载 simulation_result 时发生一次。
+
+#### EC vs 解剖距离解读歧义（已修复）
+- **问题**: `abs(r) < 0.05` 分支的解读文字 "EC 与解剖距离无显著相关（可能为噪声主导）" 表述模糊，用户无法判断该结果是"正常但未达到阈值"还是"有问题"。
+- **修复**: 改为 "⚠ EC 未呈现预期距离衰减（预期 r<−0.1，实测接近零），EC 结果可能以噪声为主，建议增加数据量后重试"。明确标注警告符号、说明预期值与实测值的差异，以及推荐的行动。
+- **规则**: EC 验证的解读文字必须对每种情况明确给出"正常/警告/异常"的判断，并说明依据（预期范围与实测值），不得使用"可能"等语意模糊的词汇描述诊断结论。
+
 *Last updated: 2026-02-26*
