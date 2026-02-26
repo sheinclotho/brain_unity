@@ -695,15 +695,25 @@ document.getElementById('btn-stim').addEventListener('click', () => {
     const swMax = sw.reduce((a, b) => Math.max(a, b), 0);
     if (swMax > 0) sw.forEach((_, i) => sw[i] /= swMax);
 
-    // Simple single-step WC stimulation (no connectivity) for offline preview
+    // Offline WC stimulation preview — deviation-based leaky integrator.
+    // Matches the server-side _demo_simulate WC formula (no connectivity matrix W
+    // for simplicity, but same equilibrium-point mechanics):
+    //   delta = tanh(stimIn * 2.0) * 0.04   — response to external drive
+    //   leak  = (v - act0[i]) * 0.10         — restores to act0 in ~10 steps
+    // Without stimulation: v stays at act0 (zero deviation → zero leak).
+    // With stimulation:    target rises above act0; recovers after stim ends.
+    // The old formula (v*0.85 + tanh(v+stim)*0.15) had a convergence-to-zero
+    // attractor: pre-stim regions drifted 0.06 toward black, post-stim regions
+    // decayed toward 0 instead of recovering to act0.
     const PRE = 5, DUR = 20, POST = 5;
     const localFrames = [];
     let curr = act0.slice();
 
     function stepLocal(state, stimIn) {
       return state.map((v, i) => {
-        const exc = Math.tanh(v + stimIn[i]);
-        return Math.max(0, Math.min(1, v * 0.85 + exc * 0.15));
+        const delta = Math.tanh(stimIn[i] * 2.0) * 0.04;
+        const leak  = (v - act0[i]) * 0.10;
+        return Math.max(0, Math.min(1, v + delta - leak));
       });
     }
 

@@ -262,4 +262,26 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 - **规则**: `start_frame` 必须指向"刺激效果最明显的帧"，而非"刺激开始帧"。正弦包络在起始帧几乎为零，绝不能用作第一可见帧。所有模拟路径（WC / 代理MLP / 离线前端）都必须遵循此规则。
 - **代码位置**: `handle_simulate` → WC 路径 `_peak_k` 计算；代理 MLP 路径 `_s_peak_k` 计算；前端离线模式 `simStartFrame = PRE + Math.floor(DUR / 2)`。
 
+### [2026-02-26] 离线前端 `stepLocal` 使用收敛到零的错误吸引子
+
+- **问题**: 离线模式的 `stepLocal` 函数使用旧公式 `v * 0.85 + tanh(v + stimIn) * 0.15`，其固定点为 `v* = tanh(v*) = 0`（收敛到黑色）。导致：
+  1. 预刺激阶段（无刺激输入）：脑区从 `act0`（如 0.5）向 0 漂移，每步漂移约 0.013，5 步累计 **0.065**（视觉可见）。
+  2. 刺激后恢复阶段：脑区也向 0 衰减，而非恢复到用户的初始大脑状态 `act0`。
+  3. 非靶区：在刺激期间因吸引子缓慢向 0 漂移，视觉上不正确。
+- **修复**: 改用与服务端 `_demo_simulate` 完全一致的**偏差驱动漏积分器**（不含连接矩阵 W，简化版）：
+  ```javascript
+  function stepLocal(state, stimIn) {
+    return state.map((v, i) => {
+      const delta = Math.tanh(stimIn[i] * 2.0) * 0.04;  // 响应外部驱动
+      const leak  = (v - act0[i]) * 0.10;               // 漏电（收敛到 act0）
+      return Math.max(0, Math.min(1, v + delta - leak));
+    });
+  }
+  ```
+  - 无刺激时：`stimIn[i]=0 → delta=0, leak=(v-act0)*0.10`，v 精确保持在 `act0`（偏差为 0）。
+  - 有刺激时：靶区明显上升（峰值偏差 0.169），非靶区保持在 `act0`（偏差恰好为 0）。
+  - 刺激后：靶区以约 10 步的时间常数恢复到 `act0`（不向 0 衰减）。
+- **量化验证**: 预刺激漂移 0.065→0.000，非靶区偏差 ~0→0.000，后刺激恢复方向正确。
+- **规则**: 任何用于预览刺激效果的 WC 公式都必须使用偏差驱动漏积分器，以 `act0`（用户当前脑状态）为稳定平衡点，绝不使用绝对值驱动的 `tanh(v + stim)` 形式。
+
 *Last updated: 2026-02-26*
