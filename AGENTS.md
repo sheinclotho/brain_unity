@@ -245,4 +245,21 @@ As an AI with access to vast knowledge databases, advanced algorithms, and a bre
 - **修复**: 改用以 `init_arr` 为稳定平衡点的偏差驱动漏积分器 `delta = tanh(stim*2.0 + W@deviation*0.35)*0.04; leak = deviation*0.10`，固定点在 `init_arr` 处，不施加刺激时不产生任何漂移。
 - **规则**: Wilson-Cowan 式模型中，连接项必须作用于**偏差**（`state - baseline`）而非绝对活动，否则 L1 归一化连接矩阵几乎必然在某个中间值处产生虚假引力点。刺激幅度应以归一化活动为单位（0–1），不应超过 0.04/步，以避免单帧跳跃。
 
-*Last updated: 2026-02-25*
+### [2026-02-26] 刺激动画 start_frame 起点错误 — 两级静默失效
+
+#### 第一级失效：预刺激静态复制（已修复 2026-02-25）
+- `_demo_simulate` 预刺激阶段对 `init_arr` 生成 10 个静态副本，导致 frames[0..9] 完全相同。
+- **修复**: 改为 WC 动力学步进（无刺激输入），frames[0..9] 现在展示真实的基线演化。
+
+#### 第二级失效（本次修复）：start_frame 指向刺激起始而非峰值
+- **根因**: `start_frame=10`（预刺激结束，刺激第 0 帧）时，正弦包络 `sin(π*0.5/60) ≈ 0.026`，WC 步进只产生 `delta ≈ 0.001` 的变化。
+- **量化验证**: 数值审计表明，在 `start_frame=10` 处：目标脑区与 `init_arr` 的差异仅 0.001，两个不同目标脑区的最大可见差异仅 0.0015 — **完全不可感知**。
+- **对比**: 在峰值帧 `start_frame=40`（正弦，DUR=60）处：差异 0.28，为起始帧的 **193 倍**。
+- **修复**: `start_frame` 改为按刺激模式自适应，指向 WC/代理 MLP 中累积效果最大的帧：
+  - `sine` / `constant`：`PRE + DUR // 2`（峰值）
+  - `pulse`：`PRE + min(9, DUR-1)`（指数衰减时累积效果最大约 k=9）
+  - `ramp`：`PRE + DUR * 3 // 4`（线性增长时效果最大在末端附近）
+- **规则**: `start_frame` 必须指向"刺激效果最明显的帧"，而非"刺激开始帧"。正弦包络在起始帧几乎为零，绝不能用作第一可见帧。所有模拟路径（WC / 代理MLP / 离线前端）都必须遵循此规则。
+- **代码位置**: `handle_simulate` → WC 路径 `_peak_k` 计算；代理 MLP 路径 `_s_peak_k` 计算；前端离线模式 `simStartFrame = PRE + Math.floor(DUR / 2)`。
+
+*Last updated: 2026-02-26*

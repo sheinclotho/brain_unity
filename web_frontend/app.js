@@ -722,8 +722,8 @@ document.getElementById('btn-stim').addEventListener('click', () => {
       localFrames.push({ activity: curr.slice() });
     }
     stimFrames = localFrames;
-    simStartFrame = PRE;
-    loadFrameSeq(localFrames, null, '⚡ 仿真 (离线)', true, PRE);
+    simStartFrame = PRE + Math.floor(DUR / 2);
+    loadFrameSeq(localFrames, null, '⚡ 仿真 (离线)', true, PRE + Math.floor(DUR / 2));
   }
 });
 

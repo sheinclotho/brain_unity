@@ -648,6 +648,16 @@ class BrainVisualizationServer:
                         surrogate_cf = None
 
             if surrogate_frames is not None:
+                # Same pattern-aware peak logic as the WC path: start at the frame
+                # where stimulation effect is most visible, not at stim onset (k=0).
+                # PRE_s and DUR_s are already set above (line ~586/587).
+                _PULSE_PEAK_K = 9  # empirical: pulse decay, effect peaks near k=9
+                if pattern == "pulse":
+                    _s_peak_k = min(_PULSE_PEAK_K, DUR_s - 1)
+                elif pattern == "ramp":
+                    _s_peak_k = max(0, DUR_s * 3 // 4)
+                else:
+                    _s_peak_k = DUR_s // 2
                 return {
                     "type": "simulation_result",
                     "success": True,
@@ -656,7 +666,7 @@ class BrainVisualizationServer:
                     "counterfactual_frames": surrogate_cf,
                     "modality": "simulation",
                     "method": "surrogate_mlp",
-                    "start_frame": PRE_s,
+                    "start_frame": PRE_s + _s_peak_k,
                 }
 
             # Final fallback: Wilson-Cowan recurrent dynamics (no trained model needed).
@@ -682,6 +692,30 @@ class BrainVisualizationServer:
                 n_regions=n_regions,
                 initial_state=initial_state,
             )
+            # Compute pattern-aware peak frame so the browser starts playback at
+            # the frame with the MOST VISIBLE stimulation effect, not at the boring
+            # first stim frame where the sine bell is barely non-zero.
+            # Numerical audit (see AGENTS.md) showed start_frame=10 (stim onset)
+            # yields only 0.001 visible change — 193× less than the peak frame.
+            # NOTE: _WC_PRE and _WC_MAX_DUR are kept separate from PRE_s/DUR_s
+            # because PRE_s/DUR_s are only defined when the surrogate path is
+            # entered (i.e., when _ec_analyzer_cache is non-empty).  The WC
+            # fallback can be reached without entering the surrogate path, so
+            # we define these independently using the same values as
+            # _demo_simulate's PRE=10 and _MAX_STIM_FRAMES=60.
+            _WC_PRE      = 10   # must match _demo_simulate's PRE
+            _WC_MAX_DUR  = 60   # must match _demo_simulate's _MAX_STIM_FRAMES
+            _PULSE_PEAK_K = 9   # empirical: pulse decay, accumulated effect peaks near k=9
+            _wc_dur = min(int(duration), _WC_MAX_DUR)
+            if pattern == "pulse":
+                # Pulse decays from k=0; accumulated deviation peaks at k ≈ 9
+                _peak_k = min(_PULSE_PEAK_K, _wc_dur - 1)
+            elif pattern == "ramp":
+                # Ramp grows continuously; deviation is maximum near the last stim frame
+                _peak_k = max(0, _wc_dur * 3 // 4)
+            else:
+                # sine and constant: bell/plateau centre gives maximum effect
+                _peak_k = _wc_dur // 2
             return {
                 "type": "simulation_result",
                 "success": True,
@@ -690,7 +724,7 @@ class BrainVisualizationServer:
                 "counterfactual_frames": cf_frames,
                 "modality": "simulation",
                 "method": "wilson_cowan",
-                "start_frame": 10,
+                "start_frame": _WC_PRE + _peak_k,
             }
                 
         except Exception as e:
