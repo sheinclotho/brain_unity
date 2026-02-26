@@ -125,6 +125,12 @@ class BrainVisualizationServer:
         # when the source data or lag window changes, not on every infer_ec call.
         self._ec_analyzer_cache: dict = {}
 
+        # Cache for computed EC matrices.
+        # Key: (cache_file_path_str, n_lags, method) — avoids re-running the
+        # (random-free but still expensive) Jacobian/perturbation computation
+        # on repeated infer_ec requests with the same parameters.
+        self._ec_matrix_cache: dict = {}
+
         # Last loaded time series — stored so handle_validate_ec and
         # handle_analyze_brain can access it without re-loading the .pt file.
         self._loaded_time_series: Optional["np.ndarray"] = None  # (T, 200)
@@ -872,13 +878,25 @@ class BrainVisualizationServer:
         else:
             self.logger.info("EC 推断: 复用已缓存代理模型（跳过训练）")
 
-        # ── Infer EC ───────────────────────────────────────────────────────
-        if method == "perturbation":
-            ec = analyzer.infer_ec_perturbation(pert_strength=0.05)
+        # ── Infer EC — use cached result when available ────────────────────
+        # Caching by (data_key, n_lags, method) avoids re-running the expensive
+        # Jacobian/perturbation pass on every frontend click.  The result is
+        # deterministic once the surrogate is trained (random seed fixed in
+        # infer_ec_jacobian), so caching is scientifically safe.
+        ec_cache_key = (*cache_key, method)
+        ec = self._ec_matrix_cache.get(ec_cache_key)
+        if ec is None:
+            if method == "perturbation":
+                ec = analyzer.infer_ec_perturbation(pert_strength=0.05)
+            else:
+                ec = analyzer.infer_ec_jacobian(
+                    n_samples=min(100, len(time_series) - n_lags)
+                )
+            self._ec_matrix_cache[ec_cache_key] = ec
         else:
-            ec = analyzer.infer_ec_jacobian(
-                n_samples=min(100, len(time_series) - n_lags)
-            )
+            # Restore so downstream code (e.g. validate_ec) has the latest EC.
+            analyzer._last_ec = ec
+            self.logger.info("EC 推断: 复用已缓存 EC 矩阵（跳过推断）")
 
         result = analyzer.ec_to_dict(ec)
         top_src = result["top_sources"]
@@ -1252,14 +1270,27 @@ class BrainVisualizationServer:
             else:  # constant / unknown — smooth ramp-up to avoid sudden color jump
                 return amplitude * min(1.0, relative_t / max(DUR * 0.15, 1.0))
         # ── Connectivity matrix for spatial propagation of deviations ────────
-        # Used only to spread *deviations from baseline* to neighbouring regions.
-        # L1-normalised so propagation stays bounded.
+        # Uses k-nearest-neighbour (k=5) sparse connectivity so that each edge
+        # carries ≈1/5 of the coupling mass.  The previous full-Gaussian L1-
+        # normalised W spread the same mass over ~50 neighbours, making each
+        # W[i,j] ≈ 0.02 and the effective per-hop coupling 50× too weak for any
+        # visible propagation beyond the direct Gaussian spread.
+        # With k=5 row-normalised, W[i,j] ≈ 0.20 for nearest neighbours, and
+        # the coupling coefficient 3.0 gives a stable effective propagation of
+        # ≈0.20 × 3.0 × 0.04 = 0.024/step (well below the leak rate of 0.10).
         _CONN_SIGMA_MM = _SPREAD_SIGMA_MM * 1.5
+        _K_NN = 5   # number of nearest neighbours per region
         D = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=2)
-        W = np.exp(-(D ** 2) / (2 * _CONN_SIGMA_MM ** 2))
-        np.fill_diagonal(W, 0.0)
+        np.fill_diagonal(D, np.inf)   # exclude self-connections
+        # Build sparse k-NN weight matrix
+        W = np.zeros((n_regions, n_regions), dtype=np.float32)
+        for i in range(n_regions):
+            nn_idx = np.argpartition(D[i], _K_NN)[:_K_NN]
+            W[i, nn_idx] = np.exp(-(D[i, nn_idx] ** 2) / (2 * _CONN_SIGMA_MM ** 2))
+        # Row-normalise: each region's outgoing coupling sums to 1
         row_sums = W.sum(axis=1, keepdims=True)
         W = np.where(row_sums > 0, W / row_sums, W).astype(np.float32)
+        np.fill_diagonal(D, 0.0)   # restore diagonal (not used further)
 
         # Fixed seed so the noise is reproducible (same run → same animation).
         rng = np.random.default_rng(0)
@@ -1285,19 +1316,25 @@ class BrainVisualizationServer:
 
             This model uses init_arr as the stable resting equilibrium:
               - deviation = state − init_arr  (0 when at rest)
-              - net_dev   = W @ deviation      (only deviations propagate, not
-                                                absolute activity; prevents
-                                                global saturation)
-              - delta     = tanh(stim_in*2.0 + net_dev*0.35) * 0.04
+              - net_dev   = W @ deviation      (sparse k-NN W; only deviations
+                                                propagate, not absolute activity)
+              - delta     = tanh(stim_in*2.0 + net_dev*3.0) * 0.04
               - leak      = deviation * 0.10   (returns to init_arr in ~10 steps)
+
+            The coupling coefficient was increased from 0.35 to 3.0 together with
+            the switch to sparse k-NN W (W[i,j] ≈ 0.20 vs ≈ 0.02 before).
+            Effective coupling per step ≈ 0.20 × 3.0 × 0.04 = 0.024 which is
+            well below the leak rate (0.10), keeping the system stable while
+            producing visible propagation to 1-2 hop neighbours.
 
             Without stimulation: deviation stays at 0 → state stable at init_arr.
             With stimulation:    target regions rise clearly above init_arr;
+                                 nearby regions follow via connectivity;
                                  leak prevents runaway saturation.
             """
             deviation = state - init_arr
             net_dev   = W @ deviation
-            delta     = np.tanh(stim_in * 2.0 + net_dev * 0.35) * 0.04
+            delta     = np.tanh(stim_in * 2.0 + net_dev * 3.0) * 0.04
             leak      = deviation * 0.10
             noise     = rng.standard_normal(n_regions).astype(np.float32) * 0.008
             return np.clip(state + delta - leak + noise, 0.0, 1.0)

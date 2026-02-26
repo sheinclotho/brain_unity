@@ -353,7 +353,12 @@ class PerturbationAnalyzer:
         model  = self._surrogate
         input_X = self._input_X
         if n_samples and n_samples < len(input_X):
-            idx     = np.random.choice(len(input_X), n_samples, replace=False)
+            # Use a fixed-seed local RNG so the same surrogate always produces the
+            # same EC matrix (deterministic subset selection).  Calling np.random
+            # without a seed made top_sources and fc_vs_ec vary across repeated
+            # calls on the same dataset (AGENTS.md 2026-02-26 bug report).
+            rng_ec = np.random.default_rng(42)
+            idx    = rng_ec.choice(len(input_X), n_samples, replace=False)
             input_X = input_X[idx]
 
         N = self.n_regions
