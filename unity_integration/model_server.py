@@ -248,8 +248,8 @@ class ModelServer:
             # Basic validation fallback
             if not target_regions:
                 raise ValueError("target_regions cannot be empty")
-            if not 0.01 <= amplitude <= 10.0:
-                raise ValueError(f"amplitude must be between 0.01 and 10.0, got {amplitude}")
+            if not 0.0 <= amplitude <= 10.0:
+                raise ValueError(f"amplitude must be between 0.0 and 10.0, got {amplitude}")
             if not 1 <= duration <= 1000:
                 raise ValueError(f"duration must be between 1 and 1000, got {duration}")
             # Filter invalid region IDs
@@ -277,10 +277,22 @@ class ModelServer:
         results = []
         current_state = initial_state.clone()
 
-        # Coupled-oscillator simulation
-        # (used when no trained model is loaded; gives physiologically plausible
-        #  propagation instead of pure random noise)
-        connectivity = self._get_connectivity_matrix()
+        # Deviation-based leaky integrator (same model as _demo_simulate in
+        # realtime_server.py).  The initial state is the stable resting equilibrium:
+        #   deviation  = state − init                  (0 at rest)
+        #   net_dev    = W @ deviation                 (propagate deviations, not absolutes)
+        #   delta      = tanh(stim*2.0 + net_dev*0.35) * 0.04
+        #   leak       = deviation * 0.10              (returns to init in ~10 steps)
+        # Without stimulation: state stays at init (deviation → 0).
+        # With stimulation:    target regions rise above init; leak prevents saturation.
+        # Fixed seed makes the noise reproducible across stimulated / counterfactual runs.
+        # NOTE: initial_state may come from the frontend in [0,1] display space;
+        # the deviation-based formula keeps state in [0,1] so _state_to_json must
+        # NOT apply its usual tanh renormalisation (already_normalized=True).
+        init_state_1d = current_state.squeeze(-1).clone()   # (n_regions,) — equilibrium
+        connectivity  = self._get_connectivity_matrix()
+        rng = torch.Generator()
+        rng.manual_seed(0)  # reproducible noise for stim / CF comparison
 
         # 模拟时间演化
         for t in range(duration):
@@ -290,17 +302,18 @@ class ModelServer:
                 if 0 <= region_id < n_regions:
                     stim[region_id] = stimulation_signal[t]
 
-            # Connectivity-mediated input from neighbouring regions
-            state_1d = current_state.squeeze(-1)           # (n_regions,)
-            net_input = connectivity @ state_1d             # (n_regions,)
+            state_1d  = current_state.squeeze(-1)           # (n_regions,)
+            deviation = state_1d - init_state_1d
+            net_dev   = connectivity @ deviation
 
-            # Wilson–Cowan-like update: tanh activation, slow decay
-            excitation = torch.tanh(state_1d + stim * 0.6 + net_input * 0.25)
-            noise      = torch.randn(n_regions) * 0.025
-            state_1d   = state_1d * 0.82 + excitation * 0.18 + noise
+            # Deviation-based WC: fixed point at init_state_1d (not at 0 or ~0.8)
+            delta      = torch.tanh(stim * 2.0 + net_dev * 0.35) * 0.04
+            leak       = deviation * 0.10
+            noise      = torch.randn(n_regions, generator=rng) * 0.008
+            state_1d   = torch.clamp(state_1d + delta - leak + noise, 0.0, 1.0)
             current_state = state_1d.unsqueeze(-1)          # back to (n_regions, 1)
-            
-            # 转换为JSON
+
+            # State is already in [0,1] — skip tanh renormalisation in _state_to_json
             brain_state = self._state_to_json(
                 current_state,
                 time_point=t,
@@ -310,9 +323,10 @@ class ModelServer:
                     "target_regions": target_regions,
                     "amplitude": amplitude,
                     "pattern": pattern
-                }
+                },
+                already_normalized=True,
             )
-            
+
             results.append(brain_state)
         
         # 保存结果
@@ -353,19 +367,23 @@ class ModelServer:
                                   + 0.20 * np.sin(2 * np.pi * slow_cycles * progress))
         
         elif pattern == "pulse":
-            # Guard: at frequency > 2 Hz the raw interval rounds to 0, causing
-            # a "slice step cannot be zero" ValueError.  Clamp to at least 1.
-            pulse_interval = max(1, int(1.0 / frequency / 0.5))  # steps between pulses
-            signal = np.zeros(n_steps)
-            signal[::pulse_interval] = amplitude
+            # Exponential-decay neural-response envelope — same as _demo_simulate and
+            # predict_trajectory.  The old square-wave (signal[::interval] = amplitude)
+            # degenerated to constant amplitude for frequency ≥ 2 Hz because the
+            # interval formula rounded to 0 → max(1,0) = 1 → every frame was "on".
+            signal = amplitude * np.exp(-np.arange(n_steps, dtype=np.float32) * 0.12)
         
         elif pattern == "ramp":
-            # 渐变
-            signal = amplitude * np.linspace(0, 1, n_steps)
+            # Use (k+0.5)/n_steps so the first frame is non-zero, matching the
+            # _demo_simulate and predict_trajectory convention (avoids exact 0 at k=0).
+            progress = (np.arange(n_steps, dtype=np.float32) + 0.5) / max(n_steps, 1)
+            signal = amplitude * progress
         
         elif pattern == "constant":
-            # 恒定
-            signal = np.ones(n_steps) * amplitude
+            # 15%-duration ramp-up, then sustained — matches _demo_simulate and offline JS
+            # (avoids sudden color jump while keeping full amplitude for most of DUR).
+            progress = np.arange(n_steps, dtype=np.float32)
+            signal = amplitude * np.minimum(1.0, progress / max(n_steps * 0.15, 1.0))
         
         else:
             # 默认恒定
@@ -379,28 +397,34 @@ class ModelServer:
         time_point: int,
         time_second: float,
         subject_id: str,
-        stimulation_info: Optional[Dict] = None
+        stimulation_info: Optional[Dict] = None,
+        already_normalized: bool = False,
     ) -> Dict[str, Any]:
         """
         将脑状态转换为JSON格式
-        
+
         Args:
-            state: 状态张量 (n_regions, n_features)
-            time_point: 时间点
-            time_second: 时间（秒）
-            subject_id: 主体ID
-            stimulation_info: 刺激信息（可选）
-        
-        Returns:
-            JSON格式的脑状态
+            state:              状态张量 (n_regions, n_features)
+            time_point:         时间点
+            time_second:        时间（秒）
+            subject_id:         主体ID
+            stimulation_info:   刺激信息（可选）
+            already_normalized: 当 state 已在 [0,1] 显示空间时设为 True，
+                                 跳过 tanh 再归一化（避免双重压缩）。
+                                 predict_future 等使用无界内部状态的路径
+                                 应保留默认值 False。
         """
         n_regions = state.shape[0]
-        
+
         # 规范化活动值到 [0, 1]
         activity = state[:, 0].numpy() if not state.is_cuda else state[:, 0].cpu().numpy()
-        
-        # 使用tanh进行软规范化
-        activity_normalized = (np.tanh(activity) + 1) / 2
+
+        if already_normalized:
+            # State is already in [0, 1]; clip for safety instead of re-applying tanh.
+            activity_normalized = np.clip(activity, 0.0, 1.0)
+        else:
+            # 使用tanh进行软规范化（适用于无界内部状态）
+            activity_normalized = (np.tanh(activity) + 1) / 2
         
         # 构建脑区数据
         regions = []

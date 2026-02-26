@@ -723,7 +723,16 @@ document.getElementById('btn-stim').addEventListener('click', () => {
     }
     for (let k = 0; k < DUR; k++) {
       const progress = (k + 0.5) / Math.max(DUR, 1);
-      const amp = amplitude * Math.sin(Math.PI * progress);
+      let amp;
+      if (pattern === 'pulse') {
+        amp = amplitude * Math.exp(-k * 0.12);
+      } else if (pattern === 'ramp') {
+        amp = amplitude * progress;
+      } else if (pattern === 'constant') {
+        amp = amplitude * Math.min(1.0, k / Math.max(DUR * 0.15, 1.0));
+      } else {  // sine (default)
+        amp = amplitude * Math.sin(Math.PI * progress);
+      }
       curr = stepLocal(curr, sw.map(w => amp * w));
       localFrames.push({ activity: curr.slice() });
     }
@@ -732,8 +741,18 @@ document.getElementById('btn-stim').addEventListener('click', () => {
       localFrames.push({ activity: curr.slice() });
     }
     stimFrames = localFrames;
-    simStartFrame = PRE + Math.floor(DUR / 2);
-    loadFrameSeq(localFrames, null, '⚡ 仿真 (离线)', true, PRE + Math.floor(DUR / 2));
+    // Pattern-aware start frame: point to the frame with maximum stimulation effect,
+    // matching the server-side logic in handle_simulate (see AGENTS.md).
+    let offlineStartFrame;
+    if (pattern === 'pulse') {
+      offlineStartFrame = PRE + Math.min(9, DUR - 1);
+    } else if (pattern === 'ramp') {
+      offlineStartFrame = PRE + Math.floor(DUR * 3 / 4);
+    } else {
+      offlineStartFrame = PRE + Math.floor(DUR / 2);
+    }
+    simStartFrame = offlineStartFrame;
+    loadFrameSeq(localFrames, null, '⚡ 仿真 (离线)', true, offlineStartFrame);
   }
 });
 
