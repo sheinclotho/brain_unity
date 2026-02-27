@@ -458,9 +458,9 @@ function handleMsg(msg) {
       `已连接 (v${msg.version || '?'})`;
     return;
   }
-  // Cache file list (used to populate the path input datalist)
+  // Cache file list (used to populate the file select dropdown)
   if (msg.type === 'cache_files_list') {
-    _populateCacheDatalist(msg.files || []);
+    _populateCacheSelect(msg.files || []);
     return;
   }
   if (msg.type === 'error') {
@@ -482,27 +482,57 @@ function handleMsg(msg) {
   }
 }
 
-// ── Cache file datalist ───────────────────────────────────────────────────────
-function _populateCacheDatalist(files) {
-  const dl = document.getElementById('cache-files-list');
-  if (!dl) return;
-  dl.innerHTML = '';
+// ── Cache file select ─────────────────────────────────────────────────────────
+/**
+ * Parse a friendly display label from a cache file path.
+ * Filenames like "sub-001_GRADOFF_4da3f3cb.pt" → "sub-001 / GRADOFF"
+ * Filenames like "hetero_graphs.pt" → "hetero_graphs"
+ */
+function _parseCacheLabel(filepath) {
+  const fname = filepath.split(/[\\/]/).pop();
+  const base  = fname.replace(/\.pt$/i, '');
+  // Pattern: {subject}_{CONDITION}_{6-8 hex chars}
+  const m = base.match(/^(.+?)_([A-Za-z0-9]+)_([0-9a-f]{6,8})$/i);
+  if (m) return `${m[1]} / ${m[2]}`;
+  return base;
+}
+
+function _populateCacheSelect(files) {
+  const sel = document.getElementById('cache-select');
+  if (!sel) return;
+  const prevVal = sel.value;
+  sel.innerHTML = '<option value="">（选择缓存文件）</option>';
+  // Detect duplicate base labels so we can append the hash suffix to disambiguate.
+  // e.g. sub-001_GRADON_2bc9dc9c.pt and sub-001_GRADON_4da3f3cb.pt would both
+  // render as "sub-001 / GRADON" without this check.
+  const labelCount = {};
+  files.forEach(f => {
+    const lbl = _parseCacheLabel(f);
+    labelCount[lbl] = (labelCount[lbl] || 0) + 1;
+  });
   files.forEach(f => {
     const opt = document.createElement('option');
     opt.value = f;
-    dl.appendChild(opt);
+    let lbl = _parseCacheLabel(f);
+    if (labelCount[lbl] > 1) {
+      const fname = f.split(/[\\/]/).pop();
+      const hashM = fname.match(/_([0-9a-f]{6,8})\.pt$/i);
+      if (hashM) lbl += ` (${hashM[1]})`;
+    }
+    opt.textContent = lbl;
+    sel.appendChild(opt);
   });
+  // Restore previous selection if still available
+  if (prevVal && files.includes(prevVal)) sel.value = prevVal;
 }
 
-// Refresh the datalist when the user focuses the path input (debounced to
-// avoid hammering the server on repeated focus/blur cycles).
-let _cacheListDebounce = null;
-document.getElementById('cache-path').addEventListener('focus', () => {
-  if (!connected || !ws || ws.readyState !== WebSocket.OPEN) return;
-  clearTimeout(_cacheListDebounce);
-  _cacheListDebounce = setTimeout(() => {
-    ws.send(JSON.stringify({ type: "list_cache_files" }));
-  }, 300);
+// Refresh button: request the file list from the server
+document.getElementById('btn-refresh-cache').addEventListener('click', () => {
+  if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
+    alert('请先连接后端服务器（运行 python start.py）');
+    return;
+  }
+  ws.send(JSON.stringify({ type: "list_cache_files" }));
 });
 
 // ── Modality toggle (fMRI / EEG) ──────────────────────────────────────────────
@@ -895,7 +925,7 @@ document.getElementById('btn-mod-eeg').addEventListener('click', () => {
 });
 
 document.getElementById('btn-load').addEventListener('click', () => {
-  const path = document.getElementById('cache-path').value.trim() || null;
+  const path = (document.getElementById('cache-select').value.trim()) || null;
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "load_cache", path }));
   } else {
@@ -986,7 +1016,7 @@ function clearECViz() {
   });
 }
 
-function drawECLines(topSources, topTargets, ecFlat, n) {
+function drawECLines(topSources, topTargets, ecFlat, n, ecStdFlat) {
   clearECViz();
   if (!ecFlat) return;
 
@@ -1007,10 +1037,25 @@ function drawECLines(topSources, topTargets, ecFlat, n) {
       const pts = new Float32Array([p0.x, p0.y, p0.z, p1.x, p1.y, p1.z]);
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+
+      // When per-edge uncertainty (ec_std_flat) is available, reduce opacity for
+      // edges where std is large relative to mean (coefficient of variation > 1).
+      // High CV = the connection is inconsistent across brain states → less reliable.
+      let opacity = Math.min(0.75, weight * 1.5);
+      if (ecStdFlat) {
+        const edgeStd = ecStdFlat[rowStart + dst];
+        const cv = weight > 1e-6 ? edgeStd / weight : 0;  // coefficient of variation
+        // CV_OPACITY_PENALTY controls how aggressively uncertain edges are faded.
+        // 0.6 = at CV=1 (std equals mean), opacity is reduced to 40% of its base value.
+        // Edges with CV>1 are extremely state-dependent and barely visible.
+        const CV_OPACITY_PENALTY = 0.6;
+        opacity *= Math.max(0.2, 1.0 - Math.min(cv, 1.0) * CV_OPACITY_PENALTY);
+      }
+
       const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
         color: EC_LINE_COLOR,
         transparent: true,
-        opacity: Math.min(0.75, weight * 1.5),
+        opacity,
       }));
       scene.add(line);
       ecLines.push(line);
@@ -1045,7 +1090,7 @@ function handleECResult(msg) {
   ecActivityDelta = msg.activity_delta|| null;
 
   const n = msg.n_regions || 200;
-  drawECLines(ecTopSources, ecTopTargets, msg.ec_flat, n);
+  drawECLines(ecTopSources, ecTopTargets, msg.ec_flat, n, msg.ec_std_flat || null);
 
   // Show activity delta overlay
   if (ecActivityDelta) updateActivity(ecActivityDelta);

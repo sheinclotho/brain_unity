@@ -81,7 +81,7 @@ class BrainVisualizationServer:
     # Directories searched for .pt cache files (in priority order).
     # "test_file3" and "Unity_TwinBrain" are project-specific subdirectory names
     # commonly used in TwinBrain experiment layouts.
-    _CACHE_SEARCH_DIRS = [Path("."), Path("test_file3"), Path("Unity_TwinBrain"), Path("..")]
+    _CACHE_SEARCH_DIRS = [Path("."), Path("graph_cache"), Path("test_file3"), Path("Unity_TwinBrain"), Path("..")]
     # Well-known cache filenames that take priority over arbitrary .pt files.
     _PREFERRED_CACHE_NAMES = ["hetero_graphs.pt", "eeg_data.pt"]
     # Minimum file size (bytes) to be considered a valid cache (filters out
@@ -686,11 +686,32 @@ class BrainVisualizationServer:
 
         # ── Data-driven modes: need time series ────────────────────────────
         raw_path   = request.get("path")
-        cache_path = Path(raw_path) if raw_path else self._find_cache_file()
+        cache_path = Path(raw_path) if raw_path else (
+            Path(self._loaded_cache_path) if self._loaded_cache_path
+            else self._find_cache_file()
+        )
 
         time_series = None
 
-        if cache_path and cache_path.exists():
+        # Priority 1: reuse the time series already loaded into the session
+        # (set by handle_load_cache when the user picked a file from the dropdown).
+        # Prefer raw values: for fMRI, global percentile normalization already
+        # preserves temporal dynamics; for EEG, per-frame min-max normalization
+        # loses the temporal amplitude envelope (the surrogate MLP would see a
+        # flat, featureless signal), so the original µV values are essential for
+        # meaningful EC inference.  This matches standard EEG/fMRI preprocessing
+        # practice (per-channel z-score prior to Granger/DCM analysis).
+        if not raw_path and self._loaded_time_series is not None:
+            ts_src = self._loaded_raw_time_series or self._loaded_time_series
+            if len(ts_src) >= n_lags + 10:
+                time_series = ts_src
+                self.logger.info(
+                    f"EC 推断: 使用已加载时序 {time_series.shape} "
+                    f"(raw={'yes' if self._loaded_raw_time_series is not None else 'no'})"
+                )
+
+        # Priority 2: load from the specified (or auto-detected) cache file.
+        if time_series is None and cache_path and cache_path.exists():
             try:
                 import torch
                 # weights_only=False is required because cache files contain
@@ -699,13 +720,18 @@ class BrainVisualizationServer:
                 # Mitigated by only loading files from the local project tree.
                 data_pt = torch.load(str(cache_path), map_location="cpu",
                                      weights_only=False)
-                frames = self._extract_time_series(data_pt)
-                if frames:
+                both = self._extract_time_series_both(data_pt)
+                # Prefer fMRI, fall back to EEG.  Use raw values so that EEG
+                # temporal dynamics are preserved (per-frame activity is useless
+                # for the surrogate MLP — see note above).
+                primary_frames = both.get("fmri") or both.get("eeg") or []
+                if primary_frames:
                     time_series = np.array(
-                        [f["activity"] for f in frames], dtype=np.float32
+                        [f.get("raw", f.get("activity", [0.5] * 200)) for f in primary_frames],
+                        dtype=np.float32,
                     )  # (T, 200)
                     self.logger.info(
-                        f"EC 推断: 从缓存加载 {time_series.shape[0]} 帧 × 200 区域"
+                        f"EC 推断: 从缓存加载 {time_series.shape[0]} 帧 × 200 区域 (raw)"
                     )
             except Exception as exc:
                 self.logger.warning(f"缓存加载失败，使用演示数据: {exc}")
