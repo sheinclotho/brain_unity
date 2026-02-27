@@ -221,7 +221,7 @@
         支持任意训练生成的 <code>.pt</code> 文件<br/>
         fMRI（200区域）直接映射；EEG（任意通道数）自动插值到200槽位
       </p>
-      <input type="text" id="cache-path" placeholder="文件路径（空 = 自动检测）" />
+      <input type="text" id="cache-path" list="cache-files-list" placeholder="文件路径（空 = 自动检测）" autocomplete="off" />
       <button id="btn-load" class="btn-success">📂 加载 .pt 文件</button>
     </div>
 
@@ -334,6 +334,7 @@
   </button>
 </div>
 
+<datalist id="cache-files-list"></datalist>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"
         crossorigin="anonymous"
         onerror="document.getElementById('no-webgl').style.display='flex'"></script>
