@@ -502,10 +502,24 @@ function _populateCacheSelect(files) {
   if (!sel) return;
   const prevVal = sel.value;
   sel.innerHTML = '<option value="">（选择缓存文件）</option>';
+  // Detect duplicate base labels so we can append the hash suffix to disambiguate.
+  // e.g. sub-001_GRADON_2bc9dc9c.pt and sub-001_GRADON_4da3f3cb.pt would both
+  // render as "sub-001 / GRADON" without this check.
+  const labelCount = {};
+  files.forEach(f => {
+    const lbl = _parseCacheLabel(f);
+    labelCount[lbl] = (labelCount[lbl] || 0) + 1;
+  });
   files.forEach(f => {
     const opt = document.createElement('option');
     opt.value = f;
-    opt.textContent = _parseCacheLabel(f);
+    let lbl = _parseCacheLabel(f);
+    if (labelCount[lbl] > 1) {
+      const fname = f.split(/[\\/]/).pop();
+      const hashM = fname.match(/_([0-9a-f]{6,8})\.pt$/i);
+      if (hashM) lbl += ` (${hashM[1]})`;
+    }
+    opt.textContent = lbl;
     sel.appendChild(opt);
   });
   // Restore previous selection if still available
