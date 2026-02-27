@@ -103,7 +103,7 @@ def _build_lag_dataset(
     """
     将时序数据切分为 (滑动窗口输入, 下一步目标) 对。
 
-    Uses vectorised numpy indexing instead of a Python loop, which is
+    Uses vectorized numpy indexing instead of a Python loop, which is
     significantly faster for large T (e.g. 10–50× on T=1000, N=200).
 
     Args:
@@ -192,6 +192,25 @@ class PerturbationAnalyzer:
         """
         if n_lags is not None:
             self.n_lags = n_lags
+
+        # Guard: replace NaN/Inf values before they silently corrupt training.
+        # Using replace-not-raise so the server stays alive and returns a result
+        # with a warning; callers can check the warning log to assess data quality.
+        if not np.isfinite(time_series).all():
+            n_bad = int((~np.isfinite(time_series)).sum())
+            logger.warning(
+                f"fit_surrogate: 时序数据含 {n_bad} 个 NaN/Inf 值，已用列均值替换。"
+                "建议检查原始数据质量。"
+            )
+            time_series = time_series.copy().astype(np.float32)
+            # Replace NaN/Inf per column with the column finite mean (or 0 if all bad)
+            for col in range(time_series.shape[1]):
+                col_data = time_series[:, col]
+                bad_mask = ~np.isfinite(col_data)
+                if bad_mask.any():
+                    good_vals = col_data[~bad_mask]
+                    fill = float(good_vals.mean()) if len(good_vals) > 0 else 0.0
+                    time_series[bad_mask, col] = fill
 
         # Z-score 标准化使训练更稳定
         ts_mean = time_series.mean(axis=0, keepdims=True)
@@ -433,33 +452,36 @@ class PerturbationAnalyzer:
         结果不代表真实连接，仅用于前端可视化演示。
         """
         n = self.n_regions
-        # Reproduce brain positions (same formula as app.js / _demo_simulate).
-        # golden_angle: angular increment from the golden ratio for Fibonacci sphere.
+        half = n // 2
+
+        # Reproduce brain positions using vectorized computation (same formula
+        # as app.js / _demo_simulate / realtime_server._make_fibonacci_brain_positions).
         golden_angle = 2 * np.pi * (2 - (1 + np.sqrt(5)) / 2)
+        i_arr  = np.arange(half, dtype=np.float64)
+        t_arr  = (i_arr + 0.5) / half
+        el_arr = 1.0 - 1.85 * t_arr
+        r_arr  = np.sqrt(np.maximum(0.0, 1.0 - el_arr ** 2))
+        az_arr = golden_angle * i_arr
+        lat    = np.abs(r_arr * np.cos(az_arr)) * 0.85 + 0.15
+        bulge  = 9 * np.exp(-((el_arr + 0.22) ** 2) * 5)
+
         pos = np.zeros((n, 3), dtype=np.float32)
-        for h in range(2):
-            sign = -1 if h == 0 else 1
-            for i in range(100):
-                t_  = (i + 0.5) / 100.0
-                el  = 1.0 - 1.85 * t_
-                r   = np.sqrt(max(0.0, 1 - el * el))
-                az  = golden_angle * i
-                lat = abs(r * np.cos(az)) * 0.85 + 0.15
-                bulge = 9 * np.exp(-((el + 0.22) ** 2) * 5)
-                ri  = h * 100 + i
-                pos[ri] = [sign * (lat * 55 + bulge + 9), el * 63 - 4,
-                           r * np.sin(az) * 76 - 8]
+        for h, sign in enumerate((-1, 1)):
+            start = h * half
+            pos[start: start + half, 0] = sign * (lat * 55 + bulge + 9)
+            pos[start: start + half, 1] = el_arr * 63 - 4
+            pos[start: start + half, 2] = r_arr * np.sin(az_arr) * 76 - 8
 
         rng = np.random.default_rng(42)
-        ec  = np.zeros((n, n), dtype=np.float32)
         # Local connections (exponential with Euclidean distance)
         D = np.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=2)
         sigma = 40.0
         ec = np.exp(-(D ** 2) / (2 * sigma ** 2))
         np.fill_diagonal(ec, 0.0)
-        # Homotopic long-range connections (ipsilateral mirror: i ↔ i+100)
-        for i in range(100):
-            ec[i, i + 100] = ec[i + 100, i] = 0.55
+        # Homotopic long-range connections (ipsilateral mirror: i ↔ i+half)
+        idx = np.arange(half)
+        ec[idx, idx + half] = 0.55
+        ec[idx + half, idx] = 0.55
         # Small noise to break symmetry
         ec += rng.uniform(0, 0.04, (n, n))
         np.fill_diagonal(ec, 0.0)
