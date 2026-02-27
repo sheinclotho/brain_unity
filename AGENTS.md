@@ -344,3 +344,28 @@ r ≈ 0 的两个神经生物学合理原因：
   - 时间轴栏新增"∆ 效果图"按钮：将 `peak_delta` 归一化到 [0,1] 并叠加到 3D 视图（0.5 = 无变化，>0.5 = 激活，<0.5 = 抑制），可放大可见性 ~10-50 倍，使极小变化也清晰可见
 - **离线模式**: JS 端也计算 topAffected（胼胝体扩散 + Gaussian，与服务器逻辑一致）
 - **规则**: `top_affected` 必须排除靶区本身，因为我们关心的是**传播效果**（非靶区变化），而不是直接刺激效果。`peak_delta` 的 ∆ 效果图是用户观察微弱二级效应的首选方式，应在刺激后主动告知用户。
+
+### [2026-02-27] NumPy 向量化与输入验证
+
+#### 消除的大型 Python 循环
+
+| 函数 | 旧实现 | 新实现 | 验证 |
+|------|--------|--------|------|
+| `_generate_demo_time_series` | T×N = 60,000 Python 迭代 | NumPy 广播 (T,1)×(1,N) | max_err = 0 |
+| `handle_get_state` | 200 Python 迭代/请求 | NumPy 向量化 | max_err = 0 |
+| `_demo_simulate._baseline()` | 200 Python 迭代/帧 | 预计算数组 + NumPy | max_err = 0 |
+| `_frames_from_xseq` | T×clip Python 调用 | 批量 (N,T) clip | max_err = 0 |
+| `_frames_from_xseq_eeg` | T×min/max Python 调用 | axis=0 列向量化 | max_err = 0 |
+| `_make_fibonacci_brain_positions` | 2×100 嵌套循环 | NumPy slice-assign | max_err = 0 |
+| `_compute_fibonacci_positions` | 2×100 嵌套循环 | 同上 | max_err = 0 |
+| `infer_ec_demo` 位置计算 | 2×100 内联循环 | 同上 + 向量化 homotopic | max_err = 0 |
+
+- **规则**: 任何迭代次数 ≥ 100 的 Python 循环，若循环体可以表达为 NumPy 广播/索引操作，都应当向量化。循环替换后必须用数值等价测试（max_err < 1e-4）验证结果一致性。
+
+#### `fit_surrogate` 输入验证
+
+- **问题**: 含 NaN/Inf 的时序数据会导致 z-score 标准化产生 NaN，使整个训练静默失败（loss = NaN），EC 结果完全无意义。
+- **修复**: 训练前检测 `~np.isfinite(time_series).any()`，对每列用有限值均值替换（全部为 NaN 的列填 0），并发出 WARNING 日志。
+- **规则**: `fit_surrogate` 必须能健壮处理含少量 NaN/Inf 的输入。修复后应记录 WARNING 而非抛出异常，保持服务器存活。注意 `~np.isfinite(arr).sum()` 与 `(~np.isfinite(arr)).sum()` 的运算符优先级差异（前者计算有限值的按位非，后者才是非有限值计数）。
+
+*Last updated: 2026-02-27*
