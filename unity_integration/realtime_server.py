@@ -569,6 +569,17 @@ class BrainVisualizationServer:
             # If the user has already run "推断有效连接", a trained MLP surrogate is
             # available in _ec_analyzer_cache.  Use predict_trajectory to produce a
             # REAL data-driven forecast instead of generic Wilson-Cowan dynamics.
+            #
+            # Stimulation mechanics (NPI principle):
+            #   Only the exact target regions receive the external perturbation.
+            #   stim_weights is a point / indicator function (1.0 at targets, 0
+            #   elsewhere), NOT a spatial Gaussian.  This ensures that every
+            #   change seen in OTHER regions comes exclusively from what the
+            #   surrogate learned about functional connectivity — the model
+            #   handles all propagation.  Using a Gaussian spread here would
+            #   pre-distribute the stimulation to neighbours before the model
+            #   runs, mixing the physical-spread assumption with the learned
+            #   connectivity and making the two impossible to disentangle.
             surrogate_frames = None
             if initial_state is not None and self._ec_analyzer_cache:
                 analyzer = list(self._ec_analyzer_cache.values())[-1]
@@ -576,31 +587,12 @@ class BrainVisualizationServer:
                         and analyzer._ts_mean is not None
                         and analyzer.n_regions == n_regions):
                     try:
-                        # Compute Gaussian spatial spread weights (same as _demo_simulate)
-                        def _bp():
-                            daz = 2 * np.pi * (2 - (1 + np.sqrt(5)) / 2)
-                            pos = []
-                            for h in range(2):
-                                sign = -1 if h == 0 else 1
-                                for i in range(100):
-                                    t_ = (i + 0.5) / 100.0
-                                    el = 1.0 - 1.85 * t_
-                                    r  = np.sqrt(max(0.0, 1 - el * el))
-                                    az = daz * i
-                                    lat = abs(r * np.cos(az)) * 0.85 + 0.15
-                                    bulge = 9 * np.exp(-((el + 0.22) ** 2) * 5)
-                                    pos.append([sign * (lat * 55 + bulge + 9),
-                                                el * 63 - 4, r * np.sin(az) * 76 - 8])
-                            return np.array(pos, dtype=np.float32)
-
-                        _pos = _bp()
+                        # Point stimulation: 1.0 at each selected target, 0 elsewhere.
+                        # The surrogate MLP propagates the effect to connected regions.
                         sw = np.zeros(n_regions, dtype=np.float32)
                         for tid in target_regions:
                             if 0 <= tid < n_regions:
-                                d = np.linalg.norm(_pos - _pos[tid], axis=1)
-                                sw += np.exp(-(d ** 2) / (2 * 30.0 ** 2))
-                        if sw.max() > 0:
-                            sw /= sw.max()
+                                sw[tid] = 1.0
 
                         PRE_s  = 10
                         DUR_s  = min(int(duration), 60)
@@ -879,9 +871,8 @@ class BrainVisualizationServer:
         # intentional: it trades single-run reproducibility for robustness
         # testing — if top-source rankings remain stable despite the random
         # subset, that is stronger evidence than a single fixed-seed result.
-        # Users who need exact reproducibility can set numpy's global random
-        # seed before calling (np.random.seed(42)) or use the perturbation
-        # method instead (which is fully deterministic for fixed inputs).
+        # Users who need exact reproducibility should use the perturbation
+        # method instead, which is fully deterministic for fixed inputs.
         if method == "perturbation":
             ec = analyzer.infer_ec_perturbation(pert_strength=0.05)
         else:
@@ -1277,7 +1268,7 @@ class BrainVisualizationServer:
             init_arr = _baseline(t0 * 200 + (PRE - 1) * 4)
 
         def _wc_step(state: np.ndarray, stim_in: np.ndarray) -> np.ndarray:
-            """Deviation-based leaky integrator — direct stimulation only.
+            """Deviation-based leaky integrator — physical spread, no connectivity W.
 
             This is the Wilson-Cowan fallback for when no trained model is
             available.  It intentionally contains NO connectivity matrix W:
@@ -1288,19 +1279,24 @@ class BrainVisualizationServer:
             are deciding connectivity ourselves (circular reasoning), which
             defeats the entire purpose.
 
-            Therefore, in demo mode only directly stimulated regions (and
-            their spatial spread, see ``spread_weights``) change.  To see
-            network-mediated propagation, the user must first run EC inference
-            from real data, which trains the data-driven MLP surrogate.
+            "stim_in" is pre-scaled by ``spread_weights`` (a Gaussian kernel
+            centred on the target, sigma ≈ 30 mm) before being passed here.
+            This Gaussian represents the *physical extent of the stimulation
+            tool* (e.g. TMS coil), NOT neural network connectivity.  Regions
+            that fall within the coil's footprint receive a direct biophysical
+            input; the question of which *connected* regions then respond is
+            exactly what EC inference is for.  There is no W term here because
+            that would be substituting an assumed spatial prior for the actual
+            learned connectivity.
 
             Model:
               - deviation = state − init_arr  (0 when at rest)
-              - delta     = tanh(stim_in * 2.0) * 0.04
+              - delta     = tanh(stim_in * 2.0) * 0.04  (stim_in includes tool spread)
               - leak      = deviation * 0.10  (returns to init_arr in ~10 steps)
 
             Without stimulation: deviation stays at 0 → state stable at init_arr.
-            With stimulation:    target + spread regions rise above init_arr;
-                                 leak prevents runaway saturation.
+            With stimulation:    regions within the tool's physical footprint
+                                 rise above init_arr; leak prevents saturation.
             """
             deviation = state - init_arr
             delta     = np.tanh(stim_in * 2.0) * 0.04
