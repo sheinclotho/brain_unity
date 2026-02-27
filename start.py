@@ -61,18 +61,10 @@ def start_web_server(web_dir: Path, port: int) -> None:
 async def start_websocket_server(model_path: Optional[Path], output_dir: Path) -> None:
     """启动 WebSocket 后端服务。"""
     try:
-        from unity_integration import BrainVisualizationServer, BrainStateExporter, StimulationSimulator
-
-        state_dir = output_dir / "brain_data" / "model_output"
-        state_dir.mkdir(parents=True, exist_ok=True)
-
-        exporter   = BrainStateExporter(atlas_info=None)
-        simulator  = StimulationSimulator(n_regions=200)
+        from unity_integration import BrainVisualizationServer
 
         server = BrainVisualizationServer(
             model_path=str(model_path) if model_path else None,
-            exporter=exporter,
-            simulator=simulator,
             output_dir=str(output_dir),
             host=WS_HOST,
             port=WS_PORT,
