@@ -569,6 +569,17 @@ class BrainVisualizationServer:
             # If the user has already run "推断有效连接", a trained MLP surrogate is
             # available in _ec_analyzer_cache.  Use predict_trajectory to produce a
             # REAL data-driven forecast instead of generic Wilson-Cowan dynamics.
+            #
+            # Stimulation mechanics (NPI principle):
+            #   Only the exact target regions receive the external perturbation.
+            #   stim_weights is a point / indicator function (1.0 at targets, 0
+            #   elsewhere), NOT a spatial Gaussian.  This ensures that every
+            #   change seen in OTHER regions comes exclusively from what the
+            #   surrogate learned about functional connectivity — the model
+            #   handles all propagation.  Using a Gaussian spread here would
+            #   pre-distribute the stimulation to neighbours before the model
+            #   runs, mixing the physical-spread assumption with the learned
+            #   connectivity and making the two impossible to disentangle.
             surrogate_frames = None
             if initial_state is not None and self._ec_analyzer_cache:
                 analyzer = list(self._ec_analyzer_cache.values())[-1]
@@ -576,31 +587,12 @@ class BrainVisualizationServer:
                         and analyzer._ts_mean is not None
                         and analyzer.n_regions == n_regions):
                     try:
-                        # Compute Gaussian spatial spread weights (same as _demo_simulate)
-                        def _bp():
-                            daz = 2 * np.pi * (2 - (1 + np.sqrt(5)) / 2)
-                            pos = []
-                            for h in range(2):
-                                sign = -1 if h == 0 else 1
-                                for i in range(100):
-                                    t_ = (i + 0.5) / 100.0
-                                    el = 1.0 - 1.85 * t_
-                                    r  = np.sqrt(max(0.0, 1 - el * el))
-                                    az = daz * i
-                                    lat = abs(r * np.cos(az)) * 0.85 + 0.15
-                                    bulge = 9 * np.exp(-((el + 0.22) ** 2) * 5)
-                                    pos.append([sign * (lat * 55 + bulge + 9),
-                                                el * 63 - 4, r * np.sin(az) * 76 - 8])
-                            return np.array(pos, dtype=np.float32)
-
-                        _pos = _bp()
+                        # Point stimulation: 1.0 at each selected target, 0 elsewhere.
+                        # The surrogate MLP propagates the effect to connected regions.
                         sw = np.zeros(n_regions, dtype=np.float32)
                         for tid in target_regions:
                             if 0 <= tid < n_regions:
-                                d = np.linalg.norm(_pos - _pos[tid], axis=1)
-                                sw += np.exp(-(d ** 2) / (2 * 30.0 ** 2))
-                        if sw.max() > 0:
-                            sw /= sw.max()
+                                sw[tid] = 1.0
 
                         PRE_s  = 10
                         DUR_s  = min(int(duration), 60)
@@ -873,6 +865,14 @@ class BrainVisualizationServer:
             self.logger.info("EC 推断: 复用已缓存代理模型（跳过训练）")
 
         # ── Infer EC ───────────────────────────────────────────────────────
+        # infer_ec_jacobian samples a random subset of training inputs on every
+        # call (np.random.choice without a fixed seed).  Repeated calls on the
+        # same data therefore produce slightly different EC matrices.  This is
+        # intentional: it trades single-run reproducibility for robustness
+        # testing — if top-source rankings remain stable despite the random
+        # subset, that is stronger evidence than a single fixed-seed result.
+        # Users who need exact reproducibility should use the perturbation
+        # method instead, which is fully deterministic for fixed inputs.
         if method == "perturbation":
             ec = analyzer.infer_ec_perturbation(pert_strength=0.05)
         else:
@@ -1251,15 +1251,6 @@ class BrainVisualizationServer:
                 return amplitude * progress
             else:  # constant / unknown — smooth ramp-up to avoid sudden color jump
                 return amplitude * min(1.0, relative_t / max(DUR * 0.15, 1.0))
-        # ── Connectivity matrix for spatial propagation of deviations ────────
-        # Used only to spread *deviations from baseline* to neighbouring regions.
-        # L1-normalised so propagation stays bounded.
-        _CONN_SIGMA_MM = _SPREAD_SIGMA_MM * 1.5
-        D = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=2)
-        W = np.exp(-(D ** 2) / (2 * _CONN_SIGMA_MM ** 2))
-        np.fill_diagonal(W, 0.0)
-        row_sums = W.sum(axis=1, keepdims=True)
-        W = np.where(row_sums > 0, W / row_sums, W).astype(np.float32)
 
         # Fixed seed so the noise is reproducible (same run → same animation).
         rng = np.random.default_rng(0)
@@ -1277,27 +1268,38 @@ class BrainVisualizationServer:
             init_arr = _baseline(t0 * 200 + (PRE - 1) * 4)
 
         def _wc_step(state: np.ndarray, stim_in: np.ndarray) -> np.ndarray:
-            """Deviation-based leaky integrator with local spatial propagation.
+            """Deviation-based leaky integrator — physical spread, no connectivity W.
 
-            Fixes the original model's 0.7-attractor bug: the previous formula
-            ``tanh(state + stim + net*0.25)`` had a non-zero fixed point at ~0.7
-            so ALL regions converged to yellow regardless of stimulation.
+            This is the Wilson-Cowan fallback for when no trained model is
+            available.  It intentionally contains NO connectivity matrix W:
 
-            This model uses init_arr as the stable resting equilibrium:
+            The NPI principle is to stimulate a region and *observe* which
+            other regions change — that observation is how you discover
+            connectivity.  If we pre-define W based on spatial proximity, we
+            are deciding connectivity ourselves (circular reasoning), which
+            defeats the entire purpose.
+
+            "stim_in" is pre-scaled by ``spread_weights`` (a Gaussian kernel
+            centred on the target, sigma ≈ 30 mm) before being passed here.
+            This Gaussian represents the *physical extent of the stimulation
+            tool* (e.g. TMS coil), NOT neural network connectivity.  Regions
+            that fall within the coil's footprint receive a direct biophysical
+            input; the question of which *connected* regions then respond is
+            exactly what EC inference is for.  There is no W term here because
+            that would be substituting an assumed spatial prior for the actual
+            learned connectivity.
+
+            Model:
               - deviation = state − init_arr  (0 when at rest)
-              - net_dev   = W @ deviation      (only deviations propagate, not
-                                                absolute activity; prevents
-                                                global saturation)
-              - delta     = tanh(stim_in*2.0 + net_dev*0.35) * 0.04
-              - leak      = deviation * 0.10   (returns to init_arr in ~10 steps)
+              - delta     = tanh(stim_in * 2.0) * 0.04  (stim_in includes tool spread)
+              - leak      = deviation * 0.10  (returns to init_arr in ~10 steps)
 
             Without stimulation: deviation stays at 0 → state stable at init_arr.
-            With stimulation:    target regions rise clearly above init_arr;
-                                 leak prevents runaway saturation.
+            With stimulation:    regions within the tool's physical footprint
+                                 rise above init_arr; leak prevents saturation.
             """
             deviation = state - init_arr
-            net_dev   = W @ deviation
-            delta     = np.tanh(stim_in * 2.0 + net_dev * 0.35) * 0.04
+            delta     = np.tanh(stim_in * 2.0) * 0.04
             leak      = deviation * 0.10
             noise     = rng.standard_normal(n_regions).astype(np.float32) * 0.008
             return np.clip(state + delta - leak + noise, 0.0, 1.0)
