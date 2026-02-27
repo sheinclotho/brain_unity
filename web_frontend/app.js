@@ -1347,10 +1347,16 @@ function handleBrainAnalysisResult(msg) {
   const s = msg.summary || {};
   if (msg.method === 'deviation') {
     const totalFrames = s.total_frames ? ` (共${s.total_frames}帧)` : '';
+    // The backend computes Cohen's d (pooled SD effect size) — not z-scores.
+    // New fields (mean_cohens_d etc.) are used directly when present.
+    // Legacy field names (mean_z_score, n_outliers_2std) act as fallbacks for
+    // older server versions and can be removed once the server is updated to
+    // always send the new names exclusively.
     el.innerHTML =
       `偏差分析完成${totalFrames}<br/>` +
-      `均值z: <strong>${s.mean_z_score}</strong>  最大z: <strong>${s.max_z_score}</strong><br/>` +
-      `异常区域(>2σ): <strong>${s.n_outliers_2std}</strong>  (>3σ): <strong>${s.n_outliers_3std ?? '?'}</strong><br/>` +
+      `Cohen's d (均值): <strong>${s.mean_cohens_d ?? s.mean_z_score}</strong>  最大: <strong>${s.max_cohens_d ?? s.max_z_score}</strong><br/>` +
+      `中等效应(|d|≥0.5): <strong>${s.n_medium_effect ?? s.n_outliers_2std}</strong>  大效应(|d|≥0.8): <strong>${s.n_large_effect ?? s.n_outliers_3std ?? '?'}</strong><br/>` +
+      `激活区域: <strong>${s.n_activated ?? '?'}</strong>  抑制区域: <strong>${s.n_suppressed ?? '?'}</strong><br/>` +
       `窗口1: ${s.window1} → 窗口2: ${s.window2}<br/>` +
       `<span style="color:#aaa">${s.interpretation || ''}</span>`;
   } else if (msg.method === 'graph_metrics') {
