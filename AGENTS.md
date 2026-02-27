@@ -403,4 +403,21 @@ r ≈ 0 的两个神经生物学合理原因：
 - **指数退避重连**: `_reconnectDelay = Math.min(30000, _reconnectDelay * 2)` 替代固定 3s，连接成功后重置。
 - **键盘快捷键**: `Space`/`←`/`→`/`Home`/`End`/`Escape`，通过 `_gotoFrame(idx)` 统一帧跳转逻辑，只在非输入元素上响应。
 
+### [2026-02-27] TwinBrain V5 图缓存格式 — 对旧格式假设的关键纠正
+
+- **旧假设（错误！）**: 缓存格式为 `hetero_graphs.pt`（fMRI，`Dict[task, List[HeteroData]]`）+ `eeg_data.pt`（EEG，`Dict[task, Dict[state, HeteroData]]`）两个独立文件。
+- **正确的 V5 格式**（来自 `API.md`）:
+  - **每个缓存文件是单个 `HeteroData` 对象**，命名为 `{subject_id}_{task}_{config_hash}.pt`
+  - 存储位置：`outputs/graph_cache/`
+  - **fMRI**: `g['fmri'].x` 形状 `[N_fmri, T_fmri, 1]`（z-scored BOLD；N_fmri ≈ 190）
+  - **EEG**: `g['eeg'].x` 形状 `[N_eeg, T_eeg, 1]`（z-scored EEG；N_eeg 通常 32–64）
+  - **两种模态在同一文件中**，不再是两个独立文件
+- **训练检查点不是图缓存**：`best_model.pt`、`swa_model.pt`、`checkpoint_epoch_*.pt` 是 `dict` 格式，不能传入 `handle_load_cache`，已在 `_is_checkpoint_file()` 中排除
+- **代码修复**:
+  - `_CACHE_SEARCH_DIRS`：添加 `outputs/graph_cache`（V5 默认路径）为首选目录
+  - `_PREFERRED_CACHE_NAMES`：移除（V5 无固定文件名）；由 `_CHECKPOINT_STEMS` 和 `_CHECKPOINT_PREFIX` 排除检查点文件
+  - `_extract_time_series_both`：时序提取改为优先 `.x`（V5），回退 `.x_seq`（旧格式）
+  - `_find_companion_cache`：V5 下为空操作；仍保留旧格式双文件兼容逻辑
+- **规则**: 任何从图缓存提取时序的代码都应优先尝试 `.x`，然后回退 `.x_seq`；两者形状均为 `[N, T, F]` 或 `[N, T]`。N_fmri ≈ 190（非 200），需通过 `_frames_from_xseq` 的 `n_out=200` 插值。
+
 *Last updated: 2026-02-27*

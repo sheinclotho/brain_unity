@@ -146,14 +146,29 @@ class BrainVisualizationServer:
     """
 
     # Directories searched for .pt cache files (in priority order).
-    # "test_file3" and "Unity_TwinBrain" are project-specific subdirectory names
-    # commonly used in TwinBrain experiment layouts.
-    _CACHE_SEARCH_DIRS = [Path("."), Path("graph_cache"), Path("test_file3"), Path("Unity_TwinBrain"), Path("..")]
-    # Well-known cache filenames that take priority over arbitrary .pt files.
-    _PREFERRED_CACHE_NAMES = ["hetero_graphs.pt", "eeg_data.pt"]
+    # V5 training pipeline writes per-subject graph caches to
+    # ``outputs/graph_cache/``.  Legacy experiment layouts may use
+    # ``graph_cache/``, ``test_file3/``, or ``Unity_TwinBrain/``.
+    _CACHE_SEARCH_DIRS = [
+        Path("outputs/graph_cache"),   # V5 default (API §2, data.cache.dir)
+        Path("outputs"),               # V5 training output root — also holds checkpoints
+                                       # that are excluded via _is_checkpoint_file()
+        Path("graph_cache"),           # legacy flat-name layout
+        Path("test_file3"),            # legacy project-specific layout
+        Path("Unity_TwinBrain"),       # legacy project-specific layout
+        Path("."),                     # current working directory
+        Path(".."),                    # parent directory (fallback)
+    ]
+    # Filename stems of training checkpoint files that should never be
+    # returned as graph-cache candidates (they have a completely different
+    # internal format and would cause confusing errors).
+    _CHECKPOINT_STEMS = {"best_model", "swa_model"}
+    # Filename prefix of periodic checkpoint files (e.g. checkpoint_epoch_10.pt)
+    _CHECKPOINT_PREFIX = "checkpoint_epoch"
     # Minimum file size (bytes) to be considered a valid cache (filters out
     # empty placeholder files and zero-byte torch.save() artefacts).
     _MIN_CACHE_SIZE = 1024
+
 
     def __init__(
         self,
@@ -1336,16 +1351,18 @@ class BrainVisualizationServer:
     # ------------------------------------------------------------------ #
 
     async def handle_list_cache_files(self, _request: Dict[str, Any]) -> Dict[str, Any]:
-        """Return all .pt cache files discoverable on the server file system.
+        """Return all .pt graph-cache files discoverable on the server file system.
 
         Scans the same candidate directories used by ``_find_cache_file``
         and returns every file that passes the minimum-size filter.
+        Training checkpoint files (``best_model.pt``, ``swa_model.pt``,
+        ``checkpoint_epoch_*.pt``) are excluded.
 
         Response::
 
             {
               "type":  "cache_files_list",
-              "files": ["path/to/hetero_graphs.pt", …]   # sorted, deduplicated
+              "files": ["outputs/graph_cache/sub-01_GRADON_a1b2c3d4.pt", …]
             }
         """
         seen: set = set()
@@ -1354,14 +1371,10 @@ class BrainVisualizationServer:
         for d in self._CACHE_SEARCH_DIRS:
             if not d.exists():
                 continue
-            # Preferred filenames first, then any .pt
-            candidates = []
-            for name in self._PREFERRED_CACHE_NAMES:
-                candidates.extend(d.glob(f"**/{name}"))
-            candidates.extend(d.glob("**/*.pt"))
-
-            for f in candidates:
+            for f in d.glob("**/*.pt"):
                 if "__pycache__" in str(f):
+                    continue
+                if self._is_checkpoint_file(f):
                     continue
                 try:
                     if f.stat().st_size <= self._MIN_CACHE_SIZE:
@@ -1379,7 +1392,7 @@ class BrainVisualizationServer:
                     display = str(f)
                 files.append(display)
 
-        files.sort()
+        files.sort()   # sort only the final collected list (not the glob generator)
         self.logger.info(f"list_cache_files → {len(files)} file(s) found")
         return {"type": "cache_files_list", "files": files}
 
@@ -1388,22 +1401,32 @@ class BrainVisualizationServer:
     # ------------------------------------------------------------------ #
 
     async def handle_load_cache(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Load a .pt cache file and return its full time series as frames.
+        """Load a V5 graph-cache .pt file and return its full time series as frames.
 
         Accepted request fields:
           path (str, optional): path to the .pt file; if omitted, auto-detects
                                 the first suitable file under the project tree.
 
-        Companion-file auto-loading
-        ---------------------------
-        The upstream training system saves fMRI and EEG into **separate** files:
-          - ``hetero_graphs.pt`` → Dict[task, List[HeteroData]]  (fMRI node type)
-          - ``eeg_data.pt``      → Dict[task, Dict[state, HeteroData]] (EEG node type)
+        V5 Graph Cache Format (TwinBrain V5, API §2)
+        ----------------------------------------------
+        Each cache file is a **single** PyG ``HeteroData`` object (no wrapping
+        dict or list) named ``{subject_id}_{task}_{config_hash}.pt`` and stored
+        in ``outputs/graph_cache/``.
 
-        When only one modality is found in the primary file we try to locate the
-        companion file in the same directory so that both fMRI and EEG frames can
-        be shown together in the UI.  The companion is loaded transparently; the
-        user never needs to load two files manually.
+        Node types and time-series attributes:
+          - ``'fmri'`` node type → ``g['fmri'].x``  shape ``[N_fmri, T_fmri, 1]``
+            z-scored BOLD signal; N_fmri ≈ 190 (Schaefer200, depends on EPI coverage)
+          - ``'eeg'``  node type → ``g['eeg'].x``   shape ``[N_eeg, T_eeg, 1]``
+            z-scored EEG signal; N_eeg typically 32–64
+
+        Both modalities are contained in the **same** file — no companion-file
+        loading is required for V5 files.
+
+        Legacy backward-compatibility
+        ------------------------------
+        Older files using ``.x_seq`` (instead of ``.x``) or the dual-file layout
+        (``hetero_graphs.pt`` + ``eeg_data.pt``) are still supported via the
+        legacy fallback paths in ``_find_companion_cache``.
 
         Response:
           { "type": "cache_loaded", "path": "…", "n_frames": N,
@@ -1507,18 +1530,45 @@ class BrainVisualizationServer:
             "success":        True,
         }
 
+    def _is_checkpoint_file(self, path: Path) -> bool:
+        """Return True if ``path`` is a training checkpoint, not a graph cache.
+
+        Training checkpoints (``best_model.pt``, ``swa_model.pt``,
+        ``checkpoint_epoch_N.pt``) contain ``model_state_dict`` dicts and are
+        completely incompatible with the graph-cache loading path.  Excluding
+        them prevents confusing errors when the search dirs overlap with the
+        training output directory.
+        """
+        stem = path.stem
+        return stem in self._CHECKPOINT_STEMS or stem.startswith(self._CHECKPOINT_PREFIX)
+
     def _find_cache_file(self) -> Optional[Path]:
-        """Auto-detect the first suitable .pt cache file in common locations."""
+        """Auto-detect the first suitable graph-cache .pt file.
+
+        Searches ``_CACHE_SEARCH_DIRS`` in priority order.  Training checkpoint
+        files (``best_model.pt``, ``swa_model.pt``, ``checkpoint_epoch_*.pt``)
+        are excluded because they have an incompatible internal format.
+
+        In V5 the graph cache lives in ``outputs/graph_cache/`` and each file
+        is named ``{subject_id}_{task}_{config_hash}.pt`` (single HeteroData
+        object containing both EEG and fMRI node types).
+
+        Returns the first matching file; deterministic ordering within each
+        directory is not required.
+        """
         for d in self._CACHE_SEARCH_DIRS:
             if not d.exists():
                 continue
-            for name in self._PREFERRED_CACHE_NAMES:
-                for f in d.glob(f"**/{name}"):
+            for f in d.glob("**/*.pt"):
+                if "__pycache__" in str(f):
+                    continue
+                if self._is_checkpoint_file(f):
+                    continue
+                try:
                     if f.stat().st_size > self._MIN_CACHE_SIZE:
                         return f
-            for f in d.glob("**/*.pt"):
-                if "__pycache__" not in str(f) and f.stat().st_size > self._MIN_CACHE_SIZE:
-                    return f
+                except OSError:
+                    continue
         return None
 
     def _find_companion_cache(
@@ -1527,16 +1577,17 @@ class BrainVisualizationServer:
         has_fmri: bool,
         has_eeg: bool,
     ) -> "Optional[Path]":
-        """Look for the complementary modality file next to ``primary_path``.
+        """Look for a complementary legacy-format modality file.
 
-        The upstream training pipeline writes fMRI and EEG to two separate files:
-          ``hetero_graphs.pt`` — fMRI  (Dict[task, List[HeteroData]])
-          ``eeg_data.pt``      — EEG   (Dict[task, Dict[state, HeteroData]])
+        **V5 format note**: In TwinBrain V5 both EEG and fMRI node types are
+        stored in the *same* ``HeteroData`` object (single ``.pt`` file per
+        subject+task).  This method is therefore a no-op for V5 files where
+        ``has_fmri and has_eeg`` is already True after loading the primary file.
 
-        When the primary file contains only one modality this method returns the
-        companion file path (if it exists in the same directory and is large
-        enough to be a valid cache), enabling ``handle_load_cache`` to merge
-        both modalities into a single response.
+        This method remains for backward-compatibility with the *old* dual-file
+        layout where fMRI lived in ``hetero_graphs.pt`` and EEG lived in
+        ``eeg_data.pt``.  If neither of those companion files is found in the
+        same directory the method returns ``None`` (no-op).
 
         Args:
             primary_path : Path of the file already loaded.
@@ -1547,25 +1598,25 @@ class BrainVisualizationServer:
             Path to the companion file, or None if not found / not needed.
         """
         if has_fmri and has_eeg:
-            return None   # both modalities already present — nothing to do
+            return None   # V5 single-file: both modalities already present
 
         parent = primary_path.parent
-        name   = primary_path.name.lower()
 
-        # Determine which companion filenames to look for based on what's missing.
+        # Only look for the old fixed filenames — do NOT search for arbitrary
+        # .pt files here, as those might be other subjects' caches.
         if not has_fmri:
-            # Primary has EEG (or nothing); look for the fMRI companion.
-            candidates = ["hetero_graphs.pt"]
+            candidates = ["hetero_graphs.pt"]   # old fMRI companion name
         else:
-            # Primary has fMRI; look for the EEG companion.
-            candidates = ["eeg_data.pt"]
+            candidates = ["eeg_data.pt"]        # old EEG companion name
 
         for cname in candidates:
             companion = parent / cname
             if (companion.exists()
                     and companion != primary_path
                     and companion.stat().st_size > self._MIN_CACHE_SIZE):
-                self.logger.info(f"发现伴随模态文件: {companion}")
+                self.logger.info(
+                    f"发现旧格式伴随模态文件 (legacy dual-file layout): {companion}"
+                )
                 return companion
 
         return None
@@ -1624,19 +1675,24 @@ class BrainVisualizationServer:
           eeg        – list of {"activity": [200 floats]} or [] if unavailable
           modalities – list of available modality names, e.g. ["fmri","eeg"]
 
-        Normalisation strategy:
+        Supported cache formats
+        -----------------------
+        **V5 (current)**: Single HeteroData per subject+task file.
+          - ``g['fmri'].x``   shape ``[N_fmri, T_fmri, 1]`` — z-scored BOLD
+          - ``g['eeg'].x``    shape ``[N_eeg,  T_eeg,  1]`` — z-scored EEG
+          Both modalities live in the same object; N_fmri ≈ 190 (interpolated
+          to 200 visualisation slots via np.interp).
+
+        **Legacy**: Dict[task, List[HeteroData]] with ``.x_seq`` attribute
+          shape ``[N, T, F]``.  Still supported for backward compatibility.
+
+        Normalisation strategy
+        ----------------------
           fMRI: global 5th/95th-percentile across all time + channels → preserves
                 absolute activity level relationships between frames.
           EEG:  per-frame min-max → shows relative spatial variation at each
                 instant (EEG temporal variance dominates spatial variance, so
                 global normalisation makes all channels appear the same colour).
-
-        Full-series reconstruction:
-          Training stores data as Dict[task, List[HeteroData]] where each
-          HeteroData holds exactly spatial_T (e.g. 384) consecutive frames to
-          keep GPU memory bounded.  This method collects ALL HeteroData chunks
-          and concatenates their x_seq tensors along the time axis (dim=1) so
-          that the visualiser sees the complete, un-truncated recording.
         """
         import torch
         import numpy as np
@@ -1742,21 +1798,22 @@ class BrainVisualizationServer:
         n_eeg_raw:  int   = 0   # actual number of EEG channels before interpolation
 
         try:
-            # Collect and concatenate x_seq tensors across all HeteroData chunks.
-            # Each chunk covers spatial_T (e.g. 384) consecutive time points; the
-            # full recording is recovered by concatenating along dim=1 (time axis).
+            # Collect and concatenate time-series tensors across all HeteroData objects.
+            # V5 format: each file is ONE HeteroData with both modalities in `.x`
+            #            shape [N, T, 1] (z-scored, scalar feature per node).
+            # Legacy format: Dict[task, List[HeteroData]] with `.x_seq` shape [N, T, F].
+            # In both cases graphs is a flat list of HeteroData objects;
+            # for V5 it contains exactly one element.
             fmri_chunks: list = []
             eeg_chunks:  list = []
 
             for g in graphs:
                 if "fmri" in g.node_types:
-                    xseq = getattr(g["fmri"], "x_seq", None)
+                    # V5: primary attribute is `.x` [N_fmri, T_fmri, 1]
+                    # Legacy: `.x_seq` [N, T, F]
+                    xseq = getattr(g["fmri"], "x", None)
                     if xseq is None:
-                        # Fallback: some older training configurations store the
-                        # fMRI time series in the standard `.x` attribute rather
-                        # than the custom `.x_seq` field.  Mirror the same
-                        # fallback that already exists for the EEG path.
-                        xseq = getattr(g["fmri"], "x", None)
+                        xseq = getattr(g["fmri"], "x_seq", None)
                     if xseq is not None:
                         if xseq.ndim == 2:
                             xseq = xseq.unsqueeze(-1)
@@ -1765,9 +1822,11 @@ class BrainVisualizationServer:
                             n_fmri_raw = int(xseq.shape[0])
 
                 if "eeg" in g.node_types:
-                    xseq = getattr(g["eeg"], "x_seq", None)
+                    # V5: primary attribute is `.x` [N_eeg, T_eeg, 1]
+                    # Legacy: `.x_seq` [N, T, F]
+                    xseq = getattr(g["eeg"], "x", None)
                     if xseq is None:
-                        xseq = getattr(g["eeg"], "x", None)
+                        xseq = getattr(g["eeg"], "x_seq", None)
                     if xseq is not None:
                         if xseq.ndim == 2:
                             xseq = xseq.unsqueeze(-1)
