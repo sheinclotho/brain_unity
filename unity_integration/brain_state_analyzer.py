@@ -60,6 +60,11 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Shared chunk size for batched finite-difference EC perturbation.
+# Must match the value in perturbation_analyzer._EC_PERTURBATION_CHUNK_SIZE
+# so both code paths behave consistently.  Tune there to affect both.
+_EC_PERTURBATION_CHUNK_SIZE: int = 32
+
 # Module-level cache for Fibonacci brain-region coordinates.
 # Computed once on first call to ``BrainStateAnalyzer.ec_vs_distance_correlation``
 # and reused on subsequent calls to avoid repeated trigonometric work.
@@ -160,14 +165,18 @@ class BrainStateAnalyzer:
         density = float(adj.sum()) / max(N * (N - 1), 1)
 
         # Local efficiency: for each region, mean EC weight among its neighbours.
-        # A high value means the neighbourhood is tightly interconnected
-        # (high local efficiency → resilient to single-node failure).
-        local_eff = np.zeros(N, dtype=np.float32)
-        for i in range(N):
-            nbrs = np.where(adj[i] > 0)[0]
-            if len(nbrs) >= 2:
-                sub = ec_abs[np.ix_(nbrs, nbrs)]
-                local_eff[i] = float(sub.mean())
+        # Vectorized using a single BLAS matrix multiply:
+        #   ((adj @ ec_abs) * adj).sum(axis=1)[i]
+        #     = Σ_{j∈nbrs_i} Σ_{k∈nbrs_i} ec_abs[k,j]   (sum over neighbour subgraph)
+        # Dividing by n_nbrs² reproduces sub.mean() for the n×n neighbour submatrix,
+        # matching the original np.ix_-based computation exactly.
+        n_nbrs    = adj.sum(axis=1)   # (N,) number of neighbours per region
+        nbr_sum   = ((adj @ ec_abs) * adj).sum(axis=1)  # (N,) sum over neighbor subgraph
+        local_eff = np.where(
+            n_nbrs >= 2,
+            nbr_sum / np.maximum(n_nbrs ** 2, 1.0),
+            0.0,
+        ).astype(np.float32)
 
         # Global efficiency proxy: mean non-zero weight × network density.
         # Equivalent to the Latora–Marchiori global efficiency on weighted
@@ -431,19 +440,28 @@ class BrainStateAnalyzer:
 
         def _compute_ec(X_arr):
             surrogate.eval()
-            N = n_regions
+            N  = n_regions
+            M  = len(X_arr)
             ec = np.zeros((N, N), dtype=np.float32)
             # Ensure input tensor lives on the same device as the surrogate model
             # to avoid a RuntimeError when the model was trained on CUDA.
-            device = next(surrogate.parameters()).device
+            device     = next(surrogate.parameters()).device
+            CHUNK_SIZE = _EC_PERTURBATION_CHUNK_SIZE  # batched forward passes
             with torch.no_grad():
-                X_t    = torch.tensor(X_arr, dtype=torch.float32).to(device)
-                base   = surrogate(X_t).cpu().numpy()
-                for j in range(N):
-                    X_pert = X_t.clone()
-                    X_pert[:, -N + j] += pert_strength
-                    pert   = surrogate(X_pert).cpu().numpy()
-                    ec[j]  = (pert - base).mean(axis=0) / pert_strength
+                X_t  = torch.tensor(X_arr, dtype=torch.float32).to(device)
+                base = surrogate(X_t).cpu().numpy()   # (M, N)
+                # Chunked batched perturbation — mirrors the optimisation in
+                # PerturbationAnalyzer.infer_ec_perturbation (same technique).
+                for chunk_start in range(0, N, CHUNK_SIZE):
+                    chunk_end = min(chunk_start + CHUNK_SIZE, N)
+                    chunk_n   = chunk_end - chunk_start
+                    X_batch   = X_t.unsqueeze(0).expand(chunk_n, M, -1).reshape(chunk_n * M, -1).clone()
+                    for k, j in enumerate(range(chunk_start, chunk_end)):
+                        X_batch[k * M:(k + 1) * M, -N + j] += pert_strength
+                    perturbed = surrogate(X_batch).reshape(chunk_n, M, N)
+                    base_t    = torch.tensor(base).unsqueeze(0).expand(chunk_n, -1, -1)
+                    diff      = (perturbed - base_t).mean(dim=1)
+                    ec[chunk_start:chunk_end] = (diff / pert_strength).cpu().numpy()
             return ec
 
         ec1 = _compute_ec(X1)

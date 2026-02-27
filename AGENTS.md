@@ -368,4 +368,53 @@ r ≈ 0 的两个神经生物学合理原因：
 - **修复**: 训练前检测 `~np.isfinite(time_series).any()`，对每列用有限值均值替换（全部为 NaN 的列填 0），并发出 WARNING 日志。
 - **规则**: `fit_surrogate` 必须能健壮处理含少量 NaN/Inf 的输入。修复后应记录 WARNING 而非抛出异常，保持服务器存活。注意 `~np.isfinite(arr).sum()` 与 `(~np.isfinite(arr)).sum()` 的运算符优先级差异（前者计算有限值的按位非，后者才是非有限值计数）。
 
+### [2026-02-27] fMRI/EEG 双模态加载 — 旧格式（已过时，代码已删除）
+
+> **⚠️ 此节描述的旧格式代码已于 2026-02-27 彻底删除。** `_find_companion_cache`、`_find_all_hetero_data`、`.x_seq` 回退路径均已移除。V5 格式（单文件 HeteroData，`.x` 属性）是唯一支持的格式。
+
+### [2026-02-27] 性能优化 — 批量推断与向量化
+
+#### 批量推断（chunked batching）
+- **受影响函数**: `infer_ec_perturbation`（perturbation_analyzer.py）和 `_compute_ec`（brain_state_analyzer.py 内嵌函数）
+- **原理**: 将 N=200 次串行前向传播改为 chunk_size=32 的分块批处理，减少 PyTorch 内核启动开销约 7×。
+- **关键**: 通过 `X_t.unsqueeze(0).expand(chunk_n, M, -1).reshape(chunk_n * M, -1).clone()` 构造批量输入，每块包含 chunk_n 种扰动 × M 样本。数值与串行等价（max_err < 1e-8）。
+- **规则**: 凡是在 N=200 个目标区域上运行串行前向传播的循环，都应考虑分块批量推断。chunk_size=32 是内存（~50MB）与速度之间的合理平衡点。
+
+#### Jacobian lag 块求和向量化
+- `J.reshape(N, n_lags, N).sum(axis=1)` 替代 `for l in range(n_lags): J_sum += J[:, l*N:(l+1)*N]`
+
+#### `compute_graph_metrics.local_eff` 精确向量化
+- **公式**: `local_eff[i] = ((adj @ ec_abs) * adj).sum(axis=1)[i] / n_nbrs[i]²`
+- **等价性**: 与原 `ec_abs[np.ix_(nbrs,nbrs)].mean()` 数值完全相同（max_err < 1e-7）
+- **原理**: `((adj @ ec_abs) * adj).sum(axis=1)[i] = Σ_{j∈nbrs_i} Σ_{k∈nbrs_i} ec_abs[k,j]`，即邻居子图的边权之和，除以 `n²` 得均值。
+
+### [2026-02-27] 前端健壮性与 UX
+
+- **`stimPending` 卡死**: 将 `_unlockStimBtn()` 加入 `ws.onerror` 和 `ws.onclose` 回调。规则：任何可能被中断的请求锁（pending 标志）都必须在连接关闭时释放。
+- **指数退避重连**: `_reconnectDelay = Math.min(30000, _reconnectDelay * 2)` 替代固定 3s，连接成功后重置。
+- **键盘快捷键**: `Space`/`←`/`→`/`Home`/`End`/`Escape`，通过 `_gotoFrame(idx)` 统一帧跳转逻辑，只在非输入元素上响应。
+
+### [2026-02-27] TwinBrain V5 图缓存格式 — 旧格式代码已彻底删除
+
+- **V5 正确格式**（来自 `API.md`）:
+  - **每个缓存文件是单个 `HeteroData` 对象**，命名为 `{subject_id}_{task}_{config_hash}.pt`
+  - 存储位置：`outputs/graph_cache/`
+  - **fMRI**: `g['fmri'].x` 形状 `[N_fmri, T_fmri, 1]`（z-scored BOLD；N_fmri ≈ 190）
+  - **EEG**: `g['eeg'].x` 形状 `[N_eeg, T_eeg, 1]`（z-scored EEG；N_eeg 通常 32–64）
+  - **两种模态在同一文件中**
+- **训练检查点不是图缓存**：`best_model.pt`、`swa_model.pt`、`checkpoint_epoch_*.pt` 是 `dict` 格式，由 `_is_checkpoint_file()` 排除
+- **旧格式代码（已彻底删除，不再保留）**:
+  - `_find_companion_cache`：删除（旧格式双文件伴随加载逻辑）
+  - `_find_all_hetero_data`：删除（旧格式递归搜索 `Dict[task, List[HeteroData]]` 嵌套结构）
+  - `_extract_time_series`：删除（dead code 包装方法）
+  - `.x_seq` 属性回退路径：删除（V5 仅使用 `.x`）
+  - 旧格式搜索目录 `graph_cache`、`test_file3`、`Unity_TwinBrain`：从 `_CACHE_SEARCH_DIRS` 删除
+  - companion-file 加载代码块：从 `handle_load_cache` 删除
+  - `_MAX_HETERO_RECURSION_DEPTH` 常量：删除
+- **当前 `_extract_time_series_both` 实现**:
+  - 输入必须是 `HeteroData` 对象（否则返回空 dict 并记录 ERROR 日志）
+  - 直接读取 `data['fmri'].x` 和 `data['eeg'].x`
+  - 单步处理，无循环/分块/合并
+- **规则**: 任何从图缓存提取时序的代码**只能**使用 `data['fmri'].x` / `data['eeg'].x`，形状 `[N, T, 1]`。N_fmri ≈ 190，通过 `_frames_from_fmri` 中的 `np.interp` 插值到 200 槽位。**不允许再为旧格式添加任何回退路径。**
+
 *Last updated: 2026-02-27*
