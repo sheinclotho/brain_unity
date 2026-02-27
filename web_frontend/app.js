@@ -458,9 +458,9 @@ function handleMsg(msg) {
       `已连接 (v${msg.version || '?'})`;
     return;
   }
-  // Cache file list (used to populate the path input datalist)
+  // Cache file list (used to populate the file select dropdown)
   if (msg.type === 'cache_files_list') {
-    _populateCacheDatalist(msg.files || []);
+    _populateCacheSelect(msg.files || []);
     return;
   }
   if (msg.type === 'error') {
@@ -482,27 +482,43 @@ function handleMsg(msg) {
   }
 }
 
-// ── Cache file datalist ───────────────────────────────────────────────────────
-function _populateCacheDatalist(files) {
-  const dl = document.getElementById('cache-files-list');
-  if (!dl) return;
-  dl.innerHTML = '';
+// ── Cache file select ─────────────────────────────────────────────────────────
+/**
+ * Parse a friendly display label from a cache file path.
+ * Filenames like "sub-001_GRADOFF_4da3f3cb.pt" → "sub-001 / GRADOFF"
+ * Filenames like "hetero_graphs.pt" → "hetero_graphs"
+ */
+function _parseCacheLabel(filepath) {
+  const fname = filepath.split(/[\\/]/).pop();
+  const base  = fname.replace(/\.pt$/i, '');
+  // Pattern: {subject}_{CONDITION}_{6-8 hex chars}
+  const m = base.match(/^(.+?)_([A-Za-z0-9]+)_([0-9a-f]{6,8})$/i);
+  if (m) return `${m[1]} / ${m[2]}`;
+  return base;
+}
+
+function _populateCacheSelect(files) {
+  const sel = document.getElementById('cache-select');
+  if (!sel) return;
+  const prevVal = sel.value;
+  sel.innerHTML = '<option value="">（选择缓存文件）</option>';
   files.forEach(f => {
     const opt = document.createElement('option');
     opt.value = f;
-    dl.appendChild(opt);
+    opt.textContent = _parseCacheLabel(f);
+    sel.appendChild(opt);
   });
+  // Restore previous selection if still available
+  if (prevVal && files.includes(prevVal)) sel.value = prevVal;
 }
 
-// Refresh the datalist when the user focuses the path input (debounced to
-// avoid hammering the server on repeated focus/blur cycles).
-let _cacheListDebounce = null;
-document.getElementById('cache-path').addEventListener('focus', () => {
-  if (!connected || !ws || ws.readyState !== WebSocket.OPEN) return;
-  clearTimeout(_cacheListDebounce);
-  _cacheListDebounce = setTimeout(() => {
-    ws.send(JSON.stringify({ type: "list_cache_files" }));
-  }, 300);
+// Refresh button: request the file list from the server
+document.getElementById('btn-refresh-cache').addEventListener('click', () => {
+  if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
+    alert('请先连接后端服务器（运行 python start.py）');
+    return;
+  }
+  ws.send(JSON.stringify({ type: "list_cache_files" }));
 });
 
 // ── Modality toggle (fMRI / EEG) ──────────────────────────────────────────────
@@ -895,7 +911,7 @@ document.getElementById('btn-mod-eeg').addEventListener('click', () => {
 });
 
 document.getElementById('btn-load').addEventListener('click', () => {
-  const path = document.getElementById('cache-path').value.trim() || null;
+  const path = (document.getElementById('cache-select').value.trim()) || null;
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "load_cache", path }));
   } else {

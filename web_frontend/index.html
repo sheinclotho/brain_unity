@@ -221,8 +221,13 @@
         支持任意训练生成的 <code>.pt</code> 文件<br/>
         fMRI（200区域）直接映射；EEG（任意通道数）自动插值到200槽位
       </p>
-      <input type="text" id="cache-path" list="cache-files-list" placeholder="文件路径（空 = 自动检测）" autocomplete="off" />
-      <button id="btn-load" class="btn-success">📂 加载 .pt 文件</button>
+      <div style="display:flex;gap:6px;margin-bottom:6px">
+        <select id="cache-select" style="flex:1;background:#111222;border:1px solid rgba(255,255,255,0.14);color:#e0e0ff;padding:5px 7px;border-radius:6px;font-size:0.79rem">
+          <option value="">（连接后自动加载列表）</option>
+        </select>
+        <button id="btn-refresh-cache" title="刷新文件列表" style="width:auto;padding:5px 9px;background:rgba(255,255,255,0.08);color:#ccc;border:none;border-radius:6px;font-size:0.88rem;cursor:pointer;flex-shrink:0">↻</button>
+      </div>
+      <button id="btn-load" class="btn-success">📂 加载选中文件</button>
     </div>
 
     <div class="card">
@@ -334,7 +339,6 @@
   </button>
 </div>
 
-<datalist id="cache-files-list"></datalist>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"
         crossorigin="anonymous"
         onerror="document.getElementById('no-webgl').style.display='flex'"></script>

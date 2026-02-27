@@ -81,7 +81,7 @@ class BrainVisualizationServer:
     # Directories searched for .pt cache files (in priority order).
     # "test_file3" and "Unity_TwinBrain" are project-specific subdirectory names
     # commonly used in TwinBrain experiment layouts.
-    _CACHE_SEARCH_DIRS = [Path("."), Path("test_file3"), Path("Unity_TwinBrain"), Path("..")]
+    _CACHE_SEARCH_DIRS = [Path("."), Path("graph_cache"), Path("test_file3"), Path("Unity_TwinBrain"), Path("..")]
     # Well-known cache filenames that take priority over arbitrary .pt files.
     _PREFERRED_CACHE_NAMES = ["hetero_graphs.pt", "eeg_data.pt"]
     # Minimum file size (bytes) to be considered a valid cache (filters out
