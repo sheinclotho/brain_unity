@@ -341,6 +341,7 @@ function connect() {
     connected = true;
     setStatus(true);
     ws.send(JSON.stringify({ type: "get_state" }));
+    ws.send(JSON.stringify({ type: "list_cache_files" }));
   };
 
   ws.onmessage = ev => {
@@ -457,6 +458,11 @@ function handleMsg(msg) {
       `已连接 (v${msg.version || '?'})`;
     return;
   }
+  // Cache file list (used to populate the path input datalist)
+  if (msg.type === 'cache_files_list') {
+    _populateCacheDatalist(msg.files || []);
+    return;
+  }
   if (msg.type === 'error') {
     console.warn('Server error:', msg.message);
     // Show error in whichever status element is currently awaiting a response.
@@ -475,6 +481,29 @@ function handleMsg(msg) {
     }
   }
 }
+
+// ── Cache file datalist ───────────────────────────────────────────────────────
+function _populateCacheDatalist(files) {
+  const dl = document.getElementById('cache-files-list');
+  if (!dl) return;
+  dl.innerHTML = '';
+  files.forEach(f => {
+    const opt = document.createElement('option');
+    opt.value = f;
+    dl.appendChild(opt);
+  });
+}
+
+// Refresh the datalist when the user focuses the path input (debounced to
+// avoid hammering the server on repeated focus/blur cycles).
+let _cacheListDebounce = null;
+document.getElementById('cache-path').addEventListener('focus', () => {
+  if (!connected || !ws || ws.readyState !== WebSocket.OPEN) return;
+  clearTimeout(_cacheListDebounce);
+  _cacheListDebounce = setTimeout(() => {
+    ws.send(JSON.stringify({ type: "list_cache_files" }));
+  }, 300);
+});
 
 // ── Modality toggle (fMRI / EEG) ──────────────────────────────────────────────
 function _getModalityFrames() {

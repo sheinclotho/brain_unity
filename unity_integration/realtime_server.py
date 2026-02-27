@@ -5,12 +5,13 @@ TwinBrain — Real-time Brain Visualization Server
 WebSocket server for real-time communication with the web frontend.
 
 Supported request types (``type`` field):
-  get_state     – Return current demo brain activity (200-region float array)
-  simulate      – Virtual stimulation simulation (WC / surrogate MLP / GNN)
-  load_cache    – Load a .pt cache file and stream its full time series
-  infer_ec      – Infer effective connectivity (Jacobian or perturbation method)
-  validate_ec   – Validate EC reliability (half-split, distance, FC comparison)
-  analyze_brain – Label-free brain state analysis (deviation map / hub metrics)
+  get_state        – Return current demo brain activity (200-region float array)
+  simulate         – Virtual stimulation simulation (WC / surrogate MLP / GNN)
+  load_cache       – Load a .pt cache file and stream its full time series
+  list_cache_files – List all discoverable .pt cache files on the server
+  infer_ec         – Infer effective connectivity (Jacobian or perturbation method)
+  validate_ec      – Validate EC reliability (half-split, distance, FC comparison)
+  analyze_brain    – Label-free brain state analysis (deviation map / hub metrics)
 
 Start the server::
 
@@ -73,8 +74,19 @@ def _import_brain_state_analyzer():
 class BrainVisualizationServer:
     """WebSocket server for real-time brain visualization.
 
-    Endpoints: get_state, simulate, load_cache, infer_ec, validate_ec, analyze_brain.
+    Endpoints: get_state, simulate, load_cache, list_cache_files,
+               infer_ec, validate_ec, analyze_brain.
     """
+
+    # Directories searched for .pt cache files (in priority order).
+    # "test_file3" and "Unity_TwinBrain" are project-specific subdirectory names
+    # commonly used in TwinBrain experiment layouts.
+    _CACHE_SEARCH_DIRS = [Path("."), Path("test_file3"), Path("Unity_TwinBrain"), Path("..")]
+    # Well-known cache filenames that take priority over arbitrary .pt files.
+    _PREFERRED_CACHE_NAMES = ["hetero_graphs.pt", "eeg_data.pt"]
+    # Minimum file size (bytes) to be considered a valid cache (filters out
+    # empty placeholder files and zero-byte torch.save() artefacts).
+    _MIN_CACHE_SIZE = 1024
 
     def __init__(
         self,
@@ -180,6 +192,8 @@ class BrainVisualizationServer:
                 return await self.handle_simulate(request)
             elif request_type == "load_cache":
                 return await self.handle_load_cache(request)
+            elif request_type == "list_cache_files":
+                return await self.handle_list_cache_files(request)
             elif request_type == "infer_ec":
                 return await self.handle_infer_ec(request)
             elif request_type == "validate_ec":
@@ -1227,6 +1241,58 @@ class BrainVisualizationServer:
         return frames
 
     # ------------------------------------------------------------------ #
+    #  List all discoverable .pt cache files                              #
+    # ------------------------------------------------------------------ #
+
+    async def handle_list_cache_files(self, _request: Dict[str, Any]) -> Dict[str, Any]:
+        """Return all .pt cache files discoverable on the server file system.
+
+        Scans the same candidate directories used by ``_find_cache_file``
+        and returns every file that passes the minimum-size filter.
+
+        Response::
+
+            {
+              "type":  "cache_files_list",
+              "files": ["path/to/hetero_graphs.pt", …]   # sorted, deduplicated
+            }
+        """
+        seen: set = set()
+        files: list = []
+
+        for d in self._CACHE_SEARCH_DIRS:
+            if not d.exists():
+                continue
+            # Preferred filenames first, then any .pt
+            candidates = []
+            for name in self._PREFERRED_CACHE_NAMES:
+                candidates.extend(d.glob(f"**/{name}"))
+            candidates.extend(d.glob("**/*.pt"))
+
+            for f in candidates:
+                if "__pycache__" in str(f):
+                    continue
+                try:
+                    if f.stat().st_size <= self._MIN_CACHE_SIZE:
+                        continue
+                except OSError:
+                    continue
+                resolved = str(f.resolve())
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                # Return path relative to cwd when possible (shorter, portable)
+                try:
+                    display = str(f.resolve().relative_to(Path(".").resolve()))
+                except ValueError:
+                    display = str(f)
+                files.append(display)
+
+        files.sort()
+        self.logger.info(f"list_cache_files → {len(files)} file(s) found")
+        return {"type": "cache_files_list", "files": files}
+
+    # ------------------------------------------------------------------ #
     #  Load a .pt cache file and stream all time frames                    #
     # ------------------------------------------------------------------ #
 
@@ -1311,17 +1377,15 @@ class BrainVisualizationServer:
 
     def _find_cache_file(self) -> Optional[Path]:
         """Auto-detect the first suitable .pt cache file in common locations."""
-        search_dirs = [Path("."), Path("test_file3"), Path("Unity_TwinBrain"), Path("..")]
-        preferred   = ["hetero_graphs.pt", "eeg_data.pt"]
-        for d in search_dirs:
+        for d in self._CACHE_SEARCH_DIRS:
             if not d.exists():
                 continue
-            for name in preferred:
+            for name in self._PREFERRED_CACHE_NAMES:
                 for f in d.glob(f"**/{name}"):
-                    if f.stat().st_size > 1024:
+                    if f.stat().st_size > self._MIN_CACHE_SIZE:
                         return f
             for f in d.glob("**/*.pt"):
-                if "__pycache__" not in str(f) and f.stat().st_size > 1024:
+                if "__pycache__" not in str(f) and f.stat().st_size > self._MIN_CACHE_SIZE:
                     return f
         return None
 
