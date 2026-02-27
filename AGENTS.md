@@ -368,4 +368,39 @@ r ≈ 0 的两个神经生物学合理原因：
 - **修复**: 训练前检测 `~np.isfinite(time_series).any()`，对每列用有限值均值替换（全部为 NaN 的列填 0），并发出 WARNING 日志。
 - **规则**: `fit_surrogate` 必须能健壮处理含少量 NaN/Inf 的输入。修复后应记录 WARNING 而非抛出异常，保持服务器存活。注意 `~np.isfinite(arr).sum()` 与 `(~np.isfinite(arr)).sum()` 的运算符优先级差异（前者计算有限值的按位非，后者才是非有限值计数）。
 
+### [2026-02-27] fMRI/EEG 双模态加载 — 上游双文件架构 & 代码修复
+
+- **架构事实（上游设计）**: 训练管线将两个模态保存到**两个独立文件**：
+  - `hetero_graphs.pt` → `Dict[task, List[HeteroData]]` 包含 `fmri` 节点类型
+  - `eeg_data.pt`      → `Dict[task, Dict[state, HeteroData]]` 包含 `eeg` 节点类型
+  单独加载任一文件只能看到对应模态，这是设计行为，不是 Bug。
+
+- **代码 Bug（已修复）**: `_extract_time_series_both` 中 fMRI 提取路径缺少 `.x` 属性回退。EEG 路径已有 `getattr(g["eeg"], "x", None)` 兜底（旧版兼容），fMRI 路径没有 → 旧格式 fMRI 数据静默丢失。已对称添加 fMRI 的 `.x` 回退。
+
+- **功能修复（已实现）**: 新增 `_find_companion_cache(primary_path, has_fmri, has_eeg)` 方法。加载任一单模态文件后自动检测同目录的伴随文件并合并，用户无需手动加载两个文件。
+
+- **规则**: `_extract_time_series_both` 的 fMRI 和 EEG 提取路径必须**对称**：两者都要先尝试 `.x_seq`，再回退到 `.x`。任何新增的节点类型提取路径都应遵循相同模式。
+
+### [2026-02-27] 性能优化 — 批量推断与向量化
+
+#### 批量推断（chunked batching）
+- **受影响函数**: `infer_ec_perturbation`（perturbation_analyzer.py）和 `_compute_ec`（brain_state_analyzer.py 内嵌函数）
+- **原理**: 将 N=200 次串行前向传播改为 chunk_size=32 的分块批处理，减少 PyTorch 内核启动开销约 7×。
+- **关键**: 通过 `X_t.unsqueeze(0).expand(chunk_n, M, -1).reshape(chunk_n * M, -1).clone()` 构造批量输入，每块包含 chunk_n 种扰动 × M 样本。数值与串行等价（max_err < 1e-8）。
+- **规则**: 凡是在 N=200 个目标区域上运行串行前向传播的循环，都应考虑分块批量推断。chunk_size=32 是内存（~50MB）与速度之间的合理平衡点。
+
+#### Jacobian lag 块求和向量化
+- `J.reshape(N, n_lags, N).sum(axis=1)` 替代 `for l in range(n_lags): J_sum += J[:, l*N:(l+1)*N]`
+
+#### `compute_graph_metrics.local_eff` 精确向量化
+- **公式**: `local_eff[i] = ((adj @ ec_abs) * adj).sum(axis=1)[i] / n_nbrs[i]²`
+- **等价性**: 与原 `ec_abs[np.ix_(nbrs,nbrs)].mean()` 数值完全相同（max_err < 1e-7）
+- **原理**: `((adj @ ec_abs) * adj).sum(axis=1)[i] = Σ_{j∈nbrs_i} Σ_{k∈nbrs_i} ec_abs[k,j]`，即邻居子图的边权之和，除以 `n²` 得均值。
+
+### [2026-02-27] 前端健壮性与 UX
+
+- **`stimPending` 卡死**: 将 `_unlockStimBtn()` 加入 `ws.onerror` 和 `ws.onclose` 回调。规则：任何可能被中断的请求锁（pending 标志）都必须在连接关闭时释放。
+- **指数退避重连**: `_reconnectDelay = Math.min(30000, _reconnectDelay * 2)` 替代固定 3s，连接成功后重置。
+- **键盘快捷键**: `Space`/`←`/`→`/`Home`/`End`/`Escape`，通过 `_gotoFrame(idx)` 统一帧跳转逻辑，只在非输入元素上响应。
+
 *Last updated: 2026-02-27*

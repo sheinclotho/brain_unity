@@ -7,7 +7,8 @@
 // ── Constants ─────────────────────────────────────────────────────────────────
 const WS_URL       = "ws://127.0.0.1:8765";
 const N_REGIONS    = 200;
-const RECONNECT_MS = 3000;
+const RECONNECT_MS     = 3000;
+const MAX_RECONNECT_MS = 30000;  // exponential backoff ceiling
 const SPHERE_R     = 4.0;   // base sphere radius (Three.js units ≈ mm)
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
@@ -334,11 +335,16 @@ function demoUpdate() {
 })();
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
+// Exponential backoff: starts at RECONNECT_MS, doubles on each failure,
+// capped at 30 s.  Resets to base delay on successful connection.
+let _reconnectDelay = RECONNECT_MS;
+
 function connect() {
-  try { ws = new WebSocket(WS_URL); } catch { return setTimeout(connect, RECONNECT_MS); }
+  try { ws = new WebSocket(WS_URL); } catch { return setTimeout(connect, _reconnectDelay); }
 
   ws.onopen = () => {
     connected = true;
+    _reconnectDelay = RECONNECT_MS;   // reset backoff on success
     setStatus(true);
     ws.send(JSON.stringify({ type: "get_state" }));
     ws.send(JSON.stringify({ type: "list_cache_files" }));
@@ -349,8 +355,20 @@ function connect() {
     catch (e) { console.warn("WS parse error:", e); }
   };
 
-  ws.onerror = () => {};
-  ws.onclose = () => { connected = false; setStatus(false); setTimeout(connect, RECONNECT_MS); };
+  ws.onerror = () => {
+    // Unlock stim button if a request was in-flight when the connection dropped.
+    _unlockStimBtn();
+  };
+  ws.onclose = () => {
+    connected = false;
+    setStatus(false);
+    // Unlock stim button so the UI doesn't stay permanently disabled.
+    _unlockStimBtn();
+    // Exponential backoff: double the delay each failure, cap at 30 s.
+    const delay = _reconnectDelay;
+    _reconnectDelay = Math.min(MAX_RECONNECT_MS, _reconnectDelay * 2);
+    setTimeout(connect, delay);
+  };
 }
 
 function handleMsg(msg) {
@@ -1380,6 +1398,52 @@ function handleBrainAnalysisResult(msg) {
     });
   }
 }
+
+// ── Keyboard Shortcuts ────────────────────────────────────────────────────────
+// Space        — play / pause timeline
+// ← / →        — step one frame backward / forward
+// Home / End   — jump to first / last frame
+// Escape       — deselect all brain regions
+function _gotoFrame(idx) {
+  if (!frameSeq.length) return;
+  curFrame = Math.max(0, Math.min(frameSeq.length - 1, idx));
+  slider.value = curFrame;
+  updateFrameLabel();
+  if (frameSeq[curFrame]) updateActivity(frameSeq[curFrame].activity, frameSeq[curFrame].raw);
+}
+
+document.addEventListener('keydown', e => {
+  // Ignore shortcuts when typing in an input field
+  if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName.toUpperCase())) return;
+
+  switch (e.key) {
+    case ' ':                              // Space — play / pause
+      e.preventDefault();
+      document.getElementById('btn-play').click();
+      break;
+    case 'ArrowLeft':                      // ← — previous frame
+      e.preventDefault();
+      _gotoFrame(curFrame - 1);
+      break;
+    case 'ArrowRight':                     // → — next frame
+      e.preventDefault();
+      _gotoFrame(curFrame + 1);
+      break;
+    case 'Home':                           // Home — first frame
+      e.preventDefault();
+      _gotoFrame(0);
+      break;
+    case 'End':                            // End — last frame
+      e.preventDefault();
+      _gotoFrame(frameSeq.length - 1);
+      break;
+    case 'Escape':                         // Escape — deselect all regions
+      selected.clear();
+      regionMeshes.forEach(m => { m.userData.selected = false; });
+      document.getElementById('sel-count').textContent = '0';
+      break;
+  }
+});
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 setStatus(false);

@@ -43,6 +43,11 @@ import torch.utils.data as data
 
 logger = logging.getLogger(__name__)
 
+# Number of source regions to perturb in each batched forward pass.
+# Trades memory (CHUNK_SIZE × M × N*n_lags float32) for reduced Python /
+# PyTorch kernel-launch overhead.  32 uses ~50 MB for typical M=400, N=200.
+_EC_PERTURBATION_CHUNK_SIZE: int = 32
+
 
 # ── Module-level tuneable constants ─────────────────────────────────────────
 # Scale model capacity down when n_train < this threshold.  Below this value
@@ -351,12 +356,12 @@ class PerturbationAnalyzer:
         model.eval()
         ec = np.zeros((N, N), dtype=np.float32)
 
-        # Chunked batched perturbation: process CHUNK_SIZE source regions at once.
-        # This replaces N=200 serial forward passes (each on M samples) with
-        # ceil(N / CHUNK_SIZE) batched passes (each on CHUNK_SIZE × M samples),
-        # reducing PyTorch kernel-launch overhead by ~(N / CHUNK_SIZE) times.
-        # Memory: CHUNK_SIZE × M × (N*n_lags) float32 ≈ 32×400×1000×4 = 51 MB (safe).
-        CHUNK_SIZE = 32
+        # Chunked batched perturbation: process _EC_PERTURBATION_CHUNK_SIZE source
+        # regions at once.  This replaces N=200 serial forward passes (each on M
+        # samples) with ceil(N / CHUNK_SIZE) batched passes, reducing PyTorch
+        # kernel-launch overhead by ~(N / CHUNK_SIZE) times.
+        # Tune via the module-level _EC_PERTURBATION_CHUNK_SIZE constant.
+        CHUNK_SIZE = _EC_PERTURBATION_CHUNK_SIZE
 
         with torch.no_grad():
             X_t      = torch.tensor(input_X, dtype=torch.float32, device=self.device)

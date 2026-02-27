@@ -116,6 +116,10 @@ def _make_fibonacci_brain_positions(n: int = 200) -> "np.ndarray":
 # Module-level cache so the positions are computed only once per process.
 _BRAIN_POSITIONS_CACHE: "Optional[np.ndarray]" = None
 
+# Maximum recursion depth for _find_all_hetero_data to guard against
+# corrupted / unexpectedly deep data structures.
+_MAX_HETERO_RECURSION_DEPTH: int = 100
+
 
 def _get_brain_positions(n: int = 200) -> "np.ndarray":
     """Return the module-level cached Fibonacci brain positions.
@@ -1390,6 +1394,17 @@ class BrainVisualizationServer:
           path (str, optional): path to the .pt file; if omitted, auto-detects
                                 the first suitable file under the project tree.
 
+        Companion-file auto-loading
+        ---------------------------
+        The upstream training system saves fMRI and EEG into **separate** files:
+          - ``hetero_graphs.pt`` → Dict[task, List[HeteroData]]  (fMRI node type)
+          - ``eeg_data.pt``      → Dict[task, Dict[state, HeteroData]] (EEG node type)
+
+        When only one modality is found in the primary file we try to locate the
+        companion file in the same directory so that both fMRI and EEG frames can
+        be shown together in the UI.  The companion is loaded transparently; the
+        user never needs to load two files manually.
+
         Response:
           { "type": "cache_loaded", "path": "…", "n_frames": N,
             "frames": [{"activity": [200 floats]}, …],
@@ -1417,6 +1432,36 @@ class BrainVisualizationServer:
         frames_fmri = both.get("fmri", [])
         frames_eeg  = both.get("eeg", [])
         modalities  = both.get("modalities", [])
+
+        # ── Companion-file auto-loading ────────────────────────────────────
+        # If one modality is missing, look for its dedicated companion file
+        # in the same directory.  This handles the common case where the
+        # upstream training pipeline saved fMRI and EEG into separate files:
+        #   hetero_graphs.pt  ← fMRI  (Dict[task, List[HeteroData]])
+        #   eeg_data.pt       ← EEG   (Dict[task, Dict[state, HeteroData]])
+        if not frames_fmri or not frames_eeg:
+            companion = self._find_companion_cache(cache_path, has_fmri=bool(frames_fmri),
+                                                   has_eeg=bool(frames_eeg))
+            if companion is not None:
+                try:
+                    companion_data = torch.load(str(companion), map_location="cpu",
+                                                weights_only=False)
+                    comp_both = self._extract_time_series_both(companion_data)
+                    if not frames_fmri and comp_both.get("fmri"):
+                        frames_fmri = comp_both["fmri"]
+                        both["n_fmri_regions"] = comp_both.get("n_fmri_regions", 0)
+                        self.logger.info(
+                            f"伴随文件加载 fMRI 数据: {companion} → {len(frames_fmri)} 帧"
+                        )
+                    if not frames_eeg and comp_both.get("eeg"):
+                        frames_eeg = comp_both["eeg"]
+                        both["n_eeg_channels"] = comp_both.get("n_eeg_channels", 0)
+                        self.logger.info(
+                            f"伴随文件加载 EEG 数据: {companion} → {len(frames_eeg)} 帧"
+                        )
+                    modalities = (["fmri"] if frames_fmri else []) + (["eeg"] if frames_eeg else [])
+                except Exception as exc:
+                    self.logger.warning(f"伴随文件加载失败 ({companion}): {exc}")
 
         # Primary frames: prefer fMRI, fall back to EEG
         primary = frames_fmri if frames_fmri else frames_eeg
@@ -1476,7 +1521,56 @@ class BrainVisualizationServer:
                     return f
         return None
 
-    def _find_all_hetero_data(self, data) -> list:
+    def _find_companion_cache(
+        self,
+        primary_path: Path,
+        has_fmri: bool,
+        has_eeg: bool,
+    ) -> "Optional[Path]":
+        """Look for the complementary modality file next to ``primary_path``.
+
+        The upstream training pipeline writes fMRI and EEG to two separate files:
+          ``hetero_graphs.pt`` — fMRI  (Dict[task, List[HeteroData]])
+          ``eeg_data.pt``      — EEG   (Dict[task, Dict[state, HeteroData]])
+
+        When the primary file contains only one modality this method returns the
+        companion file path (if it exists in the same directory and is large
+        enough to be a valid cache), enabling ``handle_load_cache`` to merge
+        both modalities into a single response.
+
+        Args:
+            primary_path : Path of the file already loaded.
+            has_fmri     : Whether the primary file already yielded fMRI frames.
+            has_eeg      : Whether the primary file already yielded EEG frames.
+
+        Returns:
+            Path to the companion file, or None if not found / not needed.
+        """
+        if has_fmri and has_eeg:
+            return None   # both modalities already present — nothing to do
+
+        parent = primary_path.parent
+        name   = primary_path.name.lower()
+
+        # Determine which companion filenames to look for based on what's missing.
+        if not has_fmri:
+            # Primary has EEG (or nothing); look for the fMRI companion.
+            candidates = ["hetero_graphs.pt"]
+        else:
+            # Primary has fMRI; look for the EEG companion.
+            candidates = ["eeg_data.pt"]
+
+        for cname in candidates:
+            companion = parent / cname
+            if (companion.exists()
+                    and companion != primary_path
+                    and companion.stat().st_size > self._MIN_CACHE_SIZE):
+                self.logger.info(f"发现伴随模态文件: {companion}")
+                return companion
+
+        return None
+
+    def _find_all_hetero_data(self, data, _depth: int = 0) -> list:
         """Recursively collect ALL HeteroData objects from a nested structure.
 
         When a cache file stores ``Dict[task, List[HeteroData]]`` the full
@@ -1484,16 +1578,27 @@ class BrainVisualizationServer:
         ``spatial_T`` frames, e.g. 384) to keep training memory bounded.
         This method collects every chunk so the caller can concatenate them
         and recover the complete time series.
+
+        Args:
+            data:   Arbitrary nested structure (HeteroData, list, tuple, dict).
+            _depth: Internal recursion depth counter.  Stops at
+                    ``_MAX_HETERO_RECURSION_DEPTH`` to prevent stack overflow
+                    on corrupted or unexpectedly deep structures.
         """
+        if _depth > _MAX_HETERO_RECURSION_DEPTH:
+            self.logger.warning(
+                "_find_all_hetero_data: 递归深度超过100，停止搜索（数据结构可能损坏）"
+            )
+            return []
         results = []
         if hasattr(data, "node_types"):
             results.append(data)
         elif isinstance(data, (list, tuple)):
             for item in data:
-                results.extend(self._find_all_hetero_data(item))
+                results.extend(self._find_all_hetero_data(item, _depth + 1))
         elif isinstance(data, dict):
             for v in data.values():
-                results.extend(self._find_all_hetero_data(v))
+                results.extend(self._find_all_hetero_data(v, _depth + 1))
         return results
 
     def _extract_time_series(self, data) -> list:
@@ -1646,6 +1751,12 @@ class BrainVisualizationServer:
             for g in graphs:
                 if "fmri" in g.node_types:
                     xseq = getattr(g["fmri"], "x_seq", None)
+                    if xseq is None:
+                        # Fallback: some older training configurations store the
+                        # fMRI time series in the standard `.x` attribute rather
+                        # than the custom `.x_seq` field.  Mirror the same
+                        # fallback that already exists for the EEG path.
+                        xseq = getattr(g["fmri"], "x", None)
                     if xseq is not None:
                         if xseq.ndim == 2:
                             xseq = xseq.unsqueeze(-1)
