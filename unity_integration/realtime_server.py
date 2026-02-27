@@ -1,8 +1,21 @@
 """
-Real-time Brain Visualization Server
-=====================================
+TwinBrain — Real-time Brain Visualization Server
+=================================================
 
-WebSocket server for real-time communication with Unity frontend.
+WebSocket server for real-time communication with the web frontend.
+
+Supported request types (``type`` field):
+  get_state     – Return current demo brain activity (200-region float array)
+  simulate      – Virtual stimulation simulation (WC / surrogate MLP / GNN)
+  load_cache    – Load a .pt cache file and stream its full time series
+  infer_ec      – Infer effective connectivity (Jacobian or perturbation method)
+  validate_ec   – Validate EC reliability (half-split, distance, FC comparison)
+  analyze_brain – Label-free brain state analysis (deviation map / hub metrics)
+
+Start the server::
+
+    server = BrainVisualizationServer(model_path="model.pt", host="127.0.0.1")
+    asyncio.run(server.start_async())
 """
 
 import asyncio
@@ -58,66 +71,42 @@ def _import_brain_state_analyzer():
 
 
 class BrainVisualizationServer:
+    """WebSocket server for real-time brain visualization.
+
+    Endpoints: get_state, simulate, load_cache, infer_ec, validate_ec, analyze_brain.
     """
-    WebSocket server for real-time brain visualization.
-    
-    Provides endpoints for:
-    - Getting current brain state
-    - Predicting future states
-    - Simulating stimulation effects
-    - Streaming brain activity
-    """
-    
+
     def __init__(
         self,
-        model = None,
-        exporter = None,
-        simulator = None,
         model_path: Optional[str] = None,
         output_dir: Optional[str] = None,
         host: str = "0.0.0.0",
-        port: int = 8765
+        port: int = 8765,
+        # Legacy params kept for backward-compat; no longer used
+        model=None, exporter=None, simulator=None,
     ):
-        """
-        Initialize server.
-        
-        Args:
-            model: Trained neural network model (legacy, use model_path instead)
-            exporter: BrainStateExporter instance
-            simulator: StimulationSimulator instance
-            model_path: Path to trained model file
-            output_dir: Output directory for predictions
-            host: Server host
-            port: Server port
-        """
         if not WEBSOCKETS_AVAILABLE:
             raise ImportError("websockets package is required. Install with: pip install websockets")
-        
-        self.model = model
-        self.exporter = exporter
-        self.simulator = simulator
+
         self.host = host
         self.port = port
-        
-        # Initialize ModelServer if available
+        self.logger = logging.getLogger(__name__)
+
+        if model is not None or exporter is not None or simulator is not None:
+            self.logger.warning(
+                "BrainVisualizationServer: 'model', 'exporter', and 'simulator' "
+                "parameters are deprecated and will be ignored. "
+                "Use 'model_path' to load a trained model."
+            )
+
         self.model_server = None
         if MODEL_SERVER_AVAILABLE and model_path:
             self.model_server = ModelServer(
                 model_path=model_path,
                 output_dir=output_dir or "unity_project/brain_data/model_output"
             )
-            self.logger = logging.getLogger(__name__)
             self.logger.info("✓ ModelServer initialized")
-        elif MODEL_SERVER_AVAILABLE and model:
-            # Create ModelServer without loading (use existing model)
-            self.model_server = ModelServer(
-                output_dir=output_dir or "unity_project/brain_data/model_output"
-            )
-            self.model_server.model = model
-            self.logger = logging.getLogger(__name__)
-        else:
-            self.logger = logging.getLogger(__name__)
-        
+
         self.clients: Set = set()
 
         # Cache for trained PerturbationAnalyzer instances.
@@ -151,20 +140,11 @@ class BrainVisualizationServer:
         """Unregister a client connection."""
         self.clients.discard(websocket)
         self.logger.info(f"Client disconnected: {websocket.remote_address}")
-    
-    async def broadcast(self, message: Dict[str, Any]):
-        """Broadcast message to all connected clients."""
-        if self.clients:
-            message_str = json.dumps(message)
-            await asyncio.gather(
-                *[client.send(message_str) for client in self.clients],
-                return_exceptions=True
-            )
-    
+
     async def handle_client(self, websocket, path=None):
         """Handle client connection and requests."""
         await self.register_client(websocket)
-        
+
         try:
             async for message in websocket:
                 try:
@@ -180,51 +160,32 @@ class BrainVisualizationServer:
                     await websocket.send(json.dumps(error))
         finally:
             await self.unregister_client(websocket)
-    
+
     async def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Process client request and return response."""
         request_type = request.get("type", "unknown")
 
-        # Type aliases: accept legacy and alternative naming conventions
-        if request_type in ("get_brain_state",):
+        # Accept legacy/alternative naming conventions
+        if request_type == "get_brain_state":
             request_type = "get_state"
-        elif request_type in ("simulate_stimulation",):
+        elif request_type == "simulate_stimulation":
             request_type = "simulate"
 
-        # Log the request
         self.logger.info(f"Processing request: {request_type}")
-        
+
         try:
             if request_type == "get_state":
                 return await self.handle_get_state(request)
-            
-            elif request_type == "predict":
-                return await self.handle_predict(request)
-            
             elif request_type == "simulate":
                 return await self.handle_simulate(request)
-            
-            elif request_type == "stream_start":
-                return await self.handle_stream_start(request)
-            
-            elif request_type == "stream_stop":
-                return {"type": "stream_stopped", "success": True}
-            
-            elif request_type == "convert_cache":
-                return await self.handle_convert_cache(request)
-
             elif request_type == "load_cache":
                 return await self.handle_load_cache(request)
-
             elif request_type == "infer_ec":
                 return await self.handle_infer_ec(request)
-
             elif request_type == "validate_ec":
                 return await self.handle_validate_ec(request)
-
             elif request_type == "analyze_brain":
                 return await self.handle_analyze_brain(request)
-            
             else:
                 self.logger.warning(f"Unknown request type: {request_type}")
                 return {
@@ -239,7 +200,6 @@ class BrainVisualizationServer:
                 "success": False,
                 "message": f"Server error: {str(e)}"
             }
-    
     async def handle_get_state(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Return current brain state with flat activity array.
 
@@ -274,149 +234,8 @@ class BrainVisualizationServer:
             "success":  True,
         }
 
-
-    
-    async def handle_predict(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Handle prediction request with automatic JSON export.
-        
-        Automatically saves prediction results to output_dir/predictions/
-        for Unity to auto-load.
-        """
-        n_steps = request.get("n_steps", 10)
-        
-        # Input validation
-        original_n_steps = n_steps
-        if not isinstance(n_steps, int) or n_steps <= 0 or n_steps > 1000:
-            self.logger.warning(f"Invalid n_steps: {n_steps}, using default 10")
-            n_steps = 10
-        
-        # Inform client if parameter was adjusted
-        parameter_adjusted = (n_steps != original_n_steps)
-        
-        try:
-            # Create timestamped output directory for predictions
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_base = Path(self.model_server.output_dir if self.model_server else "unity_project/brain_data/model_output")
-            pred_output_dir = output_base / "predictions" / f"pred_{timestamp}"
-            pred_output_dir.mkdir(parents=True, exist_ok=True)
-            
-            self.logger.info(f"Prediction output directory: {pred_output_dir}")
-            
-            # Use ModelServer if available
-            if self.model_server:
-                self.logger.info(f"Using ModelServer for prediction ({n_steps} steps)")
-                predictions = self.model_server.predict_future(
-                    n_steps=n_steps,
-                    subject_id="prediction"
-                )
-                
-                # Auto-save each prediction frame as JSON
-                # Note: Individual files are required for Unity to load frames separately
-                # and support streaming playback. Batching would prevent frame-by-frame access.
-                self.logger.info(f"Auto-saving {len(predictions)} prediction frames to {pred_output_dir}")
-                for idx, prediction in enumerate(predictions):
-                    json_path = pred_output_dir / f"frame_{idx:04d}.json"
-                    with open(json_path, 'w', encoding='utf-8') as f:
-                        json.dump(prediction, f, indent=2)
-                
-                # Create sequence index
-                index_data = {
-                    "type": "prediction_sequence",
-                    "timestamp": timestamp,
-                    "n_frames": len(predictions),
-                    "output_dir": str(pred_output_dir),
-                    "files": [f"frame_{i:04d}.json" for i in range(len(predictions))]
-                }
-                index_path = pred_output_dir / "sequence_index.json"
-                with open(index_path, 'w', encoding='utf-8') as f:
-                    json.dump(index_data, f, indent=2)
-                
-                self.logger.info(f"✓ Prediction results auto-saved to: {pred_output_dir}")
-                
-                return {
-                    "type": "prediction",
-                    "success": True,
-                    "n_steps": n_steps,
-                    "predictions": predictions,
-                    "saved_to": str(pred_output_dir),
-                    "index_file": str(index_path),
-                    "auto_saved": True,
-                    "parameter_adjusted": parameter_adjusted,
-                    "warning": "n_steps was adjusted to valid range" if parameter_adjusted else None
-                }
-            
-            # Fallback to simple prediction generation
-            import torch
-            import numpy as np
-            
-            n_regions = 200
-            
-            # Generate prediction sequence
-            predictions = []
-            for t in range(n_steps):
-                # Generate predicted brain state
-                fmri_data = torch.randn(n_regions, 1, 1) * (0.5 + t * 0.05)
-                eeg_data = torch.randn(n_regions, 1, 1) * (0.5 + t * 0.05)
-                
-                brain_activity = {
-                    'fmri': fmri_data,
-                    'eeg': eeg_data
-                }
-                
-                if self.exporter:
-                    brain_state = self.exporter.export_brain_state(
-                        brain_activity=brain_activity,
-                        time_point=t,
-                        time_second=float(t),
-                        subject_id="prediction"
-                    )
-                    predictions.append(brain_state)
-                    
-                    # Auto-save to file
-                    json_path = pred_output_dir / f"frame_{t:04d}.json"
-                    with open(json_path, 'w', encoding='utf-8') as f:
-                        json.dump(brain_state, f, indent=2)
-            
-            # Create sequence index
-            index_data = {
-                "type": "prediction_sequence",
-                "timestamp": timestamp,
-                "n_frames": len(predictions),
-                "output_dir": str(pred_output_dir),
-                "files": [f"frame_{i:04d}.json" for i in range(len(predictions))]
-            }
-            index_path = pred_output_dir / "sequence_index.json"
-            with open(index_path, 'w', encoding='utf-8') as f:
-                json.dump(index_data, f, indent=2)
-            
-            self.logger.info(f"✓ Prediction results auto-saved to: {pred_output_dir}")
-            
-            return {
-                "type": "prediction",
-                "success": True,
-                "n_steps": n_steps,
-                "predictions": predictions,
-                "saved_to": str(pred_output_dir),
-                "index_file": str(index_path),
-                "auto_saved": True,
-                "parameter_adjusted": parameter_adjusted,
-                "warning": "n_steps was adjusted to valid range" if parameter_adjusted else None
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error in prediction: {e}")
-            return {
-                "type": "error",
-                "message": f"Prediction failed: {str(e)}"
-            }
-    
     async def handle_simulate(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Handle stimulation simulation request with automatic JSON export.
-        
-        Automatically saves stimulation results to output_dir/stimulation/
-        for Unity to auto-load.
+        """Handle stimulation simulation request.
 
         Accepts both formats:
           - Flat:   {type, target_regions, amplitude, pattern, frequency, duration}
@@ -431,7 +250,35 @@ class BrainVisualizationServer:
         try:
             import torch
             import numpy as np
-            
+
+            def _compute_top_affected(frames, cf_frames, peak_idx, target_ids, top_k=15):
+                """Return top affected non-target regions and the per-region delta array.
+
+                Compares stimulated vs counterfactual frames at ``peak_idx`` to find
+                the regions that changed most due to stimulation.  Target regions are
+                excluded so the list highlights PROPAGATION to other areas.
+
+                Returns:
+                    top_affected : list of {"region_id": int, "delta": float} dicts,
+                                   sorted by |delta| descending, length ≤ top_k
+                    peak_delta   : list of 200 floats (stim − CF at peak_idx)
+                """
+                safe_peak = min(peak_idx, len(frames) - 1, len(cf_frames) - 1)
+                if not frames or not cf_frames or safe_peak < 0:
+                    return [], []
+                stim_act = np.array(frames[safe_peak]["activity"], dtype=np.float32)
+                cf_act   = np.array(cf_frames[safe_peak]["activity"], dtype=np.float32)
+                delta    = stim_act - cf_act
+                target_set = set(target_ids)
+                # Exclude target regions — we want to highlight PROPAGATION effects
+                candidates = [i for i in range(len(delta)) if i not in target_set]
+                candidates_sorted = sorted(candidates, key=lambda i: -abs(delta[i]))
+                top_affected = [
+                    {"region_id": int(i), "delta": float(delta[i])}
+                    for i in candidates_sorted[:top_k]
+                ]
+                return top_affected, delta.tolist()
+
             # Parse stimulation parameters
             target_regions = stimulation.get("target_regions", [])
             amplitude = stimulation.get("amplitude", 0.5)
@@ -496,16 +343,14 @@ class BrainVisualizationServer:
                     subject_id="stimulation"
                 )
                 
-                # Auto-save each frame as JSON
-                # Note: Individual files are required for Unity's frame-by-frame loading
-                # and to support progressive playback during long sequences.
+                # Auto-save each frame as JSON for progressive playback support.
                 self.logger.info(f"Auto-saving {len(responses)} stimulation frames to {stim_output_dir}")
                 for idx, response in enumerate(responses):
                     json_path = stim_output_dir / f"frame_{idx:04d}.json"
                     with open(json_path, 'w', encoding='utf-8') as f:
                         json.dump(response, f, indent=2)
-                
-                # Create sequence index for Unity auto-loading
+
+                # Create sequence index
                 index_data = {
                     "type": "stimulation_sequence",
                     "timestamp": timestamp,
@@ -552,6 +397,9 @@ class BrainVisualizationServer:
                     _ms_peak_k = max(0, _ms_dur * 3 // 4)
                 else:  # sine, constant
                     _ms_peak_k = _ms_dur // 2
+                ms_top_affected, ms_peak_delta = _compute_top_affected(
+                    frames, cf_frames, _ms_peak_k, valid_regions
+                )
                 return {
                     "type": "simulation_result",
                     "success": True,
@@ -561,6 +409,8 @@ class BrainVisualizationServer:
                     "modality": "simulation",
                     "method": "model_server",
                     "start_frame": _ms_peak_k,
+                    "top_affected": ms_top_affected,
+                    "peak_delta": ms_peak_delta,
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
                 }
@@ -669,6 +519,10 @@ class BrainVisualizationServer:
                     _s_peak_k = max(0, DUR_s * 3 // 4)
                 else:
                     _s_peak_k = DUR_s // 2
+                _s_peak_idx = PRE_s + _s_peak_k
+                s_top_affected, s_peak_delta = _compute_top_affected(
+                    surrogate_frames, surrogate_cf, _s_peak_idx, valid_regions
+                )
                 return {
                     "type": "simulation_result",
                     "success": True,
@@ -677,7 +531,9 @@ class BrainVisualizationServer:
                     "counterfactual_frames": surrogate_cf,
                     "modality": "simulation",
                     "method": "surrogate_mlp",
-                    "start_frame": PRE_s + _s_peak_k,
+                    "start_frame": _s_peak_idx,
+                    "top_affected": s_top_affected,
+                    "peak_delta": s_peak_delta,
                 }
 
             # Final fallback: Wilson-Cowan recurrent dynamics (no trained model needed).
@@ -735,6 +591,10 @@ class BrainVisualizationServer:
             else:
                 # sine and constant: bell/plateau centre gives maximum effect
                 _peak_k = _wc_dur // 2
+            _wc_peak_idx = _WC_PRE + _peak_k
+            top_affected, peak_delta = _compute_top_affected(
+                frames, cf_frames, _wc_peak_idx, valid_regions
+            )
             return {
                 "type": "simulation_result",
                 "success": True,
@@ -743,7 +603,9 @@ class BrainVisualizationServer:
                 "counterfactual_frames": cf_frames,
                 "modality": "simulation",
                 "method": "wilson_cowan",
-                "start_frame": _WC_PRE + _peak_k,
+                "start_frame": _wc_peak_idx,
+                "top_affected": top_affected,
+                "peak_delta": peak_delta,
             }
                 
         except Exception as e:
@@ -1206,6 +1068,20 @@ class BrainVisualizationServer:
             if 0 <= tid < n_regions:
                 d = np.linalg.norm(positions - positions[tid], axis=1)
                 spread_weights += np.exp(-(d ** 2) / (2 * _SPREAD_SIGMA_MM ** 2))
+        # Homotopic (callosal) activation: stimulating one hemisphere also weakly
+        # excites the contralateral homologous region via corpus callosum.
+        # Region 0-99 = left hemisphere; 100-199 = right hemisphere.
+        # This produces visible bilateral propagation in the demo without adding
+        # a full W matrix.  Strength 0.40 matches typical callosal coupling ratios.
+        _HOMO_STRENGTH = 0.40
+        for tid in target_regions:
+            if 0 <= tid < n_regions:
+                homo_id = tid + 100 if tid < 100 else tid - 100
+                if 0 <= homo_id < n_regions:
+                    d = np.linalg.norm(positions - positions[homo_id], axis=1)
+                    spread_weights += _HOMO_STRENGTH * np.exp(
+                        -(d ** 2) / (2 * _SPREAD_SIGMA_MM ** 2)
+                    )
         # Normalise: peak = amplitude at target, falls off with distance
         if spread_weights.max() > 0:
             spread_weights /= spread_weights.max()
@@ -1350,138 +1226,8 @@ class BrainVisualizationServer:
 
         return frames
 
-    async def handle_convert_cache(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Handle cache to JSON conversion request.
-        
-        Request format:
-        {
-            "type": "convert_cache",
-            "cache_dir": "/path/to/cache",
-            "output_dir": "/path/to/output"
-        }
-        """
-        try:
-            cache_dir = request.get("cache_dir")
-            output_dir = request.get("output_dir")
-            
-            if not cache_dir or not output_dir:
-                return {
-                    "type": "error",
-                    "message": "cache_dir and output_dir are required"
-                }
-            
-            cache_path = Path(cache_dir)
-            output_path = Path(output_dir)
-            
-            if not cache_path.exists():
-                return {
-                    "type": "error",
-                    "message": f"Cache directory does not exist: {cache_dir}"
-                }
-            
-            # Create output directory if it doesn't exist
-            output_path.mkdir(parents=True, exist_ok=True)
-            
-            # Find cache files (only .pt/.pth files are the actual cache format)
-            import glob
-            cache_files = []
-            for ext in ['*.pt', '*.pth']:
-                cache_files.extend(glob.glob(str(cache_path / ext)))
-            
-            if not cache_files:
-                return {
-                    "type": "error",
-                    "message": f"No cache files found in {cache_dir}"
-                }
-            
-            self.logger.info(f"Found {len(cache_files)} cache files to convert")
-            
-            # Process each cache file
-            converted_count = 0
-            errors = []
-            
-            for cache_file in cache_files:
-                try:
-                    # Load cache file
-                    import torch
-                    import numpy as np
-                    
-                    file_path = Path(cache_file)
-                    ext = file_path.suffix
-                    
-                    # Only .pt files are supported (the actual cache format)
-                    if ext not in ['.pt', '.pth']:
-                        self.logger.warning(f"Skipping unsupported file format: {file_path.name}")
-                        continue
-                    
-                    self.logger.info(f"Loading cache file: {file_path.name}")
-                    data = torch.load(file_path, map_location='cpu', weights_only=False)
-                    
-                    # Determine cache file type and convert accordingly
-                    # Cache files are: eeg_data.pt or hetero_graphs.pt
-                    # Both are Dict[str, ...] where keys are task names
-                    
-                    if 'eeg_data' in file_path.stem:
-                        # eeg_data.pt format: Dict[task_name, Dict["on"|"off", HeteroData]]
-                        self.logger.info(f"Processing EEG data cache: {file_path.name}")
-                        converted = self._convert_eeg_data_cache(data, output_path, file_path.stem)
-                        converted_count += converted
-                        
-                    elif 'hetero_graphs' in file_path.stem:
-                        # hetero_graphs.pt format: Dict[task_name, List[HeteroData]]
-                        self.logger.info(f"Processing hetero graphs cache: {file_path.name}")
-                        converted = self._convert_hetero_graphs_cache(data, output_path, file_path.stem)
-                        converted_count += converted
-                        
-                    else:
-                        # Unknown format - try to extract data generically
-                        self.logger.warning(f"Unknown cache format for {file_path.name}, attempting generic conversion")
-                        if isinstance(data, dict):
-                            for task_name, task_data in data.items():
-                                try:
-                                    brain_activity = self._extract_brain_activity_from_hetero(task_data)
-                                    if brain_activity:
-                                        output_file = output_path / f"brain_state_{file_path.stem}_{task_name}.json"
-                                        self._export_brain_state_json(brain_activity, output_file, task_name)
-                                        converted_count += 1
-                                except Exception as e:
-                                    error_msg = f"Error converting task {task_name}: {str(e)}"
-                                    self.logger.error(error_msg)
-                                    errors.append(error_msg)
-                        
-                except Exception as e:
-                    error_msg = f"Error processing {cache_file}: {str(e)}"
-                    self.logger.error(error_msg)
-                    errors.append(error_msg)
-            
-            if converted_count > 0:
-                return {
-                    "type": "convert_cache_response",
-                    "success": True,
-                    "message": f"Successfully converted {converted_count} cache files",
-                    "converted_count": converted_count,
-                    "errors": errors if errors else None,
-                    "output_dir": str(output_path)
-                }
-            else:
-                return {
-                    "type": "error",
-                    "success": False,
-                    "message": "No files were converted",
-                    "errors": errors
-                }
-                
-        except Exception as e:
-            self.logger.error(f"Error in handle_convert_cache: {e}")
-            return {
-                "type": "error",
-                "success": False,
-                "message": str(e)
-            }
-
     # ------------------------------------------------------------------ #
-    #  New: load a .pt cache file and stream all time frames               #
+    #  Load a .pt cache file and stream all time frames                    #
     # ------------------------------------------------------------------ #
 
     async def handle_load_cache(self, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -1577,19 +1323,6 @@ class BrainVisualizationServer:
             for f in d.glob("**/*.pt"):
                 if "__pycache__" not in str(f) and f.stat().st_size > 1024:
                     return f
-        return None
-
-    def _find_hetero_data(self, data):
-        """Recursively find the first HeteroData in a nested structure."""
-        if hasattr(data, "node_types"):
-            return data
-        if isinstance(data, (list, tuple)) and len(data) > 0:
-            return self._find_hetero_data(data[0])
-        if isinstance(data, dict):
-            for v in data.values():
-                result = self._find_hetero_data(v)
-                if result is not None:
-                    return result
         return None
 
     def _find_all_hetero_data(self, data) -> list:
@@ -1806,324 +1539,11 @@ class BrainVisualizationServer:
 
         return []
 
-    def _extract_brain_activity_from_hetero(self, hetero_data):
-        """
-        Extract brain activity tensors from HeteroData objects.
-        
-        Args:
-            hetero_data: Can be HeteroData, Dict, or List[HeteroData]
-            
-        Returns:
-            Dict with 'fmri' and/or 'eeg' tensors, or None if extraction fails
-        """
-        import torch
-        brain_activity = {}
-        
-        try:
-            # Handle different input types
-            if hasattr(hetero_data, 'node_types'):  # HeteroData object
-                # Extract from HeteroData
-                if 'fmri' in hetero_data.node_types:
-                    fmri_node = hetero_data['fmri']
-                    # x_seq is the typical attribute for sequence data
-                    if hasattr(fmri_node, 'x_seq'):
-                        brain_activity['fmri'] = fmri_node.x_seq
-                    elif hasattr(fmri_node, 'x'):
-                        brain_activity['fmri'] = fmri_node.x
-                
-                if 'eeg' in hetero_data.node_types:
-                    eeg_node = hetero_data['eeg']
-                    if hasattr(eeg_node, 'x_seq'):
-                        brain_activity['eeg'] = eeg_node.x_seq
-                    elif hasattr(eeg_node, 'x'):
-                        brain_activity['eeg'] = eeg_node.x
-                        
-            elif isinstance(hetero_data, dict):
-                # Dict with 'on'/'off' keys (EEG data format)
-                if 'on' in hetero_data:
-                    on_activity = self._extract_brain_activity_from_hetero(hetero_data['on'])
-                    if on_activity and 'eeg' in on_activity:
-                        brain_activity['eeg'] = on_activity['eeg']
-                        
-            elif isinstance(hetero_data, list) and len(hetero_data) > 0:
-                # List of HeteroData objects - use first one
-                first_activity = self._extract_brain_activity_from_hetero(hetero_data[0])
-                if first_activity:
-                    brain_activity = first_activity
-                    
-        except Exception as e:
-            self.logger.error(f"Error extracting brain activity: {e}")
-            return None
-        
-        return brain_activity if brain_activity else None
-    
-    def _convert_eeg_data_cache(self, data, output_path, base_name):
-        """
-        Convert eeg_data.pt cache file.
-        Format: Dict[task_name, Dict["on"|"off", HeteroData]]
-        """
-        converted = 0
-        
-        if not isinstance(data, dict):
-            self.logger.error(f"EEG data cache is not a dictionary: {type(data)}")
-            return 0
-        
-        for task_name, task_data in data.items():
-            try:
-                if not isinstance(task_data, dict):
-                    continue
-                
-                # Process "on" and "off" separately
-                for condition in ['on', 'off']:
-                    if condition not in task_data:
-                        continue
-                    
-                    hetero_data = task_data[condition]
-                    brain_activity = self._extract_brain_activity_from_hetero(hetero_data)
-                    
-                    if brain_activity:
-                        output_file = output_path / f"brain_state_{base_name}_{task_name}_{condition}.json"
-                        self._export_brain_state_json(
-                            brain_activity, 
-                            output_file, 
-                            f"{task_name}_{condition}"
-                        )
-                        converted += 1
-                        self.logger.info(f"  Converted: {task_name}/{condition} -> {output_file.name}")
-                        
-            except Exception as e:
-                self.logger.error(f"Error converting EEG task {task_name}: {e}")
-        
-        return converted
-    
-    def _convert_hetero_graphs_cache(self, data, output_path, base_name):
-        """
-        Convert hetero_graphs.pt cache file.
-        Format: Dict[task_name, List[HeteroData]]
-        """
-        converted = 0
-        
-        if not isinstance(data, dict):
-            self.logger.error(f"Hetero graphs cache is not a dictionary: {type(data)}")
-            return 0
-        
-        for task_name, graph_list in data.items():
-            try:
-                if not isinstance(graph_list, list) or len(graph_list) == 0:
-                    continue
-                
-                # Convert first few graphs (to avoid generating too many files)
-                max_graphs = min(10, len(graph_list))
-                for idx in range(max_graphs):
-                    hetero_data = graph_list[idx]
-                    brain_activity = self._extract_brain_activity_from_hetero(hetero_data)
-                    
-                    if brain_activity:
-                        output_file = output_path / f"brain_state_{base_name}_{task_name}_{idx:03d}.json"
-                        self._export_brain_state_json(
-                            brain_activity,
-                            output_file,
-                            f"{task_name}_frame{idx}"
-                        )
-                        converted += 1
-                        
-                if max_graphs < len(graph_list):
-                    self.logger.info(f"  Converted {max_graphs}/{len(graph_list)} graphs for task {task_name}")
-                else:
-                    self.logger.info(f"  Converted all {len(graph_list)} graphs for task {task_name}")
-                    
-            except Exception as e:
-                self.logger.error(f"Error converting hetero graph task {task_name}: {e}")
-        
-        return converted
-    
-    def _export_brain_state_json(self, brain_activity, output_file, subject_id):
-        """
-        Export brain activity to JSON file.
-        
-        Args:
-            brain_activity: Dict with 'fmri' and/or 'eeg' tensors
-            output_file: Path to save JSON
-            subject_id: Subject identifier for metadata
-        """
-        import torch
-        
-        try:
-            # Use exporter if available
-            if self.exporter:
-                self.exporter.export_brain_state(
-                    brain_activity=brain_activity,
-                    time_point=0,
-                    time_second=0.0,
-                    subject_id=subject_id,
-                    output_path=output_file
-                )
-            else:
-                # Fallback: create minimal JSON
-                json_data = {
-                    "version": "2.0",
-                    "timestamp": datetime.now().isoformat(),
-                    "subject_id": subject_id,
-                    "brain_state": {
-                        "time_point": 0,
-                        "regions": []
-                    }
-                }
-                
-                # Extract basic statistics for each modality
-                for modality, tensor in brain_activity.items():
-                    if isinstance(tensor, torch.Tensor):
-                        json_data[f"{modality}_shape"] = list(tensor.shape)
-                        json_data[f"{modality}_mean"] = float(tensor.mean())
-                        json_data[f"{modality}_std"] = float(tensor.std())
-                
-                with open(output_file, 'w') as f:
-                    json.dump(json_data, f, indent=2)
-                    
-        except Exception as e:
-            self.logger.error(f"Error exporting to JSON: {e}")
-            raise
-    
-    async def handle_stream_start(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle stream start request."""
-        fps = request.get("fps", 10)
-        duration = request.get("duration", 60)
-        
-        # Input validation
-        fps = int(max(1, min(60, fps)))
-        duration = int(max(1, min(3600, duration)))
-        
-        # Start streaming in background
-        asyncio.create_task(self.stream_brain_activity(fps, duration))
-        
-        return {
-            "type": "stream_started",
-            "success": True,
-            "fps": fps,
-            "duration": duration
-        }
-    
-    async def stream_brain_activity(self, fps: int = 10, duration: int = 60):
-        """Stream brain activity to all connected clients."""
-        n_frames = int(fps * duration)
-        
-        try:
-            import torch
-            import numpy as np
-            
-            n_regions = 200
-            
-            for frame_idx in range(n_frames):
-                # Generate dynamic brain state
-                # Simulate wave-like activity patterns
-                phase = 2 * np.pi * frame_idx / (fps * 5)  # 5 second cycle
-                
-                fmri_data = torch.randn(n_regions, 1, 1)
-                # Add wave pattern
-                for i in range(n_regions):
-                    fmri_data[i] += 0.5 * np.sin(phase + i * 0.1)
-                
-                eeg_data = torch.randn(n_regions, 1, 1)
-                
-                brain_activity = {
-                    'fmri': fmri_data,
-                    'eeg': eeg_data
-                }
-                
-                # Export brain state
-                if self.exporter:
-                    brain_state = self.exporter.export_brain_state(
-                        brain_activity=brain_activity,
-                        time_point=frame_idx,
-                        time_second=frame_idx / fps,
-                        subject_id="stream"
-                    )
-                    
-                    frame_data = {
-                        "type": "stream_frame",
-                        "frame": frame_idx,
-                        "time": frame_idx / fps,
-                        "data": brain_state
-                    }
-                else:
-                    frame_data = {
-                        "type": "stream_frame",
-                        "frame": frame_idx,
-                        "time": frame_idx / fps,
-                        "data": {}
-                    }
-                
-                # Broadcast to all clients
-                await self.broadcast(frame_data)
-                
-                # Control frame rate
-                await asyncio.sleep(1.0 / fps)
-            
-            # Send stream end message
-            await self.broadcast({"type": "stream_ended", "n_frames": n_frames})
-            
-        except Exception as e:
-            self.logger.error(f"Error in streaming: {e}")
-            await self.broadcast({
-                "type": "error",
-                "message": f"Streaming failed: {str(e)}"
-            })
-    
-    def start(self):
-        """Start the WebSocket server."""
-        if not WEBSOCKETS_AVAILABLE:
-            raise ImportError("websockets package is required")
-        
-        self.logger.info(f"Starting WebSocket server on {self.host}:{self.port}")
-        
-        start_server = websockets.serve(
-            self.handle_client,
-            self.host,
-            self.port
-        )
-        
-        asyncio.get_event_loop().run_until_complete(start_server)
-        self.logger.info("Server started successfully")
-        
-        # Run forever
-        asyncio.get_event_loop().run_forever()
-    
     async def start_async(self):
-        """Start server asynchronously (for use in existing event loop)."""
+        """Start server asynchronously (preferred entry point)."""
         if not WEBSOCKETS_AVAILABLE:
             raise ImportError("websockets package is required")
-        
         self.logger.info(f"Starting WebSocket server on {self.host}:{self.port}")
-        
         async with websockets.serve(self.handle_client, self.host, self.port):
             self.logger.info("Server started successfully")
             await asyncio.Future()  # Run forever
-
-
-# Standalone server function
-def start_server(
-    model=None,
-    exporter=None,
-    simulator=None,
-    host: str = "0.0.0.0",
-    port: int = 8765
-):
-    """
-    Start the brain visualization server.
-    
-    Usage:
-        from unity_integration.realtime_server import start_server
-        start_server(model, exporter, simulator)
-    """
-    server = BrainVisualizationServer(
-        model=model,
-        exporter=exporter,
-        simulator=simulator,
-        host=host,
-        port=port
-    )
-    
-    try:
-        server.start()
-    except KeyboardInterrupt:
-        print("\nServer stopped by user")

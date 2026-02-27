@@ -205,6 +205,16 @@
       <button id="btn-reset" class="btn-secondary">↺ 重置视图</button>
     </div>
 
+    <!-- Stimulation propagation analysis card (hidden until a simulation is run) -->
+    <div id="stim-affected-card" class="card" style="display:none">
+      <h3>🔴 刺激传播分析</h3>
+      <p style="font-size:0.73rem;color:#555;margin-bottom:6px">
+        仿真峰值帧时，变化最显著的非靶区（相对对照轨迹）<br/>
+        <span style="color:#ff8844">●</span> = 3D 视图已高亮（橙色光晕）
+      </p>
+      <div id="stim-affected-list" style="font-family:monospace;line-height:1.7"></div>
+    </div>
+
     <div class="card">
       <h3>加载缓存数据</h3>
       <p style="font-size:0.75rem;color:#555;margin-bottom:7px">
@@ -315,6 +325,12 @@
                  background:rgba(255,160,44,0.18);border:1px solid rgba(255,160,44,0.4);
                  color:#ffcc66;border-radius:5px;white-space:nowrap;flex-shrink:0">
     ○ 对照轨迹
+  </button>
+  <button id="btn-delta-view" title="以归一化 ∆活动 展示刺激效果图（仿真 − 对照）"
+          style="display:none;width:auto;padding:4px 10px;font-size:0.75rem;
+                 background:rgba(255,136,0,0.12);border:1px solid rgba(255,136,0,0.35);
+                 color:#ffaa44;border-radius:5px;white-space:nowrap;flex-shrink:0">
+    ∆ 效果图
   </button>
 </div>
 

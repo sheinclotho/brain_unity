@@ -53,6 +53,14 @@ let simStartFrame = 0;
 // Used to lock the stim button until the result arrives, preventing duplicate
 // requests if the server takes longer than the original 3-second timeout.
 let stimPending = false;
+// Top non-target regions most affected by the last stimulation (from server).
+// Each entry: { region_id, delta }.  Cleared on reset.
+let stimTopAffected = [];
+// Normalised delta array (200 floats) at the stimulation peak frame, used for
+// the "∆ 效果图" overlay view.  null = no simulation yet.
+let peakDelta = null;
+// Whether the user is currently viewing the delta overlay (∆ 效果图 mode).
+let showingDeltaView = false;
 
 // ── Guard: Three.js must be loaded ────────────────────────────────────────────
 if (typeof THREE === 'undefined') {
@@ -408,6 +416,20 @@ function handleMsg(msg) {
       // Remember where stimulation begins so both the main sequence and
       // the CF toggle start at the first stimulated frame (not pre-stim baseline).
       simStartFrame = (typeof msg.start_frame === 'number') ? msg.start_frame : 0;
+      // Store top-affected non-target regions for overlay/highlighting
+      if (Array.isArray(msg.top_affected) && msg.top_affected.length > 0) {
+        stimTopAffected = msg.top_affected;
+      } else {
+        stimTopAffected = [];
+      }
+      // Store full peak-frame delta array for ∆ 效果图 overlay
+      if (Array.isArray(msg.peak_delta) && msg.peak_delta.length > 0) {
+        peakDelta = msg.peak_delta;
+        const deltaBtn = document.getElementById('btn-delta-view');
+        if (deltaBtn) deltaBtn.style.display = '';
+      }
+      // Highlight and list top affected regions
+      _showTopAffected(stimTopAffected);
     }
     loadFrameSeq(finalFrames, msg.path || null, modalityLabel, isStim, isStim ? simStartFrame : 0);
     return;
@@ -683,13 +705,21 @@ document.getElementById('btn-stim').addEventListener('click', () => {
       ? origFrames[Math.min(origCurFrame, origFrames.length - 1)].activity.slice()
       : regionMeshes.map(m => m.userData.activity);
 
-    // Gaussian spatial spread weights
+    // Gaussian spatial spread weights (sigma² = 1800 mm² ≈ σ=42 mm)
     const sw = new Array(N_REGIONS).fill(0);
     targets.forEach(tid => {
       const p0 = BRAIN_POS[tid];
       for (let j = 0; j < N_REGIONS; j++) {
         const d2 = p0.distanceTo(BRAIN_POS[j]) ** 2;
         sw[j] += Math.exp(-d2 / 1800);
+      }
+      // Homotopic (callosal) activation: mirror region in contralateral hemisphere.
+      // Regions 0-99 = left, 100-199 = right. Strength 0.40 matches server-side.
+      const homoId = tid < 100 ? tid + 100 : tid - 100;
+      const ph = BRAIN_POS[homoId];
+      for (let j = 0; j < N_REGIONS; j++) {
+        const d2 = ph.distanceTo(BRAIN_POS[j]) ** 2;
+        sw[j] += 0.40 * Math.exp(-d2 / 1800);
       }
     });
     const swMax = sw.reduce((a, b) => Math.max(a, b), 0);
@@ -702,9 +732,6 @@ document.getElementById('btn-stim').addEventListener('click', () => {
     //   leak  = (v - act0[i]) * 0.10         — restores to act0 in ~10 steps
     // Without stimulation: v stays at act0 (zero deviation → zero leak).
     // With stimulation:    target rises above act0; recovers after stim ends.
-    // The old formula (v*0.85 + tanh(v+stim)*0.15) had a convergence-to-zero
-    // attractor: pre-stim regions drifted 0.06 toward black, post-stim regions
-    // decayed toward 0 instead of recovering to act0.
     const PRE = 5, DUR = 20, POST = 5;
     const localFrames = [];
     let curr = act0.slice();
@@ -752,6 +779,22 @@ document.getElementById('btn-stim').addEventListener('click', () => {
       offlineStartFrame = PRE + Math.floor(DUR / 2);
     }
     simStartFrame = offlineStartFrame;
+
+    // Compute counterfactual (no-stim) baseline and derive top_affected offline.
+    // No-stim: act0 never changes (leak = 0 when deviation = 0), so CF activity = act0.
+    const peakAct  = localFrames[Math.min(offlineStartFrame, localFrames.length - 1)].activity;
+    const offlineDelta = peakAct.map((v, i) => v - act0[i]);
+    const targetSet = new Set(targets);
+    const candidates = Array.from({length: N_REGIONS}, (_, i) => i).filter(i => !targetSet.has(i));
+    candidates.sort((a, b) => Math.abs(offlineDelta[b]) - Math.abs(offlineDelta[a]));
+    const offlineTopAffected = candidates.slice(0, 15).map(i => ({ region_id: i, delta: offlineDelta[i] }));
+
+    peakDelta = offlineDelta;
+    stimTopAffected = offlineTopAffected;
+    _showTopAffected(offlineTopAffected);
+    const deltaBtn = document.getElementById('btn-delta-view');
+    if (deltaBtn) deltaBtn.style.display = '';
+
     loadFrameSeq(localFrames, null, '⚡ 仿真 (离线)', true, offlineStartFrame);
   }
 });
@@ -778,11 +821,17 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   slider.max = 0;
   slider.value = 0;
   updateFrameLabel();
-  // Hide counterfactual toggle and return-data button
+  // Hide counterfactual toggle, delta-view button and return-data button
   const cfBtn = document.getElementById('btn-cf-toggle');
   if (cfBtn) cfBtn.style.display = 'none';
   const rdBtn = document.getElementById('btn-return-data');
   if (rdBtn) rdBtn.style.display = 'none';
+  const deltaBtn = document.getElementById('btn-delta-view');
+  if (deltaBtn) { deltaBtn.style.display = 'none'; deltaBtn.textContent = '∆ 效果图'; }
+  showingDeltaView = false;
+  peakDelta = null;
+  stimTopAffected = [];
+  _clearTopAffected();
   // Reset analysis and validation status
   document.getElementById('analysis-status').textContent = '';
   document.getElementById('ec-validation-status').textContent = '';
@@ -833,6 +882,65 @@ let ecActivityDelta = null;     // (200,) predicted Δactivity from top source
 const EC_LINE_COLOR   = new THREE.Color(0xffcc44);
 const EC_SOURCE_COLOR = new THREE.Color(0xffffff);
 const EC_TARGET_COLOR = new THREE.Color(0x44ffcc);
+
+// ── Stimulation top-affected regions overlay ──────────────────────────────────
+// Highlights non-target regions that changed most in the last simulation, and
+// populates the sidebar list.  Uses a warm amber emissive glow distinct from
+// the EC purple/teal highlights.
+const STIM_AFFECTED_COLOR = new THREE.Color(0xff8800);  // amber
+
+function _clearTopAffected() {
+  regionMeshes.forEach(m => {
+    if (m.userData._stimAffected) {
+      m.material.emissive.setRGB(
+        m.material.color.r * 0.22,
+        m.material.color.g * 0.22,
+        m.material.color.b * 0.22
+      );
+      m.userData._stimAffected = false;
+    }
+  });
+  const listEl = document.getElementById('stim-affected-list');
+  if (listEl) listEl.innerHTML = '';
+  const cardEl = document.getElementById('stim-affected-card');
+  if (cardEl) cardEl.style.display = 'none';
+}
+
+function _showTopAffected(topAffected) {
+  _clearTopAffected();
+  if (!topAffected || topAffected.length === 0) return;
+
+  // Visually highlight the top 5 non-target affected regions
+  topAffected.slice(0, 5).forEach(({ region_id }) => {
+    const m = regionMeshes[region_id];
+    if (m) {
+      m.material.emissive.copy(STIM_AFFECTED_COLOR).multiplyScalar(0.50);
+      m.userData._stimAffected = true;
+    }
+  });
+
+  // Populate sidebar list
+  const listEl = document.getElementById('stim-affected-list');
+  const cardEl = document.getElementById('stim-affected-card');
+  if (listEl && cardEl) {
+    cardEl.style.display = '';
+    const maxAbs = topAffected.reduce((m, r) => Math.max(m, Math.abs(r.delta)), 1e-9);
+    listEl.innerHTML = topAffected.slice(0, 10).map(({ region_id, delta }, rank) => {
+      const pct   = (delta * 100).toFixed(2);
+      const sign  = delta >= 0 ? '+' : '';
+      const bar   = Math.round(Math.abs(delta) / maxAbs * 24);
+      const col   = delta >= 0 ? '#ff8844' : '#44aaff';
+      const mark  = rank < 5 ? '●' : '○';
+      return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;">` +
+        `<span style="color:${col};font-size:0.8rem">${mark}</span>` +
+        `<span style="min-width:62px;font-size:0.78rem">区域 ${region_id + 1}</span>` +
+        `<span style="font-size:0.78rem;color:${col};min-width:52px">${sign}${pct}%</span>` +
+        `<span style="font-size:0.65rem;color:#555">${'█'.repeat(bar)}</span>` +
+        `</div>`;
+    }).join('');
+  }
+}
+
 
 function clearECViz() {
   ecLines.forEach(l => scene.remove(l));
@@ -1031,12 +1139,43 @@ document.getElementById('btn-return-data').addEventListener('click', () => {
   // Hide the CF toggle (simulation context is gone)
   const cfBtn = document.getElementById('btn-cf-toggle');
   if (cfBtn) cfBtn.style.display = 'none';
+  // Hide delta view button when leaving simulation
+  const deltaBtn = document.getElementById('btn-delta-view');
+  if (deltaBtn) deltaBtn.style.display = 'none';
+  showingDeltaView = false;
   counterFactualFrames = [];
   showingCounterFactual = false;
   // Restore original data at the frame the user was on before simulation started
   loadFrameSeq(origFrames, null, label, false, origCurFrame);
   // Pause immediately so the user can see the exact frame they paused on
   pauseSeq();
+});
+
+// ── Delta-view (∆ 效果图): show stim−CF normalised activity ───────────────────
+document.getElementById('btn-delta-view').addEventListener('click', () => {
+  if (!peakDelta || peakDelta.length === 0) return;
+  showingDeltaView = !showingDeltaView;
+  const deltaBtn = document.getElementById('btn-delta-view');
+  if (showingDeltaView) {
+    // Map delta to display space: 0.5 + 0.5 * delta / max(|delta|)
+    // Makes any change (positive or negative) visible against the teal midpoint.
+    const maxAbs  = peakDelta.reduce((m, v) => Math.max(m, Math.abs(v)), 1e-9);
+    const overlay = peakDelta.map(d => Math.max(0, Math.min(1, 0.5 + 0.5 * d / maxAbs)));
+    updateActivity(overlay);
+    deltaBtn.textContent = '▣ 退出∆视图';
+    deltaBtn.style.background = 'rgba(255,136,0,0.25)';
+    deltaBtn.style.color = '#ffaa44';
+    deltaBtn.style.borderColor = 'rgba(255,136,0,0.5)';
+    setModalityBadge('∆ 效果');
+  } else {
+    // Restore the current simulation frame
+    if (frameSeq[curFrame]) updateActivity(frameSeq[curFrame].activity, frameSeq[curFrame].raw);
+    deltaBtn.textContent = '∆ 效果图';
+    deltaBtn.style.background = '';
+    deltaBtn.style.color = '';
+    deltaBtn.style.borderColor = '';
+    setModalityBadge('⚡ 仿真');
+  }
 });
 
 // ── EC Validation ─────────────────────────────────────────────────────────────
