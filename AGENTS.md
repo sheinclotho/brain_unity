@@ -368,18 +368,9 @@ r ≈ 0 的两个神经生物学合理原因：
 - **修复**: 训练前检测 `~np.isfinite(time_series).any()`，对每列用有限值均值替换（全部为 NaN 的列填 0），并发出 WARNING 日志。
 - **规则**: `fit_surrogate` 必须能健壮处理含少量 NaN/Inf 的输入。修复后应记录 WARNING 而非抛出异常，保持服务器存活。注意 `~np.isfinite(arr).sum()` 与 `(~np.isfinite(arr)).sum()` 的运算符优先级差异（前者计算有限值的按位非，后者才是非有限值计数）。
 
-### [2026-02-27] fMRI/EEG 双模态加载 — 上游双文件架构 & 代码修复
+### [2026-02-27] fMRI/EEG 双模态加载 — 旧格式（已过时，代码已删除）
 
-- **架构事实（上游设计）**: 训练管线将两个模态保存到**两个独立文件**：
-  - `hetero_graphs.pt` → `Dict[task, List[HeteroData]]` 包含 `fmri` 节点类型
-  - `eeg_data.pt`      → `Dict[task, Dict[state, HeteroData]]` 包含 `eeg` 节点类型
-  单独加载任一文件只能看到对应模态，这是设计行为，不是 Bug。
-
-- **代码 Bug（已修复）**: `_extract_time_series_both` 中 fMRI 提取路径缺少 `.x` 属性回退。EEG 路径已有 `getattr(g["eeg"], "x", None)` 兜底（旧版兼容），fMRI 路径没有 → 旧格式 fMRI 数据静默丢失。已对称添加 fMRI 的 `.x` 回退。
-
-- **功能修复（已实现）**: 新增 `_find_companion_cache(primary_path, has_fmri, has_eeg)` 方法。加载任一单模态文件后自动检测同目录的伴随文件并合并，用户无需手动加载两个文件。
-
-- **规则**: `_extract_time_series_both` 的 fMRI 和 EEG 提取路径必须**对称**：两者都要先尝试 `.x_seq`，再回退到 `.x`。任何新增的节点类型提取路径都应遵循相同模式。
+> **⚠️ 此节描述的旧格式代码已于 2026-02-27 彻底删除。** `_find_companion_cache`、`_find_all_hetero_data`、`.x_seq` 回退路径均已移除。V5 格式（单文件 HeteroData，`.x` 属性）是唯一支持的格式。
 
 ### [2026-02-27] 性能优化 — 批量推断与向量化
 
@@ -403,21 +394,27 @@ r ≈ 0 的两个神经生物学合理原因：
 - **指数退避重连**: `_reconnectDelay = Math.min(30000, _reconnectDelay * 2)` 替代固定 3s，连接成功后重置。
 - **键盘快捷键**: `Space`/`←`/`→`/`Home`/`End`/`Escape`，通过 `_gotoFrame(idx)` 统一帧跳转逻辑，只在非输入元素上响应。
 
-### [2026-02-27] TwinBrain V5 图缓存格式 — 对旧格式假设的关键纠正
+### [2026-02-27] TwinBrain V5 图缓存格式 — 旧格式代码已彻底删除
 
-- **旧假设（错误！）**: 缓存格式为 `hetero_graphs.pt`（fMRI，`Dict[task, List[HeteroData]]`）+ `eeg_data.pt`（EEG，`Dict[task, Dict[state, HeteroData]]`）两个独立文件。
-- **正确的 V5 格式**（来自 `API.md`）:
+- **V5 正确格式**（来自 `API.md`）:
   - **每个缓存文件是单个 `HeteroData` 对象**，命名为 `{subject_id}_{task}_{config_hash}.pt`
   - 存储位置：`outputs/graph_cache/`
   - **fMRI**: `g['fmri'].x` 形状 `[N_fmri, T_fmri, 1]`（z-scored BOLD；N_fmri ≈ 190）
   - **EEG**: `g['eeg'].x` 形状 `[N_eeg, T_eeg, 1]`（z-scored EEG；N_eeg 通常 32–64）
-  - **两种模态在同一文件中**，不再是两个独立文件
-- **训练检查点不是图缓存**：`best_model.pt`、`swa_model.pt`、`checkpoint_epoch_*.pt` 是 `dict` 格式，不能传入 `handle_load_cache`，已在 `_is_checkpoint_file()` 中排除
-- **代码修复**:
-  - `_CACHE_SEARCH_DIRS`：添加 `outputs/graph_cache`（V5 默认路径）为首选目录
-  - `_PREFERRED_CACHE_NAMES`：移除（V5 无固定文件名）；由 `_CHECKPOINT_STEMS` 和 `_CHECKPOINT_PREFIX` 排除检查点文件
-  - `_extract_time_series_both`：时序提取改为优先 `.x`（V5），回退 `.x_seq`（旧格式）
-  - `_find_companion_cache`：V5 下为空操作；仍保留旧格式双文件兼容逻辑
-- **规则**: 任何从图缓存提取时序的代码都应优先尝试 `.x`，然后回退 `.x_seq`；两者形状均为 `[N, T, F]` 或 `[N, T]`。N_fmri ≈ 190（非 200），需通过 `_frames_from_xseq` 的 `n_out=200` 插值。
+  - **两种模态在同一文件中**
+- **训练检查点不是图缓存**：`best_model.pt`、`swa_model.pt`、`checkpoint_epoch_*.pt` 是 `dict` 格式，由 `_is_checkpoint_file()` 排除
+- **旧格式代码（已彻底删除，不再保留）**:
+  - `_find_companion_cache`：删除（旧格式双文件伴随加载逻辑）
+  - `_find_all_hetero_data`：删除（旧格式递归搜索 `Dict[task, List[HeteroData]]` 嵌套结构）
+  - `_extract_time_series`：删除（dead code 包装方法）
+  - `.x_seq` 属性回退路径：删除（V5 仅使用 `.x`）
+  - 旧格式搜索目录 `graph_cache`、`test_file3`、`Unity_TwinBrain`：从 `_CACHE_SEARCH_DIRS` 删除
+  - companion-file 加载代码块：从 `handle_load_cache` 删除
+  - `_MAX_HETERO_RECURSION_DEPTH` 常量：删除
+- **当前 `_extract_time_series_both` 实现**:
+  - 输入必须是 `HeteroData` 对象（否则返回空 dict 并记录 ERROR 日志）
+  - 直接读取 `data['fmri'].x` 和 `data['eeg'].x`
+  - 单步处理，无循环/分块/合并
+- **规则**: 任何从图缓存提取时序的代码**只能**使用 `data['fmri'].x` / `data['eeg'].x`，形状 `[N, T, 1]`。N_fmri ≈ 190，通过 `_frames_from_fmri` 中的 `np.interp` 插值到 200 槽位。**不允许再为旧格式添加任何回退路径。**
 
 *Last updated: 2026-02-27*

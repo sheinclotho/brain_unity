@@ -116,10 +116,6 @@ def _make_fibonacci_brain_positions(n: int = 200) -> "np.ndarray":
 # Module-level cache so the positions are computed only once per process.
 _BRAIN_POSITIONS_CACHE: "Optional[np.ndarray]" = None
 
-# Maximum recursion depth for _find_all_hetero_data to guard against
-# corrupted / unexpectedly deep data structures.
-_MAX_HETERO_RECURSION_DEPTH: int = 100
-
 
 def _get_brain_positions(n: int = 200) -> "np.ndarray":
     """Return the module-level cached Fibonacci brain positions.
@@ -147,15 +143,11 @@ class BrainVisualizationServer:
 
     # Directories searched for .pt cache files (in priority order).
     # V5 training pipeline writes per-subject graph caches to
-    # ``outputs/graph_cache/``.  Legacy experiment layouts may use
-    # ``graph_cache/``, ``test_file3/``, or ``Unity_TwinBrain/``.
+    # ``outputs/graph_cache/`` (configurable via data.cache.dir).
     _CACHE_SEARCH_DIRS = [
         Path("outputs/graph_cache"),   # V5 default (API §2, data.cache.dir)
         Path("outputs"),               # V5 training output root — also holds checkpoints
                                        # that are excluded via _is_checkpoint_file()
-        Path("graph_cache"),           # legacy flat-name layout
-        Path("test_file3"),            # legacy project-specific layout
-        Path("Unity_TwinBrain"),       # legacy project-specific layout
         Path("."),                     # current working directory
         Path(".."),                    # parent directory (fallback)
     ]
@@ -1405,32 +1397,24 @@ class BrainVisualizationServer:
 
         Accepted request fields:
           path (str, optional): path to the .pt file; if omitted, auto-detects
-                                the first suitable file under the project tree.
+                                the first suitable file under ``outputs/graph_cache/``.
 
         V5 Graph Cache Format (TwinBrain V5, API §2)
         ----------------------------------------------
-        Each cache file is a **single** PyG ``HeteroData`` object (no wrapping
-        dict or list) named ``{subject_id}_{task}_{config_hash}.pt`` and stored
-        in ``outputs/graph_cache/``.
+        Each cache file is a **single** PyG ``HeteroData`` object named
+        ``{subject_id}_{task}_{config_hash}.pt`` in ``outputs/graph_cache/``.
 
         Node types and time-series attributes:
           - ``'fmri'`` node type → ``g['fmri'].x``  shape ``[N_fmri, T_fmri, 1]``
-            z-scored BOLD signal; N_fmri ≈ 190 (Schaefer200, depends on EPI coverage)
+            z-scored BOLD signal; N_fmri ≈ 190 (Schaefer200, EPI-coverage dependent)
           - ``'eeg'``  node type → ``g['eeg'].x``   shape ``[N_eeg, T_eeg, 1]``
             z-scored EEG signal; N_eeg typically 32–64
 
-        Both modalities are contained in the **same** file — no companion-file
-        loading is required for V5 files.
-
-        Legacy backward-compatibility
-        ------------------------------
-        Older files using ``.x_seq`` (instead of ``.x``) or the dual-file layout
-        (``hetero_graphs.pt`` + ``eeg_data.pt``) are still supported via the
-        legacy fallback paths in ``_find_companion_cache``.
+        Both modalities are in the **same** file.
 
         Response:
           { "type": "cache_loaded", "path": "…", "n_frames": N,
-            "frames": [{"activity": [200 floats]}, …],
+            "frames": [{"activity": [200 floats], "raw": [200 floats]}, …],
             "frames_fmri": [...] or null,
             "frames_eeg":  [...] or null,
             "modalities":  ["fmri"] | ["eeg"] | ["fmri","eeg"] }
@@ -1451,40 +1435,13 @@ class BrainVisualizationServer:
         except Exception as exc:
             return {"type": "error", "message": f"文件加载失败: {exc}"}
 
-        both = self._extract_time_series_both(data)
+        try:
+            both = self._extract_time_series_both(data)
+        except ValueError as exc:
+            return {"type": "error", "message": str(exc)}
         frames_fmri = both.get("fmri", [])
         frames_eeg  = both.get("eeg", [])
         modalities  = both.get("modalities", [])
-
-        # ── Companion-file auto-loading ────────────────────────────────────
-        # If one modality is missing, look for its dedicated companion file
-        # in the same directory.  This handles the common case where the
-        # upstream training pipeline saved fMRI and EEG into separate files:
-        #   hetero_graphs.pt  ← fMRI  (Dict[task, List[HeteroData]])
-        #   eeg_data.pt       ← EEG   (Dict[task, Dict[state, HeteroData]])
-        if not frames_fmri or not frames_eeg:
-            companion = self._find_companion_cache(cache_path, has_fmri=bool(frames_fmri),
-                                                   has_eeg=bool(frames_eeg))
-            if companion is not None:
-                try:
-                    companion_data = torch.load(str(companion), map_location="cpu",
-                                                weights_only=False)
-                    comp_both = self._extract_time_series_both(companion_data)
-                    if not frames_fmri and comp_both.get("fmri"):
-                        frames_fmri = comp_both["fmri"]
-                        both["n_fmri_regions"] = comp_both.get("n_fmri_regions", 0)
-                        self.logger.info(
-                            f"伴随文件加载 fMRI 数据: {companion} → {len(frames_fmri)} 帧"
-                        )
-                    if not frames_eeg and comp_both.get("eeg"):
-                        frames_eeg = comp_both["eeg"]
-                        both["n_eeg_channels"] = comp_both.get("n_eeg_channels", 0)
-                        self.logger.info(
-                            f"伴随文件加载 EEG 数据: {companion} → {len(frames_eeg)} 帧"
-                        )
-                    modalities = (["fmri"] if frames_fmri else []) + (["eeg"] if frames_eeg else [])
-                except Exception as exc:
-                    self.logger.warning(f"伴随文件加载失败 ({companion}): {exc}")
 
         # Primary frames: prefer fMRI, fall back to EEG
         primary = frames_fmri if frames_fmri else frames_eeg
@@ -1503,10 +1460,9 @@ class BrainVisualizationServer:
                 [f["activity"] for f in primary], dtype=np.float32
             )   # (T, 200)
             self._loaded_cache_path = str(cache_path)
-            # Also store raw (un-per-frame-normalised) values so that the deviation
-            # analysis uses the original sensor amplitudes, not normalised [0,1] data.
-            # EEG frames are per-frame min-max normalised (loses temporal structure);
-            # raw values preserve the genuine between-task amplitude differences.
+            # Store raw (pre-normalisation) values for deviation analysis so that
+            # genuine between-frame amplitude differences are preserved.
+            # Use .get() so that frames without a 'raw' key fall back to 'activity'.
             if primary and "raw" in primary[0]:
                 self._loaded_raw_time_series = np.array(
                     [f.get("raw", f["activity"]) for f in primary], dtype=np.float32
@@ -1520,12 +1476,13 @@ class BrainVisualizationServer:
             "type":           "cache_loaded",
             "path":           str(cache_path),
             "n_frames":       len(primary),
-            "frames":         primary,           # backward-compat: primary modality
+            "frames":         primary,
             "frames_fmri":    frames_fmri or None,
             "frames_eeg":     frames_eeg  or None,
             "modalities":     modalities,
-            # Actual counts before interpolation (fallback = 200 standard Schaefer parcellation)
-            "n_fmri_regions": both.get("n_fmri_regions", 200),
+            # Actual node counts before interpolation to 200 visualisation slots.
+            # 0 means the modality is absent in this file (single-modality cache).
+            "n_fmri_regions": both.get("n_fmri_regions", 0),
             "n_eeg_channels": both.get("n_eeg_channels", 0),
             "success":        True,
         }
@@ -1571,282 +1528,133 @@ class BrainVisualizationServer:
                     continue
         return None
 
-    def _find_companion_cache(
-        self,
-        primary_path: Path,
-        has_fmri: bool,
-        has_eeg: bool,
-    ) -> "Optional[Path]":
-        """Look for a complementary legacy-format modality file.
-
-        **V5 format note**: In TwinBrain V5 both EEG and fMRI node types are
-        stored in the *same* ``HeteroData`` object (single ``.pt`` file per
-        subject+task).  This method is therefore a no-op for V5 files where
-        ``has_fmri and has_eeg`` is already True after loading the primary file.
-
-        This method remains for backward-compatibility with the *old* dual-file
-        layout where fMRI lived in ``hetero_graphs.pt`` and EEG lived in
-        ``eeg_data.pt``.  If neither of those companion files is found in the
-        same directory the method returns ``None`` (no-op).
-
-        Args:
-            primary_path : Path of the file already loaded.
-            has_fmri     : Whether the primary file already yielded fMRI frames.
-            has_eeg      : Whether the primary file already yielded EEG frames.
-
-        Returns:
-            Path to the companion file, or None if not found / not needed.
-        """
-        if has_fmri and has_eeg:
-            return None   # V5 single-file: both modalities already present
-
-        parent = primary_path.parent
-
-        # Only look for the old fixed filenames — do NOT search for arbitrary
-        # .pt files here, as those might be other subjects' caches.
-        if not has_fmri:
-            candidates = ["hetero_graphs.pt"]   # old fMRI companion name
-        else:
-            candidates = ["eeg_data.pt"]        # old EEG companion name
-
-        for cname in candidates:
-            companion = parent / cname
-            if (companion.exists()
-                    and companion != primary_path
-                    and companion.stat().st_size > self._MIN_CACHE_SIZE):
-                self.logger.info(
-                    f"发现旧格式伴随模态文件 (legacy dual-file layout): {companion}"
-                )
-                return companion
-
-        return None
-
-    def _find_all_hetero_data(self, data, _depth: int = 0) -> list:
-        """Recursively collect ALL HeteroData objects from a nested structure.
-
-        When a cache file stores ``Dict[task, List[HeteroData]]`` the full
-        time series is split across multiple HeteroData chunks (each holding
-        ``spatial_T`` frames, e.g. 384) to keep training memory bounded.
-        This method collects every chunk so the caller can concatenate them
-        and recover the complete time series.
-
-        Args:
-            data:   Arbitrary nested structure (HeteroData, list, tuple, dict).
-            _depth: Internal recursion depth counter.  Stops at
-                    ``_MAX_HETERO_RECURSION_DEPTH`` to prevent stack overflow
-                    on corrupted or unexpectedly deep structures.
-        """
-        if _depth > _MAX_HETERO_RECURSION_DEPTH:
-            self.logger.warning(
-                "_find_all_hetero_data: 递归深度超过100，停止搜索（数据结构可能损坏）"
-            )
-            return []
-        results = []
-        if hasattr(data, "node_types"):
-            results.append(data)
-        elif isinstance(data, (list, tuple)):
-            for item in data:
-                results.extend(self._find_all_hetero_data(item, _depth + 1))
-        elif isinstance(data, dict):
-            for v in data.values():
-                results.extend(self._find_all_hetero_data(v, _depth + 1))
-        return results
-
-    def _extract_time_series(self, data) -> list:
-        """Extract per-time-point activity frames from a cache .pt object.
-
-        Strategy (in order of preference):
-          1. ``fmri.x_seq`` (shape N×T×F, N == 200 ROIs) → direct 1-to-1 mapping.
-          2. ``eeg.x_seq``  (shape N_eeg×T×F, N_eeg ≠ 200) → linear interpolation
-             to 200 visualisation slots using np.interp.
-
-        All activity values are normalised to [0, 1] via global 5th/95th
-        percentile clipping (robust to outliers in both modalities).
-        """
-        both = self._extract_time_series_both(data)
-        primary = both.get("fmri") or both.get("eeg") or []
-        return primary
-
     def _extract_time_series_both(self, data) -> dict:
-        """Extract fMRI and EEG frame sequences from a cache .pt object.
+        """Extract fMRI and EEG frame sequences from a V5 graph-cache HeteroData.
 
-        Returns a dict with keys:
-          fmri       – list of {"activity": [200 floats]} or [] if unavailable
-          eeg        – list of {"activity": [200 floats]} or [] if unavailable
-          modalities – list of available modality names, e.g. ["fmri","eeg"]
+        V5 format (TwinBrain V5, API §2)
+        ---------------------------------
+        ``data`` must be a single PyG ``HeteroData`` object.
 
-        Supported cache formats
-        -----------------------
-        **V5 (current)**: Single HeteroData per subject+task file.
-          - ``g['fmri'].x``   shape ``[N_fmri, T_fmri, 1]`` — z-scored BOLD
-          - ``g['eeg'].x``    shape ``[N_eeg,  T_eeg,  1]`` — z-scored EEG
-          Both modalities live in the same object; N_fmri ≈ 190 (interpolated
-          to 200 visualisation slots via np.interp).
+        Node-type → time-series attribute mapping:
+          ``'fmri'`` → ``data['fmri'].x``  shape ``[N_fmri, T_fmri, 1]``
+          ``'eeg'``  → ``data['eeg'].x``   shape ``[N_eeg,  T_eeg,  1]``
 
-        **Legacy**: Dict[task, List[HeteroData]] with ``.x_seq`` attribute
-          shape ``[N, T, F]``.  Still supported for backward compatibility.
+        Returns a dict:
+          fmri          – list of T_fmri dicts ``{"activity": [200 floats],
+                          "raw": [200 floats]}`` or ``[]`` if absent.
+          eeg           – list of T_eeg  dicts (same schema) or ``[]``.
+          modalities    – list of present modality names, e.g. ``["fmri","eeg"]``.
+          n_fmri_regions – actual N_fmri before interpolation to 200 slots.
+          n_eeg_channels – actual N_eeg  before interpolation to 200 slots.
 
-        Normalisation strategy
-        ----------------------
-          fMRI: global 5th/95th-percentile across all time + channels → preserves
-                absolute activity level relationships between frames.
-          EEG:  per-frame min-max → shows relative spatial variation at each
-                instant (EEG temporal variance dominates spatial variance, so
-                global normalisation makes all channels appear the same colour).
+        Normalisation
+        -------------
+          fMRI: global 5th/95th-percentile clip → preserves between-frame
+                amplitude relationships; ``raw`` stores the z-scored values.
+          EEG:  per-frame min-max → shows spatial distribution at each instant
+                (EEG temporal variance >> spatial variance; global norm collapses
+                all channels to the same colour).
         """
         import torch
         import numpy as np
 
-        graphs = self._find_all_hetero_data(data)
-        if not graphs:
-            return {"fmri": [], "eeg": [], "modalities": []}
+        # V5: ``data`` must be a single HeteroData object.
+        # Raise ValueError so callers surface a clear error message rather than
+        # silently returning empty frames (which causes confusing downstream failures).
+        if not hasattr(data, "node_types"):
+            raise ValueError(
+                "文件不是 V5 图缓存（HeteroData）格式。"
+                " 请确认加载的是 outputs/graph_cache/*.pt 文件，而非训练检查点。"
+            )
 
         n_regions = 200
 
-        def _frames_from_xseq(x_seq, n_out: int) -> list:
+        def _frames_from_fmri(x_seq) -> list:
             """Global percentile normalisation for fMRI.
 
-            Each frame contains:
-              activity – [0,1] normalised values (drives sphere colour)
-              raw      – original sensor values (shown in hover tooltip)
-
-            Fully vectorized for the common N==n_out fMRI case: the entire
-            (N, T) normalisation is computed as a single NumPy operation
-            rather than one per-frame Python call.  The interpolation path
-            (N != n_out, rare) retains a T-iteration loop because np.interp
-            is 1-D only, but normalisation is still batched.
+            Each frame: ``{"activity": [n_regions floats], "raw": [n_regions floats]}``
+            Fully vectorised; interpolation only when N_fmri ≠ n_regions.
             """
             x = x_seq.cpu().float()
             if x.ndim == 2:
                 x = x.unsqueeze(-1)      # (N, T) → (N, T, 1)
             N, T, _ = x.shape
-            x_np  = x[:, :, 0].numpy()   # (N, T) float32
-            flat  = x_np.ravel()
+            x_np = x[:, :, 0].numpy()   # (N, T) float32
+            flat = x_np.ravel()
             p5, p95 = np.percentile(flat, 5), np.percentile(flat, 95)
-            scale   = max(p95 - p5, 1e-6)
+            scale = max(float(p95 - p5), 1e-6)
 
-            if N == n_out:
-                # Batch normalise the entire (N, T) tensor at once — no per-frame loop
+            if N == n_regions:
                 norms = np.clip((x_np - p5) / scale, 0.0, 1.0).astype(np.float32)
                 return [
                     {"activity": norms[:, t].tolist(),
                      "raw":      x_np[:, t].astype(np.float32).tolist()}
                     for t in range(T)
                 ]
+            # Interpolation path (N_fmri ≠ 200, e.g. partial EPI coverage)
+            src = np.linspace(0.0, 1.0, N)
+            dst = np.linspace(0.0, 1.0, n_regions)
+            norms = np.clip((x_np - p5) / scale, 0.0, 1.0)
+            return [
+                {"activity": np.interp(dst, src, norms[:, t]).astype(np.float32).tolist(),
+                 "raw":      np.interp(dst, src, x_np[:, t]).astype(np.float32).tolist()}
+                for t in range(T)
+            ]
 
-            # Interpolation path (e.g. fMRI with non-standard parcellation)
-            src_idx = np.linspace(0.0, 1.0, N)
-            dst_idx = np.linspace(0.0, 1.0, n_out)
-            norms   = np.clip((x_np - p5) / scale, 0.0, 1.0)   # (N, T) batch
-            result  = []
-            for t in range(T):
-                arr = np.interp(dst_idx, src_idx, norms[:, t]).astype(np.float32)
-                raw = np.interp(dst_idx, src_idx, x_np[:, t]).astype(np.float32)
-                result.append({"activity": arr.tolist(), "raw": raw.tolist()})
-            return result
-
-        def _frames_from_xseq_eeg(x_seq, n_out: int) -> list:
+        def _frames_from_eeg(x_seq) -> list:
             """Per-frame min-max normalisation for EEG.
 
-            EEG temporal variance >> spatial variance, so global normalisation
-            collapses all channels to the same colour at any given instant.
-            Per-frame normalisation exposes the relative spatial distribution.
-
-            Each frame contains:
-              activity – [0,1] normalised values (drives sphere colour)
-              raw      – original sensor values (shown in hover tooltip)
-
-            Vectorized for N==n_out: per-frame min/max are computed as
-            column-wise reductions on the full (N, T) matrix so that a single
-            clip call produces all normalised values at once.
+            Each frame: ``{"activity": [n_regions floats], "raw": [n_regions floats]}``
+            Fully vectorised when N_eeg == n_regions; interpolation otherwise.
             """
             x = x_seq.cpu().float()
             if x.ndim == 2:
-                x = x.unsqueeze(-1)      # (N, T) → (N, T, 1)
+                x = x.unsqueeze(-1)
             N, T, _ = x.shape
             x_np = x[:, :, 0].numpy()   # (N, T)
 
-            if N == n_out:
-                # Vectorized per-frame min-max: shape (1, T) broadcasts over (N, T)
-                sig_min = x_np.min(axis=0, keepdims=True)   # (1, T)
-                sig_max = x_np.max(axis=0, keepdims=True)   # (1, T)
-                scale   = np.maximum(sig_max - sig_min, 1e-6)
-                norms   = np.clip((x_np - sig_min) / scale, 0.0, 1.0).astype(np.float32)
+            if N == n_regions:
+                sig_min = x_np.min(axis=0, keepdims=True)
+                sig_max = x_np.max(axis=0, keepdims=True)
+                scale = np.maximum(sig_max - sig_min, 1e-6)
+                norms = np.clip((x_np - sig_min) / scale, 0.0, 1.0).astype(np.float32)
                 return [
                     {"activity": norms[:, t].tolist(),
                      "raw":      x_np[:, t].astype(np.float32).tolist()}
                     for t in range(T)
                 ]
-
-            # Interpolation path (EEG with N_eeg channels → n_out visualisation slots)
-            src_idx = np.linspace(0.0, 1.0, N)
-            dst_idx = np.linspace(0.0, 1.0, n_out)
-            result  = []
+            # Interpolation path (N_eeg → n_regions)
+            src = np.linspace(0.0, 1.0, N)
+            dst = np.linspace(0.0, 1.0, n_regions)
+            result = []
             for t in range(T):
                 sig = x_np[:, t]
-                sig_min, sig_max = float(sig.min()), float(sig.max())
-                scale = max(sig_max - sig_min, 1e-6)
-                norm  = np.clip((sig - sig_min) / scale, 0.0, 1.0)
-                arr   = np.interp(dst_idx, src_idx, norm).astype(np.float32)
-                raw   = np.interp(dst_idx, src_idx, sig).astype(np.float32)
-                result.append({"activity": arr.tolist(), "raw": raw.tolist()})
+                smin, smax = float(sig.min()), float(sig.max())
+                sc = max(smax - smin, 1e-6)
+                norm = np.clip((sig - smin) / sc, 0.0, 1.0)
+                result.append({
+                    "activity": np.interp(dst, src, norm).astype(np.float32).tolist(),
+                    "raw":      np.interp(dst, src, sig).astype(np.float32).tolist(),
+                })
             return result
 
         frames_fmri: list = []
         frames_eeg:  list = []
-        n_fmri_raw: int   = 0   # actual number of fMRI ROIs before any interpolation
-        n_eeg_raw:  int   = 0   # actual number of EEG channels before interpolation
+        n_fmri_raw:  int  = 0
+        n_eeg_raw:   int  = 0
 
         try:
-            # Collect and concatenate time-series tensors across all HeteroData objects.
-            # V5 format: each file is ONE HeteroData with both modalities in `.x`
-            #            shape [N, T, 1] (z-scored, scalar feature per node).
-            # Legacy format: Dict[task, List[HeteroData]] with `.x_seq` shape [N, T, F].
-            # In both cases graphs is a flat list of HeteroData objects;
-            # for V5 it contains exactly one element.
-            fmri_chunks: list = []
-            eeg_chunks:  list = []
+            if "fmri" in data.node_types:
+                x = getattr(data["fmri"], "x", None)
+                if x is not None:
+                    n_fmri_raw = int(x.shape[0])
+                    frames_fmri = _frames_from_fmri(x)
 
-            for g in graphs:
-                if "fmri" in g.node_types:
-                    # V5: primary attribute is `.x` [N_fmri, T_fmri, 1]
-                    # Legacy: `.x_seq` [N, T, F]
-                    xseq = getattr(g["fmri"], "x", None)
-                    if xseq is None:
-                        xseq = getattr(g["fmri"], "x_seq", None)
-                    if xseq is not None:
-                        if xseq.ndim == 2:
-                            xseq = xseq.unsqueeze(-1)
-                        fmri_chunks.append(xseq)
-                        if n_fmri_raw == 0:
-                            n_fmri_raw = int(xseq.shape[0])
-
-                if "eeg" in g.node_types:
-                    # V5: primary attribute is `.x` [N_eeg, T_eeg, 1]
-                    # Legacy: `.x_seq` [N, T, F]
-                    xseq = getattr(g["eeg"], "x", None)
-                    if xseq is None:
-                        xseq = getattr(g["eeg"], "x_seq", None)
-                    if xseq is not None:
-                        if xseq.ndim == 2:
-                            xseq = xseq.unsqueeze(-1)
-                        eeg_chunks.append(xseq)
-                        if n_eeg_raw == 0:
-                            n_eeg_raw = int(xseq.shape[0])
-
-            if fmri_chunks:
-                fmri_cat = torch.cat(fmri_chunks, dim=1)  # (N, T_total, F)
-                frames_fmri = _frames_from_xseq(fmri_cat, n_regions)
-
-            if eeg_chunks:
-                eeg_cat = torch.cat(eeg_chunks, dim=1)    # (N_eeg, T_total, F)
-                frames_eeg = _frames_from_xseq_eeg(eeg_cat, n_regions)
-
-            if len(graphs) > 1:
-                self.logger.info(
-                    f"_extract_time_series_both: 合并 {len(graphs)} 个数据块 → "
-                    f"fMRI {len(frames_fmri)} 帧, EEG {len(frames_eeg)} 帧"
-                )
+            if "eeg" in data.node_types:
+                x = getattr(data["eeg"], "x", None)
+                if x is not None:
+                    n_eeg_raw = int(x.shape[0])
+                    frames_eeg = _frames_from_eeg(x)
 
         except Exception as exc:
             self.logger.error(f"_extract_time_series_both error: {exc}")
@@ -1856,8 +1664,8 @@ class BrainVisualizationServer:
             "fmri":           frames_fmri,
             "eeg":            frames_eeg,
             "modalities":     modalities,
-            "n_fmri_regions": n_fmri_raw,   # e.g. 200 (direct mapping)
-            "n_eeg_channels": n_eeg_raw,    # e.g. 64 or 128 (interpolated to 200)
+            "n_fmri_regions": n_fmri_raw,
+            "n_eeg_channels": n_eeg_raw,
         }
 
     def _extract_activity_array(self, result: Dict) -> list:
