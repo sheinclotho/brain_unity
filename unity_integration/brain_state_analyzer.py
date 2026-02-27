@@ -60,6 +60,48 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache for Fibonacci brain-region coordinates.
+# Computed once on first call to ``BrainStateAnalyzer.ec_vs_distance_correlation``
+# and reused on subsequent calls to avoid repeated trigonometric work.
+_POSITIONS_CACHE: Optional[np.ndarray] = None
+
+
+def _get_cached_positions(n: int = 200) -> np.ndarray:
+    """Return module-level cached (n, 3) Fibonacci brain positions.
+
+    The positions are computed via ``_compute_fibonacci_positions`` on the
+    first call, then stored in ``_POSITIONS_CACHE`` and reused on every
+    subsequent call with the same ``n``.  If ``n`` changes the cache is
+    invalidated and recomputed.
+
+    This avoids repeating 200 trigonometric operations on every call to
+    ``ec_vs_distance_correlation``.
+    """
+    global _POSITIONS_CACHE
+    if _POSITIONS_CACHE is None or _POSITIONS_CACHE.shape[0] != n:
+        _POSITIONS_CACHE = _compute_fibonacci_positions(n)
+    return _POSITIONS_CACHE
+
+
+def _compute_fibonacci_positions(n: int = 200) -> np.ndarray:
+    """Compute Fibonacci-sphere brain region positions matching app.js."""
+    half   = n // 2
+    golden = 2 * np.pi * (2 - (1 + np.sqrt(5)) / 2)
+    pos    = np.zeros((n, 3), dtype=np.float32)
+    for h in range(2):
+        sign = -1 if h == 0 else 1
+        for i in range(half):
+            t_     = (i + 0.5) / half
+            el     = 1.0 - 1.85 * t_
+            r_     = np.sqrt(max(0.0, 1 - el * el))
+            az     = golden * i
+            lat    = abs(r_ * np.cos(az)) * 0.85 + 0.15
+            bulge  = 9 * np.exp(-((el + 0.22) ** 2) * 5)
+            idx    = h * half + i
+            pos[idx] = [sign * (lat * 55 + bulge + 9),
+                        el * 63 - 4, r_ * np.sin(az) * 76 - 8]
+    return pos
+
 
 class BrainStateAnalyzer:
     """
@@ -460,21 +502,8 @@ class BrainStateAnalyzer:
         N = ec_matrix.shape[0]
 
         if positions is None:
-            # Reproduce the same Fibonacci positions used in the 3D viewer
-            golden = 2 * np.pi * (2 - (1 + np.sqrt(5)) / 2)
-            pos    = np.zeros((N, 3), dtype=np.float32)
-            for h in range(2):
-                sign = -1 if h == 0 else 1
-                for i in range(100):
-                    t_  = (i + 0.5) / 100.0
-                    el  = 1.0 - 1.85 * t_
-                    r_  = np.sqrt(max(0.0, 1 - el * el))
-                    az  = golden * i
-                    lat = abs(r_ * np.cos(az)) * 0.85 + 0.15
-                    bulge = 9 * np.exp(-((el + 0.22) ** 2) * 5)
-                    idx = h * 100 + i
-                    pos[idx] = [sign * (lat * 55 + bulge + 9),
-                                el * 63 - 4, r_ * np.sin(az) * 76 - 8]
+            # Use the module-level cached Fibonacci positions (computed once).
+            pos = _get_cached_positions(N)
         else:
             pos = np.array(positions, dtype=np.float32)
 
