@@ -203,14 +203,13 @@ class PerturbationAnalyzer:
                 "建议检查原始数据质量。"
             )
             time_series = time_series.copy().astype(np.float32)
-            # Replace NaN/Inf per column with the column finite mean (or 0 if all bad)
-            for col in range(time_series.shape[1]):
-                col_data = time_series[:, col]
-                bad_mask = ~np.isfinite(col_data)
-                if bad_mask.any():
-                    good_vals = col_data[~bad_mask]
-                    fill = float(good_vals.mean()) if len(good_vals) > 0 else 0.0
-                    time_series[bad_mask, col] = fill
+            # Replace NaN/Inf per column with the column finite mean (or 0 if all bad).
+            # Vectorized: no Python loop over columns.
+            bad_mask  = ~np.isfinite(time_series)                            # (T, N)
+            good_sum  = np.where(~bad_mask, time_series, 0.0).sum(axis=0, keepdims=True)  # (1, N)
+            n_good    = (~bad_mask).sum(axis=0, keepdims=True).astype(np.float32)         # (1, N)
+            col_means = np.where(n_good > 0, good_sum / np.maximum(n_good, 1.0), 0.0)    # (1, N)
+            time_series = np.where(bad_mask, col_means, time_series)
 
         # Z-score 标准化使训练更稳定
         ts_mean = time_series.mean(axis=0, keepdims=True)
@@ -348,22 +347,40 @@ class PerturbationAnalyzer:
             input_X = input_X[:n_samples]
 
         N = self.n_regions
+        M = len(input_X)
         model.eval()
         ec = np.zeros((N, N), dtype=np.float32)
 
-        with torch.no_grad():
-            X_t = torch.tensor(input_X, dtype=torch.float32, device=self.device)
-            baseline = model(X_t).cpu().numpy()  # (M, N)
+        # Chunked batched perturbation: process CHUNK_SIZE source regions at once.
+        # This replaces N=200 serial forward passes (each on M samples) with
+        # ceil(N / CHUNK_SIZE) batched passes (each on CHUNK_SIZE × M samples),
+        # reducing PyTorch kernel-launch overhead by ~(N / CHUNK_SIZE) times.
+        # Memory: CHUNK_SIZE × M × (N*n_lags) float32 ≈ 32×400×1000×4 = 51 MB (safe).
+        CHUNK_SIZE = 32
 
-            for j in range(N):
-                # 仅扰动最近一步中区域 j 的值（对应 input 的最后 N 列中的列 j）
-                X_pert = X_t.clone()
-                X_pert[:, -N + j] += pert_strength
-                perturbed = model(X_pert).cpu().numpy()   # (M, N)
-                ec[j] = (perturbed - baseline).mean(axis=0) / pert_strength
+        with torch.no_grad():
+            X_t      = torch.tensor(input_X, dtype=torch.float32, device=self.device)
+            baseline = model(X_t).cpu().numpy()   # (M, N)
+
+            for chunk_start in range(0, N, CHUNK_SIZE):
+                chunk_end = min(chunk_start + CHUNK_SIZE, N)
+                chunk_n   = chunk_end - chunk_start   # number of perturbations in this batch
+
+                # Build (chunk_n * M, N*n_lags) batched perturbed input.
+                # Each of the chunk_n blocks is a copy of X_t with one column perturbed.
+                X_batch = X_t.unsqueeze(0).expand(chunk_n, M, -1).reshape(chunk_n * M, -1).clone()
+                # Apply perturbation: block k perturbs source region (chunk_start + k)
+                for k, j in enumerate(range(chunk_start, chunk_end)):
+                    X_batch[k * M:(k + 1) * M, -N + j] += pert_strength
+
+                perturbed = model(X_batch).reshape(chunk_n, M, N)  # (chunk_n, M, N)
+                # ec[j] = mean over M samples of (perturbed - baseline) / pert_strength
+                baseline_t = torch.tensor(baseline, dtype=torch.float32).unsqueeze(0)  # (1, M, N)
+                diff = (perturbed - baseline_t.expand(chunk_n, -1, -1)).mean(dim=1)    # (chunk_n, N)
+                ec[chunk_start:chunk_end] = (diff / pert_strength).cpu().numpy()
 
         self._last_ec = ec
-        logger.info("有限差分 EC 推断完成 (NPI 方法)")
+        logger.info("有限差分 EC 推断完成 (NPI 方法, 批量推断)")
         return ec
 
     # ── EC inference — Jacobian via autograd ────────────────────────────────
@@ -422,9 +439,10 @@ class PerturbationAnalyzer:
             # lag, matching the standard VAR / Granger definition:
             #   GC[j→i] = Σ_{l=1}^{n_lags} A_l[i,j]
             # Each block is (N_out, N_in); we sum them to get total causal influence.
-            J_sum = np.zeros((N, N), dtype=np.float64)
-            for l in range(n_lags):
-                J_sum += J[:, l * N: (l + 1) * N]
+            # Vectorized: reshape J into (N_out, n_lags, N_in) and sum over lag axis,
+            # replacing the Python loop over n_lags with a single NumPy reduction.
+            J_3d  = J.reshape(N, n_lags, N).astype(np.float64)  # (N_out, n_lags, N_in)
+            J_sum = J_3d.sum(axis=1)                             # (N_out, N_in)
             # Transpose so ec[src, tgt] = influence of src on tgt
             per_sample_ec.append(J_sum.T)
 
