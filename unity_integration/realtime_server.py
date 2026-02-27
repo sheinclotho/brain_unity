@@ -431,7 +431,35 @@ class BrainVisualizationServer:
         try:
             import torch
             import numpy as np
-            
+
+            def _compute_top_affected(frames, cf_frames, peak_idx, target_ids, top_k=15):
+                """Return top affected non-target regions and the per-region delta array.
+
+                Compares stimulated vs counterfactual frames at ``peak_idx`` to find
+                the regions that changed most due to stimulation.  Target regions are
+                excluded so the list highlights PROPAGATION to other areas.
+
+                Returns:
+                    top_affected : list of {"region_id": int, "delta": float} dicts,
+                                   sorted by |delta| descending, length ≤ top_k
+                    peak_delta   : list of 200 floats (stim − CF at peak_idx)
+                """
+                safe_peak = min(peak_idx, len(frames) - 1, len(cf_frames) - 1)
+                if not frames or not cf_frames or safe_peak < 0:
+                    return [], []
+                stim_act = np.array(frames[safe_peak]["activity"], dtype=np.float32)
+                cf_act   = np.array(cf_frames[safe_peak]["activity"], dtype=np.float32)
+                delta    = stim_act - cf_act
+                target_set = set(target_ids)
+                # Exclude target regions — we want to highlight PROPAGATION effects
+                candidates = [i for i in range(len(delta)) if i not in target_set]
+                candidates_sorted = sorted(candidates, key=lambda i: -abs(delta[i]))
+                top_affected = [
+                    {"region_id": int(i), "delta": float(delta[i])}
+                    for i in candidates_sorted[:top_k]
+                ]
+                return top_affected, delta.tolist()
+
             # Parse stimulation parameters
             target_regions = stimulation.get("target_regions", [])
             amplitude = stimulation.get("amplitude", 0.5)
@@ -552,6 +580,9 @@ class BrainVisualizationServer:
                     _ms_peak_k = max(0, _ms_dur * 3 // 4)
                 else:  # sine, constant
                     _ms_peak_k = _ms_dur // 2
+                ms_top_affected, ms_peak_delta = _compute_top_affected(
+                    frames, cf_frames, _ms_peak_k, valid_regions
+                )
                 return {
                     "type": "simulation_result",
                     "success": True,
@@ -561,6 +592,8 @@ class BrainVisualizationServer:
                     "modality": "simulation",
                     "method": "model_server",
                     "start_frame": _ms_peak_k,
+                    "top_affected": ms_top_affected,
+                    "peak_delta": ms_peak_delta,
                     "saved_to": str(stim_output_dir),
                     "index_file": str(index_path),
                 }
@@ -669,6 +702,10 @@ class BrainVisualizationServer:
                     _s_peak_k = max(0, DUR_s * 3 // 4)
                 else:
                     _s_peak_k = DUR_s // 2
+                _s_peak_idx = PRE_s + _s_peak_k
+                s_top_affected, s_peak_delta = _compute_top_affected(
+                    surrogate_frames, surrogate_cf, _s_peak_idx, valid_regions
+                )
                 return {
                     "type": "simulation_result",
                     "success": True,
@@ -677,7 +714,9 @@ class BrainVisualizationServer:
                     "counterfactual_frames": surrogate_cf,
                     "modality": "simulation",
                     "method": "surrogate_mlp",
-                    "start_frame": PRE_s + _s_peak_k,
+                    "start_frame": _s_peak_idx,
+                    "top_affected": s_top_affected,
+                    "peak_delta": s_peak_delta,
                 }
 
             # Final fallback: Wilson-Cowan recurrent dynamics (no trained model needed).
@@ -735,6 +774,10 @@ class BrainVisualizationServer:
             else:
                 # sine and constant: bell/plateau centre gives maximum effect
                 _peak_k = _wc_dur // 2
+            _wc_peak_idx = _WC_PRE + _peak_k
+            top_affected, peak_delta = _compute_top_affected(
+                frames, cf_frames, _wc_peak_idx, valid_regions
+            )
             return {
                 "type": "simulation_result",
                 "success": True,
@@ -743,7 +786,9 @@ class BrainVisualizationServer:
                 "counterfactual_frames": cf_frames,
                 "modality": "simulation",
                 "method": "wilson_cowan",
-                "start_frame": _WC_PRE + _peak_k,
+                "start_frame": _wc_peak_idx,
+                "top_affected": top_affected,
+                "peak_delta": peak_delta,
             }
                 
         except Exception as e:
@@ -1206,6 +1251,20 @@ class BrainVisualizationServer:
             if 0 <= tid < n_regions:
                 d = np.linalg.norm(positions - positions[tid], axis=1)
                 spread_weights += np.exp(-(d ** 2) / (2 * _SPREAD_SIGMA_MM ** 2))
+        # Homotopic (callosal) activation: stimulating one hemisphere also weakly
+        # excites the contralateral homologous region via corpus callosum.
+        # Region 0-99 = left hemisphere; 100-199 = right hemisphere.
+        # This produces visible bilateral propagation in the demo without adding
+        # a full W matrix.  Strength 0.40 matches typical callosal coupling ratios.
+        _HOMO_STRENGTH = 0.40
+        for tid in target_regions:
+            if 0 <= tid < n_regions:
+                homo_id = tid + 100 if tid < 100 else tid - 100
+                if 0 <= homo_id < n_regions:
+                    d = np.linalg.norm(positions - positions[homo_id], axis=1)
+                    spread_weights += _HOMO_STRENGTH * np.exp(
+                        -(d ** 2) / (2 * _SPREAD_SIGMA_MM ** 2)
+                    )
         # Normalise: peak = amplitude at target, falls off with distance
         if spread_weights.max() > 0:
             spread_weights /= spread_weights.max()
