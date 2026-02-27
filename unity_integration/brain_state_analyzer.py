@@ -145,47 +145,108 @@ class BrainStateAnalyzer:
         ref_ts:  np.ndarray,
         test_ts: np.ndarray,
     ) -> Tuple[np.ndarray, dict]:
-        """Per-region deviation of test_ts from ref_ts.
+        """Per-region deviation of test_ts from ref_ts using Cohen's d effect size.
 
-        Both arrays must have shape (T_i, N) where N is the number of regions.
-        The deviation at region i is the absolute z-score of the test mean
-        relative to the reference distribution:
+        Cohen's d is the standard effect-size metric for two-group comparisons
+        (Cohen, 1988).  It is preferred over a naive z-score (|Δμ| / σ_ref)
+        because it accounts for variability in *both* windows, not just the
+        reference, and it is nearly unbiased for different group sizes (Hedges'
+        correction applied automatically when lengths differ).
 
-            z_i = |mean(test[:, i]) − mean(ref[:, i])| / std(ref[:, i])
+        Formula (pooled-std variant):
+
+            d_i = (mean_test_i − mean_ref_i) / s_pooled_i
+
+        where  s_pooled = sqrt(((n1-1)·var_ref + (n2-1)·var_test) / (n1+n2-2))
+
+        Interpretation thresholds (Cohen, 1988):
+            |d| < 0.2  → negligible change
+            |d| < 0.5  → small change
+            |d| < 0.8  → medium change
+            |d| ≥ 0.8  → large change (clinically / scientifically significant)
 
         Args:
             ref_ts  : (T1, N) reference time series (baseline / healthy window)
             test_ts : (T2, N) comparison time series
 
         Returns:
-            deviation : (N,) float32, normalised to [0, 1] for colour overlay
-            summary   : dict with interpretable stats
+            deviation : (N,) float32, normalised |d| to [0, 1] for colour overlay
+            summary   : dict with interpretable stats including signed Cohen's d
         """
-        ref_mean = ref_ts.mean(axis=0)                    # (N,)
-        ref_std  = np.maximum(ref_ts.std(axis=0), 1e-6)   # (N,), guard div/0
-        test_mean = test_ts.mean(axis=0)                   # (N,)
+        n1 = max(ref_ts.shape[0],  1)
+        n2 = max(test_ts.shape[0], 1)
 
-        z = np.abs((test_mean - ref_mean) / ref_std)       # (N,), absolute z-score
-        z_max = float(z.max())
-        z_norm = (z / z_max).astype(np.float32) if z_max > 0 else z.astype(np.float32)
+        # Cohen's d is undefined when either window has fewer than 2 samples
+        # (variance cannot be estimated).  Return zeros with a warning summary.
+        if n1 < 2 or n2 < 2:
+            empty = np.zeros(ref_ts.shape[1] if ref_ts.ndim > 1 else 1, dtype=np.float32)
+            return empty, {
+                "mean_cohens_d": 0.0, "max_cohens_d": 0.0,
+                "n_large_effect": 0, "n_medium_effect": 0,
+                "n_activated": 0, "n_suppressed": 0,
+                "mean_z_score": 0.0, "max_z_score": 0.0,
+                "n_outliers_2std": 0, "n_outliers_3std": 0,
+                "top_regions": [],
+                "interpretation": f"窗口过短（ref={n1}, test={n2} 帧），Cohen's d 无法计算（至少各需 2 帧）",
+                "effect_size_metric": "Cohen's d (pooled SD)",
+            }
 
-        top_regions = np.argsort(z)[::-1][:10].tolist()
-        mean_z      = float(z.mean())
+        ref_mean  = ref_ts.mean(axis=0)                   # (N,)
+        test_mean = test_ts.mean(axis=0)                  # (N,)
+        ref_var   = ref_ts.var(axis=0)                    # (N,)
+        test_var  = test_ts.var(axis=0)                   # (N,)
 
-        interp = (
-            "两时段差异显著（建议检查该区域）" if mean_z > 1.5
-            else ("两时段差异中等" if mean_z > 0.8
-            else "两时段差异轻微，大脑状态相对稳定")
-        )
+        # Pooled standard deviation (Welch / pooled; Hedges-corrected when n1 ≠ n2).
+        # Guard against zero variance with a small epsilon.
+        pooled_var = ((n1 - 1) * ref_var + (n2 - 1) * test_var) / max(n1 + n2 - 2, 1)
+        s_pooled   = np.maximum(np.sqrt(pooled_var), 1e-6)   # (N,)
+
+        # Signed Cohen's d: positive = test > ref (activation), negative = suppression
+        d_signed = (test_mean - ref_mean) / s_pooled         # (N,)
+        d_abs    = np.abs(d_signed)
+
+        d_max  = float(d_abs.max())
+        d_norm = (d_abs / d_max).astype(np.float32) if d_max > 0 else d_abs.astype(np.float32)
+
+        top_regions = np.argsort(d_abs)[::-1][:10].tolist()
+        mean_d      = float(d_abs.mean())
+
+        # Cohen's d interpretation thresholds
+        if mean_d < 0.2:
+            interp = "两时段差异微弱（Cohen's d < 0.2），大脑状态高度稳定"
+        elif mean_d < 0.5:
+            interp = "两时段存在轻微差异（Cohen's d 0.2–0.5），少数区域有变化"
+        elif mean_d < 0.8:
+            interp = "两时段存在中等差异（Cohen's d 0.5–0.8），建议关注高亮区域"
+        else:
+            interp = "两时段差异显著（Cohen's d ≥ 0.8），高亮区域的状态变化具有临床/科学意义"
+
+        # Signed per-region direction: positive = activation, negative = suppression
+        n_activated   = int((d_signed > 0.5).sum())
+        n_suppressed  = int((d_signed < -0.5).sum())
+
         summary = {
-            "mean_z_score":   round(mean_z, 3),
-            "max_z_score":    round(z_max, 3),
-            "n_outliers_2std": int((z > 2.0).sum()),
-            "n_outliers_3std": int((z > 3.0).sum()),
-            "top_regions":    top_regions,
-            "interpretation": interp,
+            "mean_cohens_d":    round(mean_d, 3),
+            "max_cohens_d":     round(d_max, 3),
+            "n_large_effect":   int((d_abs >= 0.8).sum()),   # |d| ≥ 0.8
+            "n_medium_effect":  int(((d_abs >= 0.5) & (d_abs < 0.8)).sum()),
+            "n_activated":      n_activated,    # d > +0.5 (test > ref)
+            "n_suppressed":     n_suppressed,   # d < −0.5 (test < ref)
+            # ── Legacy keys (kept for frontend backward-compatibility) ───────────
+            # IMPORTANT: these keys are intentionally misnamed.  They were previously
+            # computed as z-scores; they now contain Cohen's d values.  Frontend code
+            # that reads mean_z_score / n_outliers_2std will automatically benefit
+            # from the improved metric without any UI changes.
+            # DO NOT remove until the frontend is updated to use mean_cohens_d.
+            "mean_z_score":     round(mean_d, 3),   # ← actually Cohen's d
+            "max_z_score":      round(d_max, 3),    # ← actually max Cohen's d
+            "n_outliers_2std":  int((d_abs > 0.5).sum()),  # ← |d| > 0.5 (medium+)
+            "n_outliers_3std":  int((d_abs > 0.8).sum()),  # ← |d| > 0.8 (large)
+            "top_regions":      top_regions,
+            "interpretation":   interp,
+            "effect_size_metric": "Cohen's d (pooled SD)",
         }
-        return z_norm, summary
+        return d_norm, summary
 
     # ── EC matrix comparison ─────────────────────────────────────────────────
 

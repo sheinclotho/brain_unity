@@ -1016,7 +1016,7 @@ function clearECViz() {
   });
 }
 
-function drawECLines(topSources, topTargets, ecFlat, n) {
+function drawECLines(topSources, topTargets, ecFlat, n, ecStdFlat) {
   clearECViz();
   if (!ecFlat) return;
 
@@ -1037,10 +1037,25 @@ function drawECLines(topSources, topTargets, ecFlat, n) {
       const pts = new Float32Array([p0.x, p0.y, p0.z, p1.x, p1.y, p1.z]);
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+
+      // When per-edge uncertainty (ec_std_flat) is available, reduce opacity for
+      // edges where std is large relative to mean (coefficient of variation > 1).
+      // High CV = the connection is inconsistent across brain states → less reliable.
+      let opacity = Math.min(0.75, weight * 1.5);
+      if (ecStdFlat) {
+        const edgeStd = ecStdFlat[rowStart + dst];
+        const cv = weight > 1e-6 ? edgeStd / weight : 0;  // coefficient of variation
+        // CV_OPACITY_PENALTY controls how aggressively uncertain edges are faded.
+        // 0.6 = at CV=1 (std equals mean), opacity is reduced to 40% of its base value.
+        // Edges with CV>1 are extremely state-dependent and barely visible.
+        const CV_OPACITY_PENALTY = 0.6;
+        opacity *= Math.max(0.2, 1.0 - Math.min(cv, 1.0) * CV_OPACITY_PENALTY);
+      }
+
       const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
         color: EC_LINE_COLOR,
         transparent: true,
-        opacity: Math.min(0.75, weight * 1.5),
+        opacity,
       }));
       scene.add(line);
       ecLines.push(line);
@@ -1075,7 +1090,7 @@ function handleECResult(msg) {
   ecActivityDelta = msg.activity_delta|| null;
 
   const n = msg.n_regions || 200;
-  drawECLines(ecTopSources, ecTopTargets, msg.ec_flat, n);
+  drawECLines(ecTopSources, ecTopTargets, msg.ec_flat, n, msg.ec_std_flat || null);
 
   // Show activity delta overlay
   if (ecActivityDelta) updateActivity(ecActivityDelta);
