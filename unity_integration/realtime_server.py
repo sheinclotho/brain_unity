@@ -274,6 +274,8 @@ class BrainVisualizationServer:
                 return await self.handle_validate_ec(request)
             elif request_type == "analyze_brain":
                 return await self.handle_analyze_brain(request)
+            elif request_type == "compute_response_matrix":
+                return await self.handle_compute_response_matrix(request)
             else:
                 self.logger.warning(f"Unknown request type: {request_type}")
                 return {
@@ -1096,6 +1098,164 @@ class BrainVisualizationServer:
             }
         except Exception as exc:
             return {"type": "error", "message": f"偏差分析失败: {exc}"}
+
+    # ------------------------------------------------------------------ #
+    #  Rollout-based response matrix                                       #
+    # ------------------------------------------------------------------ #
+
+    async def handle_compute_response_matrix(
+        self, request: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Compute perturbation-based response matrix R[i,j,k].
+
+        For each stimulated region i, runs a rollout WITH sustained injection
+        and one WITHOUT (baseline), then records ΔX(t) = X_stim(t) - X_base(t).
+        Returns the mean response matrix, temporal profile, and analysis metrics.
+
+        Requires a trained surrogate (run ``infer_ec`` first).
+
+        Request fields:
+            initial_state   : list[float] length N — current brain state (required)
+            stim_regions    : list[int] (optional; defaults to top-10 EC sources)
+            rollout_steps   : int 5–100 (default 20)
+            sustained_steps : int 1–rollout_steps (default 5)
+            alpha           : float 0.05–1.0 (default 0.3) — z-score perturbation
+            mode            : "sustained" | "impulse" (default "sustained")
+            run_validation  : bool (default False) — self-consistency check
+
+        Response type: "response_matrix_result"
+        """
+        try:
+            import numpy as np
+            from .perturbation_analyzer import PerturbationAnalyzer
+
+            initial_state = request.get("initial_state")
+            if initial_state is None:
+                return {
+                    "type":    "error",
+                    "success": False,
+                    "message": "initial_state is required for compute_response_matrix",
+                }
+
+            n_regions = 200
+            init_arr  = np.array(initial_state[:n_regions], dtype=np.float32)
+
+            rollout_steps   = max(5, min(100, int(request.get("rollout_steps",   20))))
+            sustained_steps = max(1, min(rollout_steps,
+                                        int(request.get("sustained_steps", 5))))
+            alpha           = float(max(0.05, min(1.0, request.get("alpha", 0.3))))
+            mode            = str(request.get("mode", "sustained"))
+            if mode not in ("sustained", "impulse"):
+                mode = "sustained"
+            run_validation  = bool(request.get("run_validation", False))
+
+            if not self._ec_analyzer_cache:
+                return {
+                    "type":    "error",
+                    "success": False,
+                    "message": (
+                        "代理模型未训练，请先运行 '推断有效连接' (infer_ec) "
+                        "以训练代理模型。"
+                    ),
+                }
+
+            analyzer = list(self._ec_analyzer_cache.values())[-1]
+            if analyzer._surrogate is None:
+                return {
+                    "type":    "error",
+                    "success": False,
+                    "message": "代理模型未就绪，请先运行 '推断有效连接'。",
+                }
+
+            # Default stim_regions: top-10 EC sources when EC is available,
+            # otherwise fall back to the first 10 regions.
+            stim_regions = request.get("stim_regions")
+            if stim_regions is None:
+                if analyzer._last_ec is not None:
+                    stim_regions = analyzer.suggest_targets(
+                        n_targets=10, strategy="outgoing"
+                    )
+                else:
+                    stim_regions = list(range(min(10, n_regions)))
+            stim_regions = [
+                int(r) for r in stim_regions if 0 <= int(r) < n_regions
+            ]
+
+            result = analyzer.compute_response_matrix(
+                initial_state=init_arr,
+                stim_regions=stim_regions,
+                rollout_steps=rollout_steps,
+                sustained_steps=sustained_steps,
+                alpha=alpha,
+                mode=mode,
+            )
+
+            R        = result["R"]   # (n_stim, N, T)
+            analysis = PerturbationAnalyzer.analyze_response_matrix(
+                R, stim_regions, N=n_regions
+            )
+
+            # Build (N, N) mean response matrix for frontend visualisation.
+            # R_mean[i, j] = peak |ΔX_j| when stimulating region i, normalised
+            # to [0, 1] so the frontend draw-threshold is meaningful.
+            R_peak = np.abs(R).max(axis=2)   # (n_stim, N) — peak response
+            R_mean_NxN = np.zeros((n_regions, n_regions), dtype=np.float32)
+            for idx, ri in enumerate(stim_regions):
+                R_mean_NxN[ri, :] = R_peak[idx]
+            r_max = float(R_mean_NxN.max())
+            if r_max > 1e-9:
+                R_mean_NxN /= r_max
+
+            # Temporal profile: mean |ΔX| across all stim regions and regions
+            r_time_profile = np.abs(R).mean(axis=(0, 1)).tolist()   # (T,)
+
+            # Optional self-consistency validation
+            validation_result = None
+            if run_validation and self._loaded_time_series is not None:
+                ts  = self._loaded_time_series   # (T_data, 200)
+                n_t = len(ts)
+                if n_t >= 3:
+                    # Pick three distinct, evenly spaced timepoints as initial states.
+                    # Requiring n_t >= 3 ensures no duplicates (with step = n_t//3,
+                    # the indices 0, step, 2*step are always distinct when n_t ≥ 3).
+                    step = n_t // 3
+                    seed_indices = [0, step, min(2 * step, n_t - 1)]
+                    seed_states = [ts[i] for i in seed_indices]
+                    validation_result = analyzer.validate_response_matrix(
+                        initial_states=[s.astype(np.float32) for s in seed_states],
+                        stim_regions=stim_regions,
+                        rollout_steps=rollout_steps,
+                        sustained_steps=sustained_steps,
+                        alpha=alpha,
+                        mode=mode,
+                    )
+
+            self.logger.info(
+                "compute_response_matrix: %d stim regions, T=%d, "
+                "spatial_spread=%.3f, temporal_decay=%.4f",
+                len(stim_regions), rollout_steps,
+                analysis["spatial_spread"], analysis["temporal_decay"],
+            )
+
+            return {
+                "type":           "response_matrix_result",
+                "success":        True,
+                "R_mean":         R_mean_NxN.flatten().tolist(),
+                "R_time_profile": r_time_profile,
+                "stim_regions":   stim_regions,
+                "analysis":       analysis,
+                "validation":     validation_result,
+                "n_frames":       rollout_steps,
+                "mode":           mode,
+                "alpha":          alpha,
+            }
+        except Exception as exc:
+            self.logger.exception("handle_compute_response_matrix 出错")
+            return {
+                "type":    "error",
+                "success": False,
+                "message": str(exc),
+            }
 
     def _generate_demo_time_series(self, T: int = 300) -> "np.ndarray":
         """Generate synthetic 200-region time series using 7-network oscillators.

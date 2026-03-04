@@ -192,6 +192,7 @@ function activityColor(v) {
 }
 
 function updateActivity(arr, rawArr) {
+  let sum = 0, sum2 = 0;
   for (let i = 0; i < regionMeshes.length; i++) {
     const m  = regionMeshes[i];
     const v  = Math.max(0, Math.min(1, arr[i] ?? 0.2));
@@ -201,7 +202,17 @@ function updateActivity(arr, rawArr) {
     m.material.color.copy(c);
     m.material.emissive.setRGB(c.r * 0.22, c.g * 0.22, c.b * 0.22);
     m.scale.setScalar(m.userData.selected ? 1.6 : 0.65 + v * 0.60);
+    sum  += v;
+    sum2 += v * v;
   }
+  // Update per-frame stats in the status card
+  const n    = regionMeshes.length;
+  const mean = sum / n;
+  const std  = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
+  const statMean = document.getElementById('stat-mean');
+  const statStd  = document.getElementById('stat-std');
+  if (statMean) statMean.textContent = mean.toFixed(3);
+  if (statStd)  statStd.textContent  = std.toFixed(3);
 }
 
 // ── Orbit Controls ────────────────────────────────────────────────────────────
@@ -470,6 +481,11 @@ function handleMsg(msg) {
     handleBrainAnalysisResult(msg);
     return;
   }
+  // Response matrix result
+  if (msg.type === 'response_matrix_result') {
+    handleResponseMatrixResult(msg);
+    return;
+  }
   // Server greeting
   if (msg.type === 'welcome') {
     document.getElementById('status-text').textContent =
@@ -681,6 +697,7 @@ function playSeq() {
   clearInterval(playTimer);
   isPlaying = true;
   btnPlay.textContent = '⏸';
+  let _prevAct = null;  // for identical-frame diagnostic
   playTimer = setInterval(() => {
     if (!frameSeq.length) return;
     curFrame = (curFrame + 1) % frameSeq.length;
@@ -688,7 +705,23 @@ function playSeq() {
     if (!viewingSimulation) origCurFrame = curFrame;
     slider.value = curFrame;
     updateFrameLabel();
-    updateActivity(frameSeq[curFrame].activity, frameSeq[curFrame].raw);
+    const act = frameSeq[curFrame].activity;
+    updateActivity(act, frameSeq[curFrame].raw);
+    // Identical-frame diagnostic: warn once if consecutive frames are bit-identical.
+    // This catches regressions where the WC model / surrogate collapses to a fixed point.
+    if (_prevAct && act.length === _prevAct.length) {
+      let maxDiff = 0;
+      for (let k = 0; k < act.length; k++) maxDiff = Math.max(maxDiff, Math.abs(act[k] - _prevAct[k]));
+      if (maxDiff < 1e-7) {
+        console.warn(`[TwinBrain] Frame ${curFrame}: identical to previous frame (maxDiff<1e-7). ` +
+          'Possible fixed-point attractor or static initialisation bug.');
+        _prevAct = null;  // suppress repeated warnings
+      } else {
+        _prevAct = act;
+      }
+    } else {
+      _prevAct = act;
+    }
   }, 100);   // 10 fps
 }
 
@@ -714,6 +747,9 @@ document.getElementById('amplitude').addEventListener('input', e => {
 });
 document.getElementById('frequency').addEventListener('input', e => {
   document.getElementById('freq-val').textContent = e.target.value;
+});
+document.getElementById('duration').addEventListener('input', e => {
+  document.getElementById('dur-val').textContent = e.target.value;
 });
 
 document.getElementById('btn-stim').addEventListener('click', () => {
@@ -772,7 +808,7 @@ document.getElementById('btn-stim').addEventListener('click', () => {
       type: "simulate",
       target_regions: targets,
       amplitude, pattern, frequency,
-      duration: 60,
+      duration: parseInt(document.getElementById('duration').value) || 60,
       initial_state,
     }));
   } else {
@@ -809,7 +845,9 @@ document.getElementById('btn-stim').addEventListener('click', () => {
     //   leak  = (v - act0[i]) * 0.10         — restores to act0 in ~10 steps
     // Without stimulation: v stays at act0 (zero deviation → zero leak).
     // With stimulation:    target rises above act0; recovers after stim ends.
-    const PRE = 5, DUR = 20, POST = 5;
+    const PRE = 5;
+    const DUR = Math.max(5, Math.min(120, parseInt(document.getElementById('duration').value) || 60));
+    const POST = 5;
     const localFrames = [];
     let curr = act0.slice();
 
@@ -1113,8 +1151,13 @@ function handleECResult(msg) {
   // Show activity delta overlay
   if (ecActivityDelta) updateActivity(ecActivityDelta);
 
-  // Enable "刺激推荐靶点" button
+  // Enable "刺激推荐靶点" and "响应矩阵分析" buttons.
+  // Response matrix requires a usable surrogate — enable only when ecTopSources
+  // is populated (meaning EC inference actually produced results).
   document.getElementById('btn-ec-stim').disabled = false;
+  if (ecTopSources.length > 0) {
+    document.getElementById('btn-response-matrix').disabled = false;
+  }
   document.getElementById('btn-hide-ec').style.display = '';
 
   // Build status string — include surrogate reliability when available
@@ -1398,6 +1441,131 @@ function handleBrainAnalysisResult(msg) {
     });
   }
 }
+
+// ── Response Matrix Analysis ───────────────────────────────────────────────────
+document.getElementById('rm-rollout-steps').addEventListener('input', e => {
+  document.getElementById('rm-steps-val').textContent = e.target.value;
+});
+document.getElementById('rm-alpha').addEventListener('input', e => {
+  document.getElementById('rm-alpha-val').textContent = parseFloat(e.target.value).toFixed(2);
+});
+
+document.getElementById('btn-response-matrix').addEventListener('click', () => {
+  if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
+    document.getElementById('rm-status').textContent = '⚠ 需要后端连接';
+    return;
+  }
+  // Use the same initial_state logic as btn-stim: real data preferred
+  let initial_state;
+  if (origFrames.length > 0) {
+    const srcIdx = Math.min(origCurFrame, origFrames.length - 1);
+    initial_state = origFrames[srcIdx].activity;
+  } else if (frameSeq.length > 0) {
+    initial_state = frameSeq[curFrame].activity;
+  } else {
+    initial_state = regionMeshes.map(m => m.userData.activity);
+  }
+
+  const mode          = document.getElementById('rm-mode').value;
+  const rollout_steps = parseInt(document.getElementById('rm-rollout-steps').value) || 20;
+  const alpha         = parseFloat(document.getElementById('rm-alpha').value) || 0.3;
+
+  document.getElementById('rm-status').textContent = '计算中（可能需要数秒）…';
+  document.getElementById('btn-response-matrix').disabled = true;
+
+  ws.send(JSON.stringify({
+    type: 'compute_response_matrix',
+    initial_state,
+    mode,
+    rollout_steps,
+    alpha,
+    // run_validation requires at least 3 × rollout_steps real data frames so the
+    // three seed states are genuinely distinct and the pairwise Pearson r is meaningful.
+    run_validation: origFrames.length >= rollout_steps * 3,
+  }));
+});
+
+function handleResponseMatrixResult(msg) {
+  const el  = document.getElementById('rm-status');
+  const btn = document.getElementById('btn-response-matrix');
+  btn.disabled = false;
+
+  if (!msg.success) {
+    el.textContent = `⚠ ${msg.message || '分析失败'}`;
+    return;
+  }
+
+  const a = msg.analysis || {};
+
+  // Overlay mean_response_map on 3D brain: shows how much each region was affected
+  // on average across all stimulated regions and time steps.
+  if (Array.isArray(a.mean_response_map) && a.mean_response_map.length >= N_REGIONS) {
+    updateActivity(a.mean_response_map.slice(0, N_REGIONS));
+    setModalityBadge('R̄ 响应');
+  }
+
+  // Build status summary
+  const spread  = a.spatial_spread !== undefined ? `${(a.spatial_spread * 100).toFixed(0)}%` : '?';
+  const decay   = a.temporal_decay  !== undefined ? a.temporal_decay.toFixed(4) : '?';
+  const offDiag = a.off_diagonal_ratio !== undefined ? a.off_diagonal_ratio.toFixed(3) : '?';
+
+  const validLine = msg.validation
+    ? `一致性 r=${(msg.validation.consistency_r || 0).toFixed(3)} ${msg.validation.reliable ? '✓' : '⚠'}<br/>`
+    : '';
+
+  el.innerHTML =
+    `<strong>响应矩阵完成</strong> | 刺激区: ${msg.stim_regions ? msg.stim_regions.length : '?'} | 步数: ${msg.n_frames}<br/>` +
+    `空间传播: ${spread}　时间斜率: ${decay}　离轴比: ${offDiag}<br/>` +
+    validLine +
+    (a.plausibility_summary || '').replace(/\n/g, '<br/>');
+
+  // Consecutive-frame identical check: warn in UI + console if all frames are the same.
+  // A near-zero R_mean means the stimulation had no detectable effect on the surrogate.
+  if (Array.isArray(msg.R_mean) && msg.n_frames > 1) {
+    const maxVal = msg.R_mean.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+    if (maxVal < 1e-6) {
+      const warnMsg = '⚠ R矩阵接近零：刺激无效果，建议增大 α 或换选刺激脑区';
+      el.innerHTML = warnMsg + '<br/>' + el.innerHTML;
+      console.warn('[TwinBrain] response_matrix: R_mean is near-zero — '
+        + 'stimulation had no effect. Try increasing alpha or selecting different regions.');
+    }
+  }
+}
+
+// ── Export current data ────────────────────────────────────────────────────────
+document.getElementById('btn-export').addEventListener('click', () => {
+  const act = frameSeq.length > 0
+    ? frameSeq[curFrame].activity
+    : regionMeshes.map(m => m.userData.activity);
+
+  const now      = new Date();
+  const isoStr   = now.toISOString();
+  const payload = {
+    exported_at:  isoStr,
+    frame:        curFrame + 1,
+    total_frames: frameSeq.length,
+    modality:     activeModality,
+    n_regions:    N_REGIONS,
+    activity:     act,
+    selected_regions: [...selected],
+  };
+  // Append EC matrix if available
+  if (ecTopSources.length > 0 && ecActivityDelta) {
+    payload.ec_top_sources    = ecTopSources;
+    payload.ec_top_targets    = ecTopTargets;
+    payload.ec_activity_delta = ecActivityDelta;
+  }
+  // Append peak_delta if available
+  if (peakDelta) payload.peak_delta = peakDelta;
+
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = `twinbrain_frame${curFrame + 1}_${isoStr.slice(0,19).replace(/:/g,'-')}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
 
 // ── Keyboard Shortcuts ────────────────────────────────────────────────────────
 // Space        — play / pause timeline

@@ -110,5 +110,194 @@ class TestPerturbationAnalyzerInit(unittest.TestCase):
         self.assertEqual(len(result["ec_flat"]), 200 * 200)
 
 
+class TestComputeResponseMatrix(unittest.TestCase):
+    """Tests for compute_response_matrix, analyze_response_matrix,
+    and validate_response_matrix."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Train a small surrogate once for all tests in this class."""
+        rng = np.random.default_rng(42)
+        # 60 time steps, 10 regions — fast enough for unit tests
+        cls.N = 10
+        cls.ts = rng.random((60, cls.N)).astype(np.float32)
+        cls.analyzer = PerturbationAnalyzer(n_regions=cls.N, n_lags=2)
+        cls.analyzer.fit_surrogate(cls.ts, n_lags=2, num_epochs=5, batch_size=16)
+        cls.init_state = cls.ts[0].copy()
+
+    # ── compute_response_matrix ─────────────────────────────────────────
+
+    def test_output_shape_sustained(self):
+        """R should be (n_stim, N, T)."""
+        stim_regions = [0, 1, 2]
+        result = self.analyzer.compute_response_matrix(
+            initial_state=self.init_state,
+            stim_regions=stim_regions,
+            rollout_steps=8,
+            sustained_steps=3,
+            alpha=0.3,
+            mode="sustained",
+        )
+        R = result["R"]
+        self.assertEqual(R.shape, (len(stim_regions), self.N, 8))
+        self.assertIsInstance(R, np.ndarray)
+        self.assertEqual(R.dtype, np.float32)
+
+    def test_output_shape_impulse(self):
+        """Impulse mode should also return correct shape."""
+        result = self.analyzer.compute_response_matrix(
+            initial_state=self.init_state,
+            stim_regions=[0],
+            rollout_steps=5,
+            mode="impulse",
+        )
+        self.assertEqual(result["R"].shape, (1, self.N, 5))
+        self.assertEqual(result["mode"], "impulse")
+        self.assertEqual(result["sustained_steps"], 1)
+
+    def test_baseline_included(self):
+        """Result dict must include baseline trajectory (N, T)."""
+        result = self.analyzer.compute_response_matrix(
+            initial_state=self.init_state,
+            stim_regions=[0],
+            rollout_steps=6,
+        )
+        bl = result["baseline"]
+        self.assertEqual(bl.shape, (self.N, 6))
+
+    def test_zero_alpha_gives_near_zero_R(self):
+        """With alpha=0 there is no perturbation so ΔX ≈ 0."""
+        result = self.analyzer.compute_response_matrix(
+            initial_state=self.init_state,
+            stim_regions=[0],
+            rollout_steps=5,
+            alpha=0.0,
+        )
+        np.testing.assert_allclose(
+            result["R"], 0.0, atol=1e-6,
+            err_msg="alpha=0 should give zero response"
+        )
+
+    def test_nonzero_alpha_gives_nonzero_R(self):
+        """With nonzero alpha, at least the stimulated region should respond."""
+        result = self.analyzer.compute_response_matrix(
+            initial_state=self.init_state,
+            stim_regions=[0],
+            rollout_steps=5,
+            alpha=0.3,
+        )
+        # Mean absolute response should be positive
+        self.assertGreater(float(np.abs(result["R"]).mean()), 0.0)
+
+    def test_sustained_vs_impulse_differ(self):
+        """Sustained and impulse modes should yield different R matrices."""
+        common = dict(
+            initial_state=self.init_state, stim_regions=[0],
+            rollout_steps=8, sustained_steps=5, alpha=0.3,
+        )
+        R_sus = self.analyzer.compute_response_matrix(
+            **common, mode="sustained"
+        )["R"]
+        R_imp = self.analyzer.compute_response_matrix(
+            **common, mode="impulse"
+        )["R"]
+        # They should differ beyond numerical noise
+        self.assertFalse(np.allclose(R_sus, R_imp, atol=1e-5))
+
+    def test_default_all_regions(self):
+        """When stim_regions=None all N regions are stimulated."""
+        result = self.analyzer.compute_response_matrix(
+            initial_state=self.init_state,
+            stim_regions=None,
+            rollout_steps=4,
+        )
+        self.assertEqual(result["R"].shape[0], self.N)
+        self.assertEqual(len(result["stim_regions"]), self.N)
+
+    # ── analyze_response_matrix ─────────────────────────────────────────
+
+    def test_analyze_output_keys(self):
+        """analyze_response_matrix must return all required keys."""
+        result = self.analyzer.compute_response_matrix(
+            initial_state=self.init_state, stim_regions=[0, 1],
+            rollout_steps=8,
+        )
+        analysis = PerturbationAnalyzer.analyze_response_matrix(
+            result["R"], result["stim_regions"], N=self.N
+        )
+        for key in (
+            "spatial_spread", "temporal_decay", "delay_peak_steps",
+            "off_diagonal_ratio", "mean_response_map",
+            "has_spatial_spread", "has_decay", "has_delay",
+            "plausibility_summary",
+        ):
+            self.assertIn(key, analysis, f"Missing key: {key}")
+
+    def test_analyze_ranges(self):
+        """Scalar metrics should lie in expected ranges."""
+        result = self.analyzer.compute_response_matrix(
+            initial_state=self.init_state, stim_regions=[0, 1],
+            rollout_steps=10, alpha=0.3,
+        )
+        analysis = PerturbationAnalyzer.analyze_response_matrix(
+            result["R"], result["stim_regions"], N=self.N
+        )
+        self.assertGreaterEqual(analysis["spatial_spread"], 0.0)
+        self.assertLessEqual(analysis["spatial_spread"], 1.0)
+        self.assertIsInstance(analysis["temporal_decay"], float)
+        self.assertEqual(
+            len(analysis["delay_peak_steps"]), len(result["stim_regions"])
+        )
+        self.assertGreaterEqual(analysis["off_diagonal_ratio"], 0.0)
+        self.assertEqual(len(analysis["mean_response_map"]), self.N)
+
+    def test_analyze_plausibility_str(self):
+        """plausibility_summary must be a non-empty string."""
+        result = self.analyzer.compute_response_matrix(
+            initial_state=self.init_state, stim_regions=[0],
+            rollout_steps=5,
+        )
+        analysis = PerturbationAnalyzer.analyze_response_matrix(
+            result["R"], result["stim_regions"], N=self.N
+        )
+        self.assertIsInstance(analysis["plausibility_summary"], str)
+        self.assertGreater(len(analysis["plausibility_summary"]), 0)
+
+    # ── validate_response_matrix ────────────────────────────────────────
+
+    def test_validate_requires_two_states(self):
+        """Single state should return nan and reliable=False."""
+        result = self.analyzer.validate_response_matrix(
+            initial_states=[self.init_state],
+            stim_regions=[0],
+        )
+        self.assertTrue(np.isnan(result["consistency_r"]))
+        self.assertFalse(result["reliable"])
+
+    def test_validate_output_keys(self):
+        """validate_response_matrix must return all required keys."""
+        rng = np.random.default_rng(7)
+        states = [
+            rng.random(self.N).astype(np.float32),
+            rng.random(self.N).astype(np.float32),
+        ]
+        result = self.analyzer.validate_response_matrix(
+            initial_states=states, stim_regions=[0], rollout_steps=5,
+        )
+        for key in ("consistency_r", "n_states", "reliable", "interpretation"):
+            self.assertIn(key, result, f"Missing key: {key}")
+        self.assertEqual(result["n_states"], 2)
+
+    def test_validate_consistency_r_range(self):
+        """consistency_r must lie in [-1, 1]."""
+        rng = np.random.default_rng(8)
+        states = [rng.random(self.N).astype(np.float32) for _ in range(3)]
+        result = self.analyzer.validate_response_matrix(
+            initial_states=states, stim_regions=[0, 1], rollout_steps=5,
+        )
+        self.assertGreaterEqual(result["consistency_r"], -1.0 - 1e-6)
+        self.assertLessEqual(result["consistency_r"],  1.0 + 1e-6)
+
+
 if __name__ == '__main__':
     unittest.main()
