@@ -654,6 +654,318 @@ class PerturbationAnalyzer:
 
         return frames
 
+    # ── Rollout-based response matrix ────────────────────────────────────────
+
+    def compute_response_matrix(
+        self,
+        initial_state: np.ndarray,
+        stim_regions: Optional[List[int]] = None,
+        rollout_steps: int = 20,
+        sustained_steps: int = 5,
+        alpha: float = 0.3,
+        mode: str = "sustained",
+    ) -> dict:
+        """Compute the perturbation-based dynamical response matrix R[i,j,k].
+
+        For each stimulated region i, runs a rollout WITH sustained injection
+        and another WITHOUT (baseline), then computes:
+
+            R[i, j, k] = X_stim[j, k] − X_base[j, k]
+
+        This characterises the *dynamical propagation structure* of the surrogate:
+        which regions j respond to a perturbation at i by step k, and with what
+        sign/magnitude.
+
+        Stimulation convention (NPI-aligned):
+            delta_z = alpha  (z-score units, matching NPI's pert_strength).
+            This corresponds to display-space amplitude ≈ alpha × ts_std[i],
+            scaling perturbations to each region's local variability.
+            alpha ∈ [0.1, 0.5] keeps perturbations < 1σ (avoids OOD).
+
+        Args:
+            initial_state  : (N,) float32 brain state in [0,1] display space.
+            stim_regions   : list of region indices to stimulate; None = all N.
+            rollout_steps  : T — total rollout length in time steps.
+            sustained_steps: K — number of steps stimulation is injected.
+                             Ignored when mode == "impulse" (K is always 1).
+            alpha          : perturbation strength in z-score units (0.1–0.5).
+            mode           : "sustained" (inject for K steps) or
+                             "impulse" (inject at step 0 only, then observe decay).
+
+        Returns:
+            dict with keys:
+                R              : np.ndarray (n_stim, N, rollout_steps) float32 — ΔX
+                stim_regions   : list[int] — which regions were stimulated
+                baseline       : np.ndarray (N, rollout_steps) float32 — zero-stim
+                alpha          : float
+                mode           : str
+                sustained_steps: int — effective K used
+        """
+        self._require_surrogate()
+        N = self.n_regions
+        if stim_regions is None:
+            stim_regions = list(range(N))
+        else:
+            stim_regions = [int(r) for r in stim_regions if 0 <= int(r) < N]
+        K = 1 if mode == "impulse" else max(1, int(sustained_steps))
+        T = max(1, int(rollout_steps))
+
+        null_weights = np.zeros(N, dtype=np.float32)
+
+        def _run_traj(sw: np.ndarray, amp: float) -> np.ndarray:
+            """Rollout with given stim_weights and amplitude; return (N, T) display."""
+            stim_fn: Callable[[int], float] = (
+                (lambda k: amp if k == 0 else 0.0)
+                if mode == "impulse"
+                else (lambda k: amp if k < K else 0.0)
+            )
+            frames = self.predict_trajectory(
+                initial_state=initial_state.astype(np.float32),
+                stim_weights=sw,
+                stim_fn=stim_fn,
+                n_steps=T,
+            )
+            return np.array([f["activity"] for f in frames], dtype=np.float32).T  # (N, T)
+
+        # Baseline: zero stimulation (shared across all stim_regions)
+        baseline = _run_traj(null_weights, 0.0)   # (N, T)
+
+        # Response for each stimulated region
+        R = np.zeros((len(stim_regions), N, T), dtype=np.float32)
+        for idx, region_i in enumerate(stim_regions):
+            sw = np.zeros(N, dtype=np.float32)
+            sw[region_i] = 1.0
+            R[idx] = _run_traj(sw, alpha) - baseline  # ΔX[j, k]
+
+        logger.info(
+            "compute_response_matrix: %d regions × T=%d, mode=%s, K=%d, "
+            "alpha=%.3f, mean|R|=%.4f",
+            len(stim_regions), T, mode, K, alpha, float(np.abs(R).mean()),
+        )
+        return {
+            "R":               R,
+            "stim_regions":    stim_regions,
+            "baseline":        baseline,
+            "alpha":           float(alpha),
+            "mode":            mode,
+            "sustained_steps": K,
+        }
+
+    @staticmethod
+    def analyze_response_matrix(
+        R: np.ndarray,
+        stim_regions: List[int],
+        N: Optional[int] = None,
+        threshold: float = 0.01,
+    ) -> dict:
+        """Analyse structural properties of a response matrix.
+
+        Args:
+            R            : (n_stim, N, T) float32 — from compute_response_matrix.
+            stim_regions : list of stimulated region indices (length == n_stim).
+            N            : total region count (inferred from R if None).
+            threshold    : |ΔX| threshold for "visible response" in spatial spread.
+
+        Returns:
+            dict with keys:
+                spatial_spread     : float — fraction of non-target regions with
+                                     mean |ΔX| > threshold
+                temporal_decay     : float — linear slope of mean |R| over time
+                                     (negative = decaying response → stable system)
+                delay_peak_steps   : list[int] — per stim-region, which step shows
+                                     maximum non-target mean |ΔX|
+                off_diagonal_ratio : float — mean off-diag |R| / mean diag |R|
+                mean_response_map  : list[float] (N,) — mean |ΔX| across stim regions
+                                     and time, for 3D overlay
+                has_spatial_spread : bool — spatial_spread > 0.05
+                has_decay          : bool — temporal_decay < −1e-4
+                has_delay          : bool — any delay_peak_steps > 0
+                plausibility_summary : str — human-readable assessment
+        """
+        n_stim, n_regions, T = R.shape
+        if N is None:
+            N = n_regions
+
+        # Mean |ΔX| across stim regions and time → per-region overlay
+        mean_response_map = np.abs(R).mean(axis=(0, 2))   # (N,)
+
+        # Spatial spread: fraction of non-target regions above threshold
+        target_set  = set(stim_regions)
+        non_target  = [j for j in range(n_regions) if j not in target_set]
+        if non_target:
+            spread_vals  = mean_response_map[np.array(non_target)]
+            spatial_spread = float((spread_vals > threshold).sum()) / len(non_target)
+        else:
+            spatial_spread = 0.0
+
+        # Temporal decay: linear regression slope of mean |R| vs time step
+        mean_over_t = np.abs(R).mean(axis=(0, 1))   # (T,)
+        t_arr = np.arange(T, dtype=np.float64)
+        if T >= 2:
+            t_c = t_arr - t_arr.mean()
+            v_c = mean_over_t.astype(np.float64) - mean_over_t.mean()
+            temporal_decay = float((t_c * v_c).sum() / max((t_c ** 2).sum(), 1e-12))
+        else:
+            temporal_decay = 0.0
+
+        # Delay peaks: per stim-region, step with max non-target mean |ΔX|
+        delay_peak_steps: List[int] = []
+        nt_arr = np.array(non_target) if non_target else None
+        for idx in range(n_stim):
+            if nt_arr is not None:
+                profile = np.abs(R[idx, nt_arr, :]).mean(axis=0)  # (T,)
+                delay_peak_steps.append(int(np.argmax(profile)))
+            else:
+                delay_peak_steps.append(0)
+
+        # Off-diagonal ratio: spread-to-non-targets vs direct target effect
+        diag_vals: List[float]     = []
+        off_diag_vals: List[float] = []
+        for idx, ri in enumerate(stim_regions):
+            if ri < n_regions:
+                diag_vals.append(float(np.abs(R[idx, ri, :]).mean()))
+            if nt_arr is not None:
+                off_diag_vals.extend(
+                    float(np.abs(R[idx, j, :]).mean()) for j in non_target
+                )
+        mean_diag      = float(np.mean(diag_vals))    if diag_vals    else 0.0
+        mean_off_diag  = float(np.mean(off_diag_vals)) if off_diag_vals else 0.0
+        off_diagonal_ratio = mean_off_diag / max(mean_diag, 1e-9)
+
+        has_spatial_spread = spatial_spread > 0.05
+        has_decay          = temporal_decay < -1e-4
+        has_delay          = any(d > 0 for d in delay_peak_steps)
+
+        # Human-readable plausibility summary
+        lines = []
+        if has_spatial_spread:
+            lines.append(f"✓ 空间传播: {spatial_spread*100:.0f}% 非靶区响应超阈值")
+        else:
+            lines.append(
+                f"✗ 空间传播不明显 ({spatial_spread*100:.0f}% 超阈值)，"
+                "建议增大 alpha 或提供更多数据"
+            )
+        if has_decay:
+            lines.append(f"✓ 时间衰减: 斜率={temporal_decay:.4f} (稳定系统)")
+        else:
+            lines.append(
+                f"△ 无显著时间衰减 (斜率={temporal_decay:.4f})，"
+                "系统可能处于持续振荡"
+            )
+        if has_delay:
+            lines.append(
+                f"✓ 传播延迟: 非靶区峰值在步骤 "
+                f"{min(delay_peak_steps)}–{max(delay_peak_steps)}"
+            )
+        else:
+            lines.append("△ 无明显传播延迟 (瞬时扩散或无传播)")
+        lines.append(
+            f"  离轴/对角比={off_diagonal_ratio:.3f} "
+            f"({'传播至远端区域' if off_diagonal_ratio > 0.1 else '主要局部效应'})"
+        )
+
+        return {
+            "spatial_spread":      spatial_spread,
+            "temporal_decay":      temporal_decay,
+            "delay_peak_steps":    delay_peak_steps,
+            "off_diagonal_ratio":  off_diagonal_ratio,
+            "mean_response_map":   mean_response_map.tolist(),
+            "has_spatial_spread":  has_spatial_spread,
+            "has_decay":           has_decay,
+            "has_delay":           has_delay,
+            "plausibility_summary": "\n".join(lines),
+        }
+
+    def validate_response_matrix(
+        self,
+        initial_states: List[np.ndarray],
+        stim_regions: Optional[List[int]] = None,
+        rollout_steps: int = 20,
+        sustained_steps: int = 5,
+        alpha: float = 0.3,
+        mode: str = "sustained",
+    ) -> dict:
+        """Check self-consistency of response matrix across multiple initial states.
+
+        Runs ``compute_response_matrix`` for each state, then computes pairwise
+        Pearson correlations between the flattened R matrices.
+
+        High correlation (r ≥ 0.5) means the propagation structure is robust to
+        initial conditions.  Low correlation may indicate strong nonlinear dynamics
+        or an over-fitted surrogate — neurobiologically interesting in either case.
+
+        Args:
+            initial_states : list of (N,) float32 arrays in [0,1] display space.
+                             Provide ≥ 2 states for a meaningful comparison.
+            Others         : forwarded to ``compute_response_matrix``.
+
+        Returns:
+            dict with keys:
+                consistency_r  : float — mean pairwise Pearson r
+                n_states       : int
+                reliable       : bool — consistency_r ≥ 0.5
+                interpretation : str — human-readable explanation
+        """
+        if len(initial_states) < 2:
+            return {
+                "consistency_r": float("nan"),
+                "n_states":      len(initial_states),
+                "reliable":      False,
+                "interpretation": (
+                    "自一致性检验需要至少 2 个初始状态，请提供更多样本。"
+                ),
+            }
+
+        Rs = []
+        for state in initial_states:
+            res = self.compute_response_matrix(
+                initial_state=state,
+                stim_regions=stim_regions,
+                rollout_steps=rollout_steps,
+                sustained_steps=sustained_steps,
+                alpha=alpha,
+                mode=mode,
+            )
+            Rs.append(res["R"].flatten())
+
+        # Pairwise Pearson r (vectorised — no scipy dependency)
+        r_values: List[float] = []
+        for i in range(len(Rs)):
+            for j in range(i + 1, len(Rs)):
+                a_c = Rs[i] - Rs[i].mean()
+                b_c = Rs[j] - Rs[j].mean()
+                denom = (
+                    np.sqrt((a_c ** 2).sum()) * np.sqrt((b_c ** 2).sum())
+                )
+                r_values.append(float((a_c * b_c).sum() / max(denom, 1e-12)))
+
+        consistency_r = float(np.mean(r_values)) if r_values else float("nan")
+        reliable = consistency_r >= 0.5 if not np.isnan(consistency_r) else False
+
+        if reliable:
+            interpretation = (
+                f"✓ 自一致性良好 (r={consistency_r:.3f} ≥ 0.5): "
+                "响应矩阵在不同初始状态下保持稳定，传播结构可靠。"
+            )
+        elif not np.isnan(consistency_r) and consistency_r >= 0.3:
+            interpretation = (
+                f"△ 自一致性中等 (r={consistency_r:.3f}): "
+                "响应矩阵对初始状态有一定依赖性，建议增加数据量后重新训练代理。"
+            )
+        else:
+            interpretation = (
+                f"✗ 自一致性差 (r={consistency_r:.3f} < 0.3): "
+                "响应矩阵在不同初始状态间差异显著，可能反映强非线性动力学或代理过拟合。"
+                "建议检查 fit_quality 并增加时序数据。"
+            )
+
+        return {
+            "consistency_r": consistency_r,
+            "n_states":      len(initial_states),
+            "reliable":      reliable,
+            "interpretation": interpretation,
+        }
+
     # ── Activity delta prediction ────────────────────────────────────────────
 
     def predict_activity_delta(
