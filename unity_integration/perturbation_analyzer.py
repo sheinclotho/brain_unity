@@ -714,11 +714,10 @@ class PerturbationAnalyzer:
 
         def _run_traj(sw: np.ndarray, amp: float) -> np.ndarray:
             """Rollout with given stim_weights and amplitude; return (N, T) display."""
-            stim_fn: Callable[[int], float] = (
-                (lambda k: amp if k == 0 else 0.0)
-                if mode == "impulse"
-                else (lambda k: amp if k < K else 0.0)
-            )
+            if mode == "impulse":
+                stim_fn: Callable[[int], float] = lambda k: amp if k == 0 else 0.0
+            else:
+                stim_fn = lambda k: amp if k < K else 0.0  # noqa: E731
             frames = self.predict_trajectory(
                 initial_state=initial_state.astype(np.float32),
                 stim_weights=sw,
@@ -839,10 +838,14 @@ class PerturbationAnalyzer:
         # Human-readable plausibility summary
         lines = []
         if has_spatial_spread:
-            lines.append(f"✓ 空间传播: {spatial_spread*100:.0f}% 非靶区响应超阈值")
+            lines.append(
+                f"✓ 空间传播: {spatial_spread*100:.0f}% 非靶区响应超阈值"
+                f" (threshold={threshold:.3f})"
+            )
         else:
             lines.append(
-                f"✗ 空间传播不明显 ({spatial_spread*100:.0f}% 超阈值)，"
+                f"✗ 空间传播不明显 ({spatial_spread*100:.0f}% 超阈值"
+                f" threshold={threshold:.3f})，"
                 "建议增大 alpha 或提供更多数据"
             )
         if has_decay:

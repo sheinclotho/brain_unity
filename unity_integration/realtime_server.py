@@ -1214,13 +1214,13 @@ class BrainVisualizationServer:
             if run_validation and self._loaded_time_series is not None:
                 ts  = self._loaded_time_series   # (T_data, 200)
                 n_t = len(ts)
-                if n_t >= 2:
-                    step        = max(1, n_t // 3)
-                    seed_states = [
-                        ts[0],
-                        ts[min(step, n_t - 1)],
-                        ts[min(2 * step, n_t - 1)],
-                    ]
+                if n_t >= 3:
+                    # Pick three distinct, evenly spaced timepoints as initial states.
+                    # Requiring n_t >= 3 ensures no duplicates (with step = n_t//3,
+                    # the indices 0, step, 2*step are always distinct when n_t ≥ 3).
+                    step = n_t // 3
+                    seed_indices = [0, step, min(2 * step, n_t - 1)]
+                    seed_states = [ts[i] for i in seed_indices]
                     validation_result = analyzer.validate_response_matrix(
                         initial_states=[s.astype(np.float32) for s in seed_states],
                         stim_regions=stim_regions,
