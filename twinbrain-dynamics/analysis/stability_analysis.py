@@ -15,15 +15,26 @@ Stability Analysis
 方法 C（自适应相对阈值，默认，推荐）：
   对 Δ_mean 按轨迹 RMS 归一化，得到无量纲 delta_ratio。
   引入谱周期评分（dominant_spectral_ratio）区分极限环与固定点，
-  引入变异系数（CV）区分规则运动与混沌。
+  引入变异系数（CV）区分规则运动与混沌，
+  引入 ACF 周期性评分（acf_oscillation_score）检测大幅振荡的极限环。
 
   **标量归一化解决维数依赖问题**：在 n_regions=190 时，
   随机步进的 L2 范数 ≈ sqrt(190) × std_per_region，
   导致方法 B 的固定阈值（如 0.1）被轻易突破，产生 100% "不稳定"。
 
-  方法 C 分类规则：
-  - delta_ratio < 0.01  AND cv_delta < 0.5         → fixed_point
-  - delta_ratio < 0.05  AND spectral_peak > 0.40   → limit_cycle
+  **高维极限环检测**：当 n_regions 较大时，各脑区的振荡相位不一致，
+  导致延迟距离序列 ||x(t+ΔT) − x(t)||₂ 几乎恒定（各脑区相位差相消），
+  谱分析的 DC 项主导（spectral_peak_ratio ≈ 0），原有低幅度极限环条件失效。
+  修复方案：新增两个条件，检测**大幅稳定振荡**：
+    (C3) cv_delta 很小（延迟距离高度一致）→ 振荡幅度稳定 → 极限环
+    (C4) 直接对状态时序 x_i(t) 计算 ACF，检测二级正峰（周期性确认）
+
+  方法 C 分类规则（按优先级）：
+  - delta_ratio < 0.01  AND cv_delta < 0.50        → fixed_point
+  - delta_ratio < 0.05  AND spectral_peak > 0.40   → limit_cycle（低幅）
+  - cv_delta < 0.30     AND (spectral > 0.40 OR acf_score > 0.15)
+                                                   → limit_cycle（大幅稳定振荡）
+  - acf_score > 0.35                               → limit_cycle（ACF 强周期）
   - delta_ratio < 0.15                             → metastable
   - else                                           → unstable
 
@@ -31,6 +42,10 @@ Stability Analysis
   · Eckmann & Ruelle (1985) Rev. Mod. Phys.
   · Kantz & Schreiber (1997) Nonlinear Time Series Analysis
   · Marwan et al. (2007) Phys. Rep. — 循环图定量分析
+
+**全局一致性指标**（run_stability_analysis 新增）：
+  delta_ratio_between_cv = std(delta_ratio across trajectories) / mean(delta_ratio)
+  若 < 0.05，说明所有轨迹收敛到同一全局吸引子（典型极限环特征）。
 
 输出文件：outputs/stability_metrics.json
 """
@@ -65,19 +80,138 @@ _DEFAULT_DELAY_DT = 50
 #      matches a criterion of "clear periodicity" in Marwan et al. (2007)
 #      Phys. Rep. 438:237 (recurrence quantification DET > 0.4 is their
 #      analogous threshold for deterministic vs. chaotic behaviour).
+#   d) High-dimensional limit-cycle fix: when n_regions is large (e.g. 190),
+#      the delay-distance series ||x(t+dt)-x(t)||₂ is nearly constant due to
+#      phase cancellation across regions → DC dominates → spectral_peak_ratio≈0.
+#      Two new conditions handle this regime:
+#      (C3) cv_delta < _ADAPTIVE_LC_CV  AND  (spectral OR ACF)
+#           → consistent oscillation amplitude → large-amplitude limit cycle
+#      (C4) acf_score > _ADAPTIVE_LC_ACF_STRONG
+#           → ACF of state x_i(t) shows clear secondary positive peak → periodic
 #
 # All thresholds may be overridden via kwargs to classify_dynamics_adaptive().
 _ADAPTIVE_FP_RATIO: float = 0.01      # delta_ratio < this AND cv < 0.5 → fixed_point
 _ADAPTIVE_FP_CV: float = 0.50         # CV upper bound for fixed_point gate
 _ADAPTIVE_LC_RATIO: float = 0.05      # delta_ratio < this AND spectral > 0.40 → limit_cycle
 _ADAPTIVE_LC_SPECTRAL: float = 0.40   # spectral peak fraction lower bound → limit_cycle
+_ADAPTIVE_LC_CV: float = 0.30         # cv_delta < this → consistent oscillation amplitude
+_ADAPTIVE_LC_ACF: float = 0.15        # ACF secondary-peak score lower bound → periodicity confirmed
+_ADAPTIVE_LC_ACF_STRONG: float = 0.35 # ACF score > this → limit_cycle without cv requirement
 _ADAPTIVE_META_RATIO: float = 0.15    # delta_ratio < this → metastable
 # else → unstable
+
+# ── ACF oscillation-score parameters ─────────────────────────────────────────
+# Used in compute_acf_oscillation_score() and compute_trajectory_features().
+_ACF_N_SAMPLE_REGIONS: int = 8        # number of regions to sample for ACF score
+_ACF_MAX_LAG_FRACTION: float = 0.40   # use up to this fraction of T as max ACF lag
+_ACF_MIN_LAG: int = 5                 # skip near-zero lags in secondary-peak search
+
+# Between-trajectory consistency threshold for attractor warning
+_BETWEEN_TRAJ_CV_ATTRACTOR: float = 0.05  # delta_ratio CV < this → single global attractor
 
 # ── Empty classification count template (shared by run_stability_analysis) ───
 _EMPTY_CLASS_COUNTS: Dict[str, int] = {
     "fixed_point": 0, "limit_cycle": 0, "metastable": 0, "unstable": 0,
 }
+
+
+def compute_acf_oscillation_score(
+    trajectory: np.ndarray,
+    n_samples: int = _ACF_N_SAMPLE_REGIONS,
+    max_lag_fraction: float = _ACF_MAX_LAG_FRACTION,
+    min_lag: int = _ACF_MIN_LAG,
+    seed: int = 0,
+) -> float:
+    """
+    ACF 周期性评分：对轨迹中采样的若干脑区计算自相关函数，
+    返回"二级正峰高度"的均值，作为振荡强度的无量纲指标。
+
+    **原理**：
+    对于极限环 x_i(t) ≈ A·sin(2πt/P + φ_i)，ACF 近似余弦函数：
+      ACF(lag) ≈ cos(2π·lag/P)
+    在 lag = P/4 处过零，lag = P/2 处出现二级正峰（高度约 1.0 for pure sinusoid）。
+
+    对于高维极限环（n_regions 大），各脑区相位不同但周期相同，
+    各脑区 ACF 均呈周期结构，二级正峰高度 > 0（取决于噪声水平）。
+
+    对于混沌/随机系统，ACF 快速衰减至 0，无周期结构（二级正峰 ≈ 0）。
+    对于固定点（无振荡），ACF 单调衰减，无过零点（返回 0）。
+
+    **与延迟距离谱方法的比较**：
+    延迟距离谱（现有代码）在高维极限环中失效（见模块文档注释 §d），
+    因为 ||x(t+dt)-x(t)||₂ 近似恒定，谱 DC 项主导。
+    ACF 直接作用于状态 x_i(t)，不受此问题影响。
+
+    Args:
+        trajectory:       shape (T, n_regions)。
+        n_samples:        采样脑区数（默认 8；计算量为 O(n_samples × T·log T)）。
+        max_lag_fraction: 最大 ACF 延迟 = T × max_lag_fraction（默认 0.40）。
+        min_lag:          跳过近零延迟（默认 5），避免误判邻近步骤相关为周期。
+        seed:             随机采样种子（默认 0，确保可复现）。
+
+    Returns:
+        score: 各采样脑区"二级正峰高度"的均值，范围 [0, 1]。
+               0.0 = 无周期结构；0.10–0.30 = 中等周期性；> 0.30 = 强周期性。
+
+    参考：
+      Rosenstein, Collins & De Luca (1993) Physica D 65:117 — ACF 零点作为嵌入维度
+      Kantz & Schreiber (1997) §4.2 — 时序 ACF 作为动力学指标
+    """
+    T, N = trajectory.shape
+    max_lag = min(max(min_lag + 2, int(T * max_lag_fraction)), T - 1)
+
+    if max_lag <= min_lag:
+        return 0.0
+
+    rng = np.random.default_rng(seed)
+    region_idx = rng.choice(N, size=min(n_samples, N), replace=False)
+
+    scores: List[float] = []
+    for ri in region_idx:
+        x = trajectory[:, ri].astype(np.float64)
+        x = x - x.mean()
+        var = float(np.dot(x, x))
+        if var < 1e-20:
+            scores.append(0.0)
+            continue
+
+        # FFT-based full autocorrelation (O(T log T), exact)
+        n = len(x)
+        f = np.fft.rfft(x, n=2 * n)
+        acf_full = np.fft.irfft(f * np.conj(f))[:n]
+        if acf_full[0] < 1e-20:
+            scores.append(0.0)
+            continue
+        acf = (acf_full / acf_full[0]).astype(np.float32)
+
+        # Restrict to [min_lag, max_lag]
+        acf_tail = acf[min_lag: max_lag + 1]
+        if len(acf_tail) < 3:
+            scores.append(0.0)
+            continue
+
+        # Find first zero crossing (positive → negative transition)
+        sign_seq = np.sign(acf_tail)
+        # Treat exact 0 as negative (conservative)
+        sign_seq[sign_seq == 0] = -1.0
+        sign_changes = np.where(np.diff(sign_seq) < 0)[0]  # + to - crossings
+
+        if len(sign_changes) == 0:
+            # ACF never goes negative → monotonic decay (fixed point) or very long period
+            scores.append(0.0)
+            continue
+
+        # Region after the first negative crossing
+        first_neg_start = int(sign_changes[0]) + 1
+        if first_neg_start >= len(acf_tail):
+            scores.append(0.0)
+            continue
+
+        after_first_neg = acf_tail[first_neg_start:]
+        secondary_max = float(after_first_neg.max()) if len(after_first_neg) > 0 else 0.0
+        scores.append(max(0.0, secondary_max))
+
+    return float(np.mean(scores)) if scores else 0.0
 
 
 def compute_delay_distances(
@@ -166,13 +300,15 @@ def compute_trajectory_features(
 
     Returns:
         features: {
-            "delta_ratio":        float  — delay_mean / traj_rms（相对运动强度）
-            "cv_delta":           float  — std / mean of tail delays（变异系数）
-            "spectral_peak_ratio":float  — 主频功率 / 总功率（周期性评分）
-            "tail_rms_ratio":     float  — rms(尾部) / rms(全段)（是否收敛）
-            "delay_mean":         float  — 延迟距离均值（绝对量，仅供参考）
-            "delay_std":          float  — 延迟距离标准差
-            "traj_rms":           float  — 轨迹 RMS（归一化基准）
+            "delta_ratio":          float  — delay_mean / traj_rms（相对运动强度）
+            "cv_delta":             float  — std / mean of tail delays（变异系数）
+            "spectral_peak_ratio":  float  — 主频功率 / 总功率（延迟距离序列谱周期评分）
+            "tail_rms_ratio":       float  — rms(尾部) / rms(全段)（是否收敛）
+            "delay_mean":           float  — 延迟距离均值（绝对量，仅供参考）
+            "delay_std":            float  — 延迟距离标准差
+            "traj_rms":             float  — 轨迹 RMS（归一化基准）
+            "acf_oscillation_score":float  — 状态 ACF 二级正峰高度均值（周期性确认，
+                                             不受高维延迟距离恒定问题影响）
         }
     """
     T, N = trajectory.shape
@@ -186,7 +322,7 @@ def compute_trajectory_features(
         return {
             "delta_ratio": 0.0, "cv_delta": 0.0, "spectral_peak_ratio": 0.0,
             "tail_rms_ratio": 1.0, "delay_mean": 0.0, "delay_std": 0.0,
-            "traj_rms": traj_rms,
+            "traj_rms": traj_rms, "acf_oscillation_score": 0.0,
         }
 
     tail_len = max(1, int(len(delays) * tail_fraction))
@@ -231,6 +367,7 @@ def compute_trajectory_features(
         "delay_mean": delay_mean,
         "delay_std": delay_std,
         "traj_rms": traj_rms,
+        "acf_oscillation_score": compute_acf_oscillation_score(trajectory),
     }
 
 
@@ -240,6 +377,9 @@ def classify_dynamics_adaptive(
     fp_cv: float = _ADAPTIVE_FP_CV,
     lc_ratio: float = _ADAPTIVE_LC_RATIO,
     lc_spectral: float = _ADAPTIVE_LC_SPECTRAL,
+    lc_cv: float = _ADAPTIVE_LC_CV,
+    lc_acf: float = _ADAPTIVE_LC_ACF,
+    lc_acf_strong: float = _ADAPTIVE_LC_ACF_STRONG,
     meta_ratio: float = _ADAPTIVE_META_RATIO,
 ) -> str:
     """
@@ -248,22 +388,35 @@ def classify_dynamics_adaptive(
     使用无量纲特征，与 n_regions 无关。
 
     分类层次（优先级从高到低）：
-    1. fixed_point:  delta_ratio < fp_ratio AND cv_delta < fp_cv
-    2. limit_cycle:  delta_ratio < lc_ratio AND spectral_peak_ratio > lc_spectral
-    3. metastable:   delta_ratio < meta_ratio
-    4. unstable:     其余
+    1. fixed_point:       delta_ratio < fp_ratio AND cv_delta < fp_cv
+    2. limit_cycle（低幅）: delta_ratio < lc_ratio AND spectral_peak > lc_spectral
+    3. limit_cycle（大幅）: delta_ratio >= lc_ratio AND cv_delta < lc_cv
+                           AND (spectral > lc_spectral OR acf > lc_acf)
+       — 高维极限环的延迟距离序列近似恒定（各脑区相位差相消），谱 DC 项主导
+         （spectral_peak_ratio ≈ 0），此时由 cv_delta 小 + ACF 确认振荡性。
+         只在 dr ≥ lc_ratio 时触发，避免与条件 2 重叠。
+    4. limit_cycle（强ACF）: acf_score > lc_acf_strong（周期性由 ACF 单独确认）
+    5. metastable:        delta_ratio < meta_ratio
+    6. unstable:          其余
 
     参考：
       Eckmann & Ruelle (1985) Rev. Mod. Phys. 57:617
       Kantz & Schreiber (1997) Nonlinear Time Series Analysis §5
+      Rosenstein et al. (1993) Physica D 65:117 — ACF 零点
 
     Args:
-        features:     来自 compute_trajectory_features() 的特征字典。
-        fp_ratio:     固定点的相对运动阈值（默认 0.01）。
-        fp_cv:        固定点的变异系数上限（默认 0.50）。
-        lc_ratio:     极限环的相对运动阈值（默认 0.05）。
-        lc_spectral:  极限环的谱周期评分下限（默认 0.40）。
-        meta_ratio:   亚稳态的相对运动阈值（默认 0.15）。
+        features:      来自 compute_trajectory_features() 的特征字典。
+        fp_ratio:      固定点的相对运动阈值（默认 0.01）。
+        fp_cv:         固定点的变异系数上限（默认 0.50）。
+        lc_ratio:      低幅极限环的相对运动阈值（默认 0.05）。
+        lc_spectral:   极限环的延迟距离谱周期评分下限（默认 0.40）。
+        lc_cv:         大幅极限环的 cv_delta 上限（默认 0.30）；
+                       cv_delta 小 → 振荡幅度一致 → 非混沌。
+        lc_acf:        ACF 二级正峰下限（默认 0.15）；
+                       与 lc_cv 联合使用，确认周期性。
+        lc_acf_strong: ACF 强周期评分阈值（默认 0.35）；
+                       超过此值单独可判定极限环，无需 cv 条件。
+        meta_ratio:    亚稳态的相对运动阈值（默认 0.15）。
 
     Returns:
         classification: "fixed_point" | "limit_cycle" | "metastable" | "unstable"
@@ -271,13 +424,33 @@ def classify_dynamics_adaptive(
     dr = features["delta_ratio"]
     cv = features["cv_delta"]
     sp = features["spectral_peak_ratio"]
+    acf_score = features.get("acf_oscillation_score", 0.0)
 
+    # (C1) Fixed point: negligible motion with low variability
     if dr < fp_ratio and cv < fp_cv:
         return "fixed_point"
+
+    # (C2) Low-amplitude limit cycle: small displacement, clear delay-distance periodicity
     if dr < lc_ratio and sp > lc_spectral:
         return "limit_cycle"
+
+    # (C3) Large-amplitude stable oscillation (high-dimensional limit cycle):
+    # Applies only when dr ≥ lc_ratio (C2 already handles the dr < lc_ratio range).
+    # Confirmed by delay-distance spectral peak OR state-ACF secondary peak.
+    # Rationale: for n_regions≫1, delay-distance series is nearly constant
+    # (phase cancellation), so spectral_peak_ratio≈0 despite clear periodicity.
+    # State-ACF directly detects x_i(t) periodicity without this limitation.
+    if dr >= lc_ratio and cv < lc_cv and (sp > lc_spectral or acf_score > lc_acf):
+        return "limit_cycle"
+
+    # (C4) Strong ACF periodicity alone confirms oscillatory attractor
+    if acf_score > lc_acf_strong:
+        return "limit_cycle"
+
+    # (C5) Metastable: moderate motion without clear periodicity
     if dr < meta_ratio:
         return "metastable"
+
     return "unstable"
 
 
@@ -370,7 +543,8 @@ def analyze_trajectory_stability(
             "delay_var": float,              # 方法 B：延迟距离方差
             "delta_ratio": float,            # 方法 C：相对运动强度（无量纲）
             "cv_delta": float,               # 方法 C：变异系数
-            "spectral_peak_ratio": float,    # 方法 C：谱周期评分
+            "spectral_peak_ratio": float,    # 方法 C：延迟距离谱周期评分
+            "acf_oscillation_score": float,  # 方法 C：状态 ACF 二级正峰均值（0–1）
         }
     """
     convergence_tol = float(convergence_tol)
@@ -408,6 +582,7 @@ def analyze_trajectory_stability(
         "delta_ratio": features["delta_ratio"],
         "cv_delta": features["cv_delta"],
         "spectral_peak_ratio": features["spectral_peak_ratio"],
+        "acf_oscillation_score": features.get("acf_oscillation_score", 0.0),
     }
 
 
@@ -455,6 +630,7 @@ def run_stability_analysis(
 
     convergence_steps: List[int] = []
     delta_ratios: List[float] = []
+    acf_scores: List[float] = []
 
     logger.info(
         "稳定性分析: %d 条轨迹, 每条 %d 步, delay_dt=%d",
@@ -488,6 +664,7 @@ def run_stability_analysis(
             convergence_steps.append(metrics["convergence_step"])
 
         delta_ratios.append(metrics.get("delta_ratio", 0.0))
+        acf_scores.append(metrics.get("acf_oscillation_score", 0.0))
 
     mean_conv = float(np.mean(convergence_steps)) if convergence_steps else None
 
@@ -502,6 +679,25 @@ def run_stability_analysis(
         "std": float(dr_arr.std()),
     }
 
+    # Between-trajectory consistency: CV of delta_ratio across trajectories.
+    # For a single global attractor (e.g. limit cycle), all trajectories converge
+    # to the same oscillation amplitude → CV ≈ 0.  For truly chaotic systems,
+    # different initial conditions diverge and CV is large (> 0.20).
+    dr_mean = delta_ratio_stats["mean"]
+    between_traj_cv = (
+        delta_ratio_stats["std"] / dr_mean if dr_mean > 1e-12 else 0.0
+    )
+    delta_ratio_stats["between_traj_cv"] = between_traj_cv
+
+    # ACF score summary
+    acf_arr = np.array(acf_scores, dtype=np.float64)
+    acf_score_stats = {
+        "mean": float(acf_arr.mean()),
+        "median": float(np.median(acf_arr)),
+        "p25": float(np.percentile(acf_arr, 25)),
+        "p75": float(np.percentile(acf_arr, 75)),
+    }
+
     summary = {
         "per_trajectory": per_traj,
         "classification_counts": class_counts,
@@ -513,6 +709,7 @@ def run_stability_analysis(
         "fraction_metastable": class_counts["metastable"] / n_traj,
         "fraction_unstable": class_counts["unstable"] / n_traj,
         "delta_ratio_stats": delta_ratio_stats,
+        "acf_score_stats": acf_score_stats,
     }
 
     logger.info(
@@ -541,6 +738,44 @@ def run_stability_analysis(
         delta_ratio_stats["mean"], delta_ratio_stats["median"],
         delta_ratio_stats["p25"], delta_ratio_stats["p75"], delta_ratio_stats["p95"],
     )
+    logger.info(
+        "  acf_score 分布: 均值=%.3f  中位数=%.3f  p25=%.3f  p75=%.3f",
+        acf_score_stats["mean"], acf_score_stats["median"],
+        acf_score_stats["p25"], acf_score_stats["p75"],
+    )
+    # Attractor consistency / global-attractor diagnostic.
+    # Note: in high-dimensional systems (N≫1) even pure noise shows small
+    # between_traj_cv (law of large numbers).  ACF score must also be checked
+    # to distinguish genuine oscillatory attractors from unstructured noise.
+    # Use _ADAPTIVE_META_RATIO as the dr_mean gate (system must show clearly
+    # large oscillation amplitude, not just marginally above fp_ratio).
+    if between_traj_cv < _BETWEEN_TRAJ_CV_ATTRACTOR and dr_mean > _ADAPTIVE_META_RATIO:
+        if acf_score_stats["mean"] > _ADAPTIVE_LC_ACF:
+            logger.info(
+                "  ✓ 单一全局振荡吸引子（轨迹间 delta_ratio CV=%.1f%%；"
+                "acf_score=%.3f > %.2f）",
+                between_traj_cv * 100,
+                acf_score_stats["mean"],
+                _ADAPTIVE_LC_ACF,
+            )
+            logger.info(
+                "    delta_ratio=%.4f 表明系统处于持续振荡（非固定点）；"
+                "ACF 二级正峰确认为极限环吸引子。",
+                dr_mean,
+            )
+        else:
+            # Small between_traj_cv but no periodic ACF structure:
+            # could be high-dim noise or quasi-periodic orbit with very long period.
+            logger.info(
+                "  → 轨迹间 delta_ratio CV=%.1f%%（一致），但 acf_score=%.3f 低于阈值 %.2f。",
+                between_traj_cv * 100,
+                acf_score_stats["mean"],
+                _ADAPTIVE_LC_ACF,
+            )
+            logger.info(
+                "    可能原因：(a) 振荡周期 > T/3，ACF 无法检测；"
+                "(b) 高维噪声（N 大时延迟距离恒定）；(c) 准周期吸引子。",
+            )
     if mean_conv is not None:
         logger.info("  平均收敛步数: %.1f", mean_conv)
 
@@ -553,6 +788,7 @@ def run_stability_analysis(
         json_summary["classification_counts_v2"] = class_counts_v2
         json_summary["classification_counts_v1"] = class_counts_v1
         json_summary["delta_ratio_stats"] = delta_ratio_stats
+        json_summary["acf_score_stats"] = acf_score_stats
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump(json_summary, fh, indent=2, ensure_ascii=False)
         logger.info("  → 已保存: %s", out_path)
