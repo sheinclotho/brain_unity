@@ -426,6 +426,7 @@ def run_lyapunov_analysis(
         "log_growth_curve": log_growth_curve,
         "chaos_regime": chaos_info,
         "method": method,
+        "renorm_steps": int(renorm_steps),
     }
 
     if output_dir is not None:

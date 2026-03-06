@@ -676,8 +676,10 @@ class TestLyapunovAnalysis(unittest.TestCase):
         results = run_lyapunov_analysis(trajs, self.sim, renorm_steps=10, method="wolf")
         for key in ("lyapunov_values", "mean_lyapunov", "median_lyapunov",
                     "std_lyapunov", "fraction_positive", "fraction_negative",
-                    "log_growth_curve", "chaos_regime", "method"):
+                    "log_growth_curve", "chaos_regime", "method", "renorm_steps"):
             self.assertIn(key, results)
+        # renorm_steps must match what was passed in (used by plot_lyapunov_growth)
+        self.assertEqual(results["renorm_steps"], 10)
 
     def test_run_ftle_keys(self):
         trajs = np.random.rand(3, 50, N).astype(np.float32)
