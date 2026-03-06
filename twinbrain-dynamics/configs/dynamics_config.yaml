@@ -1,0 +1,67 @@
+# TwinBrain Dynamics Analysis Configuration
+# ==========================================
+# Loaded by run_dynamics_analysis.py
+
+# Model configuration
+model:
+  path: null          # Path to trained .pt checkpoint; null = no model (Wilson-Cowan fallback)
+  device: "cpu"       # "cpu" or "cuda"
+
+# Simulator configuration
+simulator:
+  # Internal time step aligned to EEG sampling rate (seconds)
+  # EEG is typically 250-1000 Hz; fMRI is downsampled to this grid.
+  dt: 0.004           # 4 ms → 250 Hz EEG grid
+  fmri_subsample: 25  # observe fMRI every N steps (100 ms at 250 Hz → ~0.1s TR)
+  n_regions: 200      # Number of brain regions (Schaefer 200-parcel atlas)
+
+# Free dynamics experiment
+free_dynamics:
+  n_init: 200         # Number of random initial states to simulate
+  steps: 1000         # Simulation steps per trajectory
+  seed: 42            # Random seed for reproducibility
+
+# Attractor analysis
+attractor_analysis:
+  tail_steps: 100     # Number of final steps used to compute attractor state
+  k_candidates: [2, 3, 4, 5, 6]  # Range of K to test for KMeans
+  k_best: 3           # Final K for reporting basin distribution
+  dbscan_eps: 0.5     # Epsilon for DBSCAN (alternative method)
+  dbscan_min_samples: 5
+
+# Virtual stimulation experiment
+virtual_stimulation:
+  # Nodes to stimulate — default: frontal hub regions
+  target_nodes: [0, 100]
+  frequency: 10.0     # Hz (for sinusoidal / square wave)
+  amplitude: 0.5      # Normalised units
+  duration: 200       # Stimulation duration (steps)
+  pre_steps: 100      # Baseline steps before stimulation
+  post_steps: 200     # Recovery steps after stimulation
+  patterns:           # Which patterns to compare
+    - sine
+    - square
+    - step
+
+# Response matrix computation
+response_matrix:
+  n_nodes: 200        # Stimulate all N nodes
+  stim_amplitude: 0.5
+  stim_duration: 50   # Steps per node stimulation
+  stim_frequency: 10.0
+  stim_pattern: "sine"
+  measure_window: 20  # Steps after stimulation onset to average response
+
+# Stability analysis
+stability_analysis:
+  convergence_tol: 1e-4   # ||Δx|| < tol → classify as fixed point
+  period_max_lag: 100     # Maximum lag to check for periodic orbits
+
+# Output configuration
+output:
+  directory: "outputs"
+  save_trajectories: true
+  save_attractors: true
+  save_response_matrix: true
+  save_stability_metrics: true
+  save_plots: true
