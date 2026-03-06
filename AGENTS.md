@@ -433,3 +433,36 @@ r ≈ 0 的两个神经生物学合理原因：
 - **规则**: 新增 `n_segments`（多段采样，默认 3）：从轨迹不同位置采样 LLE，探索吸引子不同区域，减少瞬态偏差。
 
 *Last updated: 2026-03-06*
+
+### [2026-03-06] TwinBrainDigitalTwin 模型架构 vs WC — 响应矩阵与随机对照修复
+
+#### 模型架构要点（非 WC）
+- TwinBrainDigitalTwin = ST-GCN 编码器（上下文窗口 [N,T,H]）+ 每节点时序预测器 + 图传播器（2轮 ST-GCN）+ 解码器
+- `simulate_intervention()`：在潜空间对目标节点 h[i, :, :] += delta_vec（作用于全部 T 步），预测 + 图传播 + 解码，返回 `causal_effect = perturbed − baseline`
+- 与 WC 的本质区别：WC 是点状脉冲刺激步进积分；TwinBrain 是潜空间上下文级别偏移，1次 encoder 调用完成
+
+#### 响应矩阵竖条纹根因（Twin 模式）
+- **Bug**: `_rollout_with_twin` 存储 `result["perturbed"]`（绝对预测），而非 `causal_effect`
+- 绝对预测包含自然动力学分量（所有行 i 相同），掩盖刺激特异性 → 列主导结构（竖条）
+- **修复**: twin 模式直接调用 `simulator.model.simulate_intervention()` on base_graph（deepcopy 一次），取 `causal_effect["fmri"]` 作为 R[i,:]
+- **注意**: Twin 模式下即使正确，也可能出现枢纽主导竖条（DMN、前额叶等强连接区域对任何刺激都响应强烈）——这是真实网络特性，行归一化面板 B 揭示枢纽外的刺激特异性
+
+#### WC 模式响应矩阵竖条纹根因
+- **Bug**: 在暂态窗口（刺激刚开始、幅度尚小）测量，所有行响应几乎相同
+- **修复**: `skip_transient`（auto = stim_duration//4）跳过暂态爬升期；pattern="step"（恒定幅度）；stim_duration=80；measure_window=30
+
+#### 随机对照两大问题
+1. **固定种子**：相同 W 矩阵 → 换数据结果完全相同，毫无说服力
+   - **修复**: `_random_lle_multi_seed()` 循环 n_seeds=5 个独立 W 矩阵，报告均值 ± 标准差
+2. **混沌边界误判**：tanh(W@x) 的实际混沌边界不是线性理论的 ρ=1，而是 n≈190 时 ρ≈1.5（tanh 非线性压缩）
+   - ρ<1：数学保证稳定（Banach 不动点定理）；ρ>1 不保证混沌
+   - **修复**: spectral_radii=[0.9, 1.5, 2.0]（稳定/近临界/混沌）；用真实 Wolf-Benettin LLE（`_wolf_lle_random()`）而非稳定性代理指标
+
+#### 实测混沌边界（tanh(clip(W@x), 0,1)，Wolf LLE）
+| n | ρ=0.9 | ρ=1.5 | ρ=2.0 | ρ=3.0 |
+|---|------|------|------|------|
+| 190 | -0.44（稳定） | +0.001（临界） | +0.064（混沌） | +0.14（混沌） |
+
+- **规则**: Wolf LLE 扰动折叠到 0 时（r<1e-30）不记录该期 log-growth，直接重新扰动继续（避免大负值污染均值）
+
+*Last updated: 2026-03-06*
