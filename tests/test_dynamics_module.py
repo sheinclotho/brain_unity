@@ -582,13 +582,21 @@ class TestLyapunovAnalysis(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(lg)))
 
     def test_wolf_stable_system_negative_lle(self):
-        """WC at equilibrium x0=0.5 should have LLE ≤ 0 (stable system)."""
+        """WC at equilibrium x0=0.5 should have LLE < 0 (stable system).
+
+        Bug guard: the old implementation created a new WilsonCowanIntegrator
+        with x_cur as the equilibrium every Wolf period.  Because the trajectory
+        starts *at* its own equilibrium, deviation = 0, no dynamics occur, and
+        the method returned LLE = 0 trivially.  The correct value is negative
+        because the WC model's deviation-driven dynamics contract all
+        perturbations back to the fixed point.
+        """
         x0 = np.full(N, 0.5, dtype=np.float32)
         lle, _ = wolf_largest_lyapunov(
             self.sim, x0=x0, total_steps=200, renorm_steps=20, rng=self.rng
         )
-        # WC with no stimulus is stable around x0; LLE should not be strongly positive
-        self.assertLess(lle, 0.2)
+        # WC with no stimulus is a contracting system; LLE must be negative.
+        self.assertLess(lle, 0.0)
 
     def test_wolf_reproducible_with_same_rng(self):
         """Same seed → same LLE."""
@@ -718,7 +726,12 @@ class TestLyapunovAnalysis(unittest.TestCase):
             self.assertIn("is_chaotic", report)
 
     def test_wc_stable_system_lle_not_strongly_positive(self):
-        """WC system at equilibrium should have non-positive or small-positive LLE."""
+        """WC system at equilibrium should have negative mean LLE.
+
+        Bug guard: run_lyapunov_analysis uses wolf_largest_lyapunov which must
+        now call wolf_rollout_pair instead of rollout() twice.  The old code
+        returned LLE ≈ 0 (frozen dynamics); the correct value is negative.
+        """
         sim = BrainDynamicsSimulator(model=None, n_regions=N, seed=42)
         trajs = np.tile(
             np.full((1, 100, N), 0.5, dtype=np.float32),
@@ -729,8 +742,8 @@ class TestLyapunovAnalysis(unittest.TestCase):
         trajs += (rng.random(trajs.shape) * 0.02).astype(np.float32)
         trajs = np.clip(trajs, 0, 1)
         results = run_lyapunov_analysis(trajs, sim, renorm_steps=20, method="wolf")
-        # WC is stable so LLE should not be strongly positive
-        self.assertLess(results["mean_lyapunov"], 0.3)
+        # WC is a contracting system; mean LLE must be negative.
+        self.assertLess(results["mean_lyapunov"], 0.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

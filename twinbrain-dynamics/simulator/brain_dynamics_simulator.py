@@ -774,6 +774,189 @@ class BrainDynamicsSimulator:
         trajectories = np.concatenate(all_chunks, axis=1)  # (n_batch, steps, N)
         return trajectories, times
 
+    # ── Wolf-Benettin rollout pair (correct per-mode implementation) ────────────
+
+    def wolf_rollout_pair(
+        self,
+        x_base: np.ndarray,
+        x_pert: np.ndarray,
+        steps: int,
+        wolf_context=None,
+    ):
+        """
+        Run one Wolf-Benettin period: evolve the (base, perturbed) pair for
+        *steps* steps, returning the final states and the updated context.
+
+        This method correctly handles both WC mode and twin mode:
+
+        **WC mode**
+          ``wolf_context`` is a ``_WilsonCowanIntegrator`` with a *fixed*
+          equilibrium (the very first ``x_base`` value passed across all
+          periods).  The equilibrium does NOT change between periods — only
+          the starting state (``x_base``) moves.
+
+          Calling ``rollout(x0=x_cur)`` twice would instead re-use ``x_cur``
+          as the equilibrium every period.  Because the trajectory starts *at*
+          its own equilibrium, the deviation is always zero, the dynamics are
+          trivially frozen, and the Wolf algorithm returns LLE = 0 for all
+          trajectories.
+
+        **Twin mode**
+          ``wolf_context`` is the current ``HeteroData`` context window.  The
+          base rollout advances the context via ``_advance_context`` so that
+          subsequent Wolf periods are genuine continuations of the trajectory
+          rather than resets to ``base_graph``.
+
+          Calling ``rollout()`` twice would reset both rollouts to
+          ``base_graph`` every period.  After a few periods ``x_cur``
+          converges to the fixed point of the "inject → predict" map,
+          making all 200 trajectories yield the same biased LLE.
+
+        Args:
+            x_base:       Base starting state, shape ``(n_regions,)``.
+            x_pert:       Perturbed starting state, shape ``(n_regions,)``.
+            steps:        Number of integration steps per Wolf period
+                          (= ``renorm_steps`` in the caller).
+            wolf_context: Opaque state from the previous period; ``None``
+                          on the very first period (auto-initialised from
+                          the base state / base_graph).
+
+        Returns:
+            (x_after_base, x_after_pert, next_wolf_context):
+              x_after_base:      Final base state, shape ``(n_regions,)``.
+              x_after_pert:      Final perturbed state, shape ``(n_regions,)``.
+              next_wolf_context: Updated context for the next Wolf period.
+        """
+        if self._is_twin:
+            return self._wolf_pair_twin(x_base, x_pert, steps, wolf_context)
+        return self._wolf_pair_wc(x_base, x_pert, steps, wolf_context)
+
+    def _wolf_pair_wc(
+        self,
+        x_base: np.ndarray,
+        x_pert: np.ndarray,
+        steps: int,
+        wolf_context: Optional[_WilsonCowanIntegrator],
+    ):
+        """
+        One Wolf period in WC mode.
+
+        Creates the integrator on the first call with ``x_base`` as the
+        *fixed* equilibrium.  Subsequent calls reuse the same integrator
+        (same connectivity matrix W, same equilibrium x0_eq), so the
+        deviation-driven dynamics remain non-trivial even as the current
+        base state moves away from the equilibrium.
+
+        Contrast with calling ``rollout(x0=x_cur)`` which recreates the
+        integrator every period using ``x_cur`` as the new equilibrium.
+        When ``state == equilibrium`` at the start, deviation = 0 → delta = 0
+        → the trajectory is frozen → LLE = 0 (trivially wrong).
+        """
+        if wolf_context is None:
+            # First period: fix the equilibrium at the initial base state.
+            wolf_context = _WilsonCowanIntegrator(
+                self.n_regions, x0=x_base, seed=self.seed
+            )
+        wc: _WilsonCowanIntegrator = wolf_context
+        zeros = np.zeros(self.n_regions, dtype=np.float32)
+
+        # Base trajectory
+        state_b = np.asarray(x_base, dtype=np.float32).copy()
+        for _ in range(steps):
+            state_b = wc.step(state_b, zeros)
+
+        # Perturbed trajectory — same fixed equilibrium, different start
+        state_p = np.asarray(x_pert, dtype=np.float32).copy()
+        for _ in range(steps):
+            state_p = wc.step(state_p, zeros)
+
+        return state_b, state_p, wc  # return integrator for reuse next period
+
+    def _wolf_predict(
+        self,
+        context: HeteroData,
+        steps: int,
+    ):
+        """
+        Run the twin model for *steps* prediction steps from *context*.
+
+        Unlike ``_rollout_with_twin`` (which always resets to ``base_graph``),
+        this helper uses exactly the provided context and advances it
+        step-by-step.  Used internally by ``_wolf_pair_twin``.
+
+        Returns:
+            trajectory:       ``(steps, n_regions)`` float32 numpy array.
+            advanced_context: ``HeteroData`` with all modalities advanced by
+                              *steps* predictions.
+        """
+        chunk_size: int = getattr(
+            getattr(self.model, "model", None), "prediction_steps", 50
+        )
+        trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
+        ctx = _clone_hetero_graph(context)
+        t_offset = 0
+
+        while t_offset < steps:
+            remaining = steps - t_offset
+            req_steps = min(chunk_size, remaining)
+
+            pred_dict = self.model.predict_future(ctx, num_steps=req_steps)
+            if self.modality not in pred_dict:
+                raise RuntimeError(
+                    f"模型未返回模态 '{self.modality}' 的预测 (_wolf_predict)。\n"
+                    f"可用模态: {list(pred_dict.keys())}"
+                )
+
+            pred = pred_dict[self.modality]  # [N, req_steps, 1]
+            chunk_np = pred.squeeze(-1).detach().cpu().numpy().T  # [req_steps, N]
+            trajectory[t_offset: t_offset + req_steps] = chunk_np[:req_steps]
+            t_offset += req_steps
+
+            # Always advance; the final ctx is the one returned.
+            ctx = _advance_context(ctx, pred_dict)
+
+        return trajectory, ctx
+
+    def _wolf_pair_twin(
+        self,
+        x_base: np.ndarray,
+        x_pert: np.ndarray,
+        steps: int,
+        wolf_context: Optional[HeteroData],
+    ):
+        """
+        One Wolf period in twin mode.
+
+        Both rollouts share the *same* pre-period context window, differing
+        only in the last injected step (``x_base`` vs ``x_pert``).  After
+        the base rollout the context is advanced via ``_advance_context`` so
+        the next Wolf period continues from where the base trajectory left off.
+
+        Resetting to ``base_graph`` every period (as plain ``rollout()`` does)
+        causes ``x_cur`` to converge to the fixed point of the
+        "inject → predict" map, making every trajectory yield the same
+        biased LLE — the bug observed as λ=0.5559 for all 200 trajectories.
+        """
+        # Initialise context from base_graph on the first call.
+        if wolf_context is None:
+            wolf_context = self._trim_context(_clone_hetero_graph(self.base_graph))
+            self._inject_x0_into_context(wolf_context, x_base)
+
+        # --- Base rollout ---
+        # Clone the current context so that the perturbed rollout below can
+        # also start from the same (pre-advance) history.
+        base_ctx = _clone_hetero_graph(wolf_context)
+        self._inject_x0_into_context(base_ctx, x_base)
+        traj_base, next_context = self._wolf_predict(base_ctx, steps)
+
+        # --- Perturbed rollout ---
+        # Uses the SAME pre-advance context but with x_pert as the last step.
+        pert_ctx = _clone_hetero_graph(wolf_context)
+        self._inject_x0_into_context(pert_ctx, x_pert)
+        traj_pert, _ = self._wolf_predict(pert_ctx, steps)
+
+        return traj_base[-1], traj_pert[-1], next_context
+
     # ── Private helpers ─────────────────────────────────────────────────────────
 
     def _trim_context(self, context: HeteroData) -> HeteroData:
