@@ -80,32 +80,43 @@ def _merge_config(defaults: dict, overrides: dict) -> dict:
 # ── Default configuration ─────────────────────────────────────────────────────
 
 _DEFAULTS = {
-    "model": {"path": None, "device": "cpu"},
-    "simulator": {"dt": 0.004, "fmri_subsample": 25, "n_regions": 200},
-    "free_dynamics": {"n_init": 200, "steps": 1000, "seed": 42},
+    "model": {
+        "path": None,          # Required: path to best_model.pt
+        "graph_path": None,    # Required: path to graph cache .pt file
+        "config_path": None,   # Optional: training config.yaml (auto-detected if None)
+        "device": "cpu",
+        "k_cross_modal": 5,    # Cross-modal edges per EEG electrode (API.md §2.5)
+    },
+    "simulator": {
+        "modality": "fmri",    # Which modality to simulate ('fmri' or 'eeg')
+        "fmri_subsample": 25,  # Kept for compatibility; model infers dt from graph
+    },
+    # Steps here mean fMRI prediction steps (not EEG samples).
+    # With prediction_steps=50 (TR=2s), steps=50 → 100s of future prediction.
+    "free_dynamics": {"n_init": 10, "steps": 50, "seed": 42},
     "attractor_analysis": {
-        "tail_steps": 100,
+        "tail_steps": 10,
         "k_candidates": [2, 3, 4, 5, 6],
         "k_best": 3,
         "dbscan_eps": 0.5,
-        "dbscan_min_samples": 5,
+        "dbscan_min_samples": 3,
     },
     "virtual_stimulation": {
         "target_nodes": [0, 100],
         "frequency": 10.0,
         "amplitude": 0.5,
-        "duration": 200,
-        "pre_steps": 100,
-        "post_steps": 200,
+        "duration": 30,       # fMRI steps (≈ 60 s at TR=2 s)
+        "pre_steps": 10,
+        "post_steps": 20,
         "patterns": ["sine"],
     },
     "response_matrix": {
-        "n_nodes": 200,
+        "n_nodes": 10,         # Reduced default for model mode (full 200 is slow)
         "stim_amplitude": 0.5,
-        "stim_duration": 50,
+        "stim_duration": 20,
         "stim_frequency": 10.0,
         "stim_pattern": "sine",
-        "measure_window": 20,
+        "measure_window": 10,
     },
     "stability_analysis": {
         "convergence_tol": 1e-4,
@@ -133,8 +144,12 @@ def run(cfg: dict) -> dict:
 
     Returns:
         results: Dictionary containing all computed artefacts.
+
+    Raises:
+        RuntimeError: If the model path is provided but loading fails.
+        ValueError:   If model mode is enabled but graph_path is not specified.
     """
-    from loader.load_model import load_trained_model
+    from loader.load_model import load_trained_model, load_graph_for_inference
     from simulator.brain_dynamics_simulator import BrainDynamicsSimulator
     from experiments.free_dynamics import run_free_dynamics
     from experiments.attractor_analysis import run_attractor_analysis
@@ -151,30 +166,57 @@ def run(cfg: dict) -> dict:
     logger.info("=" * 60)
     logger.info("步骤 1/7  加载训练模型")
     model_path = cfg["model"].get("path")
+    graph_path = cfg["model"].get("graph_path")
     device = cfg["model"].get("device", "cpu")
-    model = None
-    if model_path:
-        model = load_trained_model(model_path, device=device)
-        if model is None:
-            logger.warning("模型加载失败，回退到 Wilson-Cowan 演化模式。")
-    else:
-        logger.info("未指定模型路径，使用 Wilson-Cowan 演化模式。")
+    # config_path: training config.yaml auto-detected from checkpoint directory,
+    # but can be overridden via cfg["model"]["config_path"]
+    config_path = cfg["model"].get("config_path")
+
+    if not model_path:
+        raise ValueError(
+            "必须通过 --model 或配置文件 model.path 指定训练好的模型路径。\n"
+            "示例: python run_dynamics_analysis.py "
+            "--model outputs/twinbrain_v5_xxx/best_model.pt "
+            "--graph outputs/graph_cache/sub-01_notask_xx.pt"
+        )
+
+    twin = load_trained_model(
+        checkpoint_path=model_path,
+        device=device,
+        config_path=config_path,
+    )
+
+    # ── Step 1b: Load graph cache ─────────────────────────────────────────────
+    if not graph_path:
+        raise ValueError(
+            "使用训练模型时必须通过 --graph 或配置文件 model.graph_path 指定图缓存路径。\n"
+            "图缓存位于 outputs/graph_cache/<subject_id>_<task>_<hash>.pt\n"
+            "示例: --graph outputs/graph_cache/sub-01_notask_ff12ab34.pt"
+        )
+
+    k_cross_modal = cfg["model"].get("k_cross_modal", 5)
+    base_graph = load_graph_for_inference(
+        graph_path=graph_path,
+        device=device,
+        k_cross_modal=k_cross_modal,
+    )
 
     # ── Step 2: Create simulator ──────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("步骤 2/7  创建动力学模拟器")
-    sim_cfg = cfg["simulator"]
+    modality = cfg["simulator"].get("modality", "fmri")
+
     simulator = BrainDynamicsSimulator(
-        model=model,
-        n_regions=sim_cfg.get("n_regions", 200),
-        dt=sim_cfg.get("dt", 0.004),
-        fmri_subsample=sim_cfg.get("fmri_subsample", 25),
+        model=twin,
+        base_graph=base_graph,
+        modality=modality,
+        fmri_subsample=cfg["simulator"].get("fmri_subsample", 25),
     )
     logger.info(
-        "  n_regions=%d, dt=%.4f s, fmri_subsample=%d",
+        "  模式=TwinBrainDigitalTwin, modality=%s, n_regions=%d, dt=%.4f s",
+        simulator.modality,
         simulator.n_regions,
         simulator.dt,
-        simulator.fmri_subsample,
     )
 
     results: dict = {}
@@ -183,10 +225,13 @@ def run(cfg: dict) -> dict:
     logger.info("=" * 60)
     logger.info("步骤 3/7  自由动力学实验")
     fd_cfg = cfg["free_dynamics"]
+    # In model mode, each rollout() call ignores x0 and uses base_graph context.
+    # n_init > 1 produces n_init independent rollout segments (identical context
+    # but the predictor may have stochastic components from dropout if enabled).
     trajectories = run_free_dynamics(
         simulator=simulator,
-        n_init=fd_cfg.get("n_init", 200),
-        steps=fd_cfg.get("steps", 1000),
+        n_init=fd_cfg.get("n_init", 10),
+        steps=fd_cfg.get("steps", 50),
         seed=fd_cfg.get("seed", 42),
         output_dir=output_dir if cfg["output"].get("save_trajectories") else None,
     )
@@ -211,14 +256,24 @@ def run(cfg: dict) -> dict:
     logger.info("=" * 60)
     logger.info("步骤 5/7  虚拟刺激实验")
     vs_cfg = cfg["virtual_stimulation"]
+    # Clamp target nodes to the actual number of fMRI regions
+    all_target_nodes = vs_cfg.get("target_nodes", [0, 100])
+    target_nodes = [n for n in all_target_nodes if n < simulator.n_regions]
+    if not target_nodes:
+        logger.warning(
+            "所有目标节点索引超出范围（n_regions=%d），使用节点 0。",
+            simulator.n_regions,
+        )
+        target_nodes = [0]
+
     stim_results = run_virtual_stimulation(
         simulator=simulator,
-        target_nodes=vs_cfg.get("target_nodes", [0, 100]),
+        target_nodes=target_nodes,
         amplitude=vs_cfg.get("amplitude", 0.5),
         frequency=vs_cfg.get("frequency", 10.0),
-        stim_steps=vs_cfg.get("duration", 200),
-        pre_steps=vs_cfg.get("pre_steps", 100),
-        post_steps=vs_cfg.get("post_steps", 200),
+        stim_steps=vs_cfg.get("duration", 30),
+        pre_steps=vs_cfg.get("pre_steps", 10),
+        post_steps=vs_cfg.get("post_steps", 20),
         patterns=vs_cfg.get("patterns", ["sine"]),
         output_dir=output_dir,
     )
@@ -228,14 +283,17 @@ def run(cfg: dict) -> dict:
     logger.info("=" * 60)
     logger.info("步骤 6/7  响应矩阵计算")
     rm_cfg = cfg["response_matrix"]
+    n_nodes_rm = min(
+        rm_cfg.get("n_nodes", simulator.n_regions), simulator.n_regions
+    )
     response_matrix = compute_response_matrix(
         simulator=simulator,
-        n_nodes=rm_cfg.get("n_nodes", simulator.n_regions),
+        n_nodes=n_nodes_rm,
         stim_amplitude=rm_cfg.get("stim_amplitude", 0.5),
-        stim_duration=rm_cfg.get("stim_duration", 50),
+        stim_duration=rm_cfg.get("stim_duration", 20),
         stim_frequency=rm_cfg.get("stim_frequency", 10.0),
         stim_pattern=rm_cfg.get("stim_pattern", "sine"),
-        measure_window=rm_cfg.get("measure_window", 20),
+        measure_window=rm_cfg.get("measure_window", 10),
         output_dir=output_dir if cfg["output"].get("save_response_matrix") else None,
     )
     results["response_matrix"] = response_matrix
@@ -328,13 +386,36 @@ def _parse_args() -> argparse.Namespace:
         "--config",
         type=Path,
         default=_ROOT / "configs" / "dynamics_config.yaml",
-        help="YAML 配置文件路径",
+        help="动力学分析 YAML 配置文件路径",
     )
     parser.add_argument(
         "--model",
         type=str,
+        required=True,
+        help=(
+            "训练好的模型检查点路径（best_model.pt）。\n"
+            "示例: outputs/<experiment_name>/best_model.pt"
+        ),
+    )
+    parser.add_argument(
+        "--graph",
+        type=str,
+        required=True,
+        help=(
+            "图缓存文件路径（outputs/graph_cache/*.pt）。\n"
+            "示例: outputs/graph_cache/<subject_id>_<task>_<hash>.pt"
+        ),
+    )
+    parser.add_argument(
+        "--training-config",
+        type=str,
         default=None,
-        help="训练好的模型文件路径 (.pt)",
+        dest="training_config",
+        help=(
+            "训练时生成的 config.yaml 路径。\n"
+            "省略时自动在检查点同目录查找（推荐）。\n"
+            "示例: outputs/<experiment_name>/config.yaml"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -346,13 +427,20 @@ def _parse_args() -> argparse.Namespace:
         "--n-init",
         type=int,
         default=None,
-        help="自由动力学初始状态数（覆盖配置）",
+        help="自由动力学独立预测轮次数（覆盖配置，模型模式下建议 ≤ 20）",
     )
     parser.add_argument(
         "--steps",
         type=int,
         default=None,
-        help="每条轨迹的模拟步数（覆盖配置）",
+        help="每条轨迹的预测步数（fMRI TR 数，覆盖配置）",
+    )
+    parser.add_argument(
+        "--modality",
+        type=str,
+        default=None,
+        choices=["fmri", "eeg"],
+        help="分析模态（默认 fmri）",
     )
     parser.add_argument(
         "--no-plots",
@@ -363,8 +451,8 @@ def _parse_args() -> argparse.Namespace:
         "--device",
         type=str,
         default=None,
-        choices=["cpu", "cuda"],
-        help="计算设备",
+        choices=["cpu", "cuda", "auto"],
+        help="计算设备（auto 自动选择 CUDA/CPU）",
     )
     return parser.parse_args()
 
@@ -372,19 +460,23 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
 
-    # Load and merge configuration
+    # Load and merge dynamics configuration
     file_cfg = _load_config(args.config)
     cfg = _merge_config(_DEFAULTS, file_cfg)
 
     # Apply CLI overrides
-    if args.model:
-        cfg["model"]["path"] = args.model
+    cfg["model"]["path"] = args.model
+    cfg["model"]["graph_path"] = args.graph
+    if args.training_config:
+        cfg["model"]["config_path"] = args.training_config
     if args.output:
         cfg["output"]["directory"] = args.output
-    if args.n_init:
+    if args.n_init is not None:
         cfg["free_dynamics"]["n_init"] = args.n_init
-    if args.steps:
+    if args.steps is not None:
         cfg["free_dynamics"]["steps"] = args.steps
+    if args.modality:
+        cfg["simulator"]["modality"] = args.modality
     if args.no_plots:
         cfg["output"]["save_plots"] = False
     if args.device:
