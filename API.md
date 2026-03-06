@@ -1,7 +1,8 @@
 # TwinBrain V5 — 接口参考手册（API Reference）
 
 > **适用对象**：与 TwinBrain 训练管线集成的前端 Agent、下游分析脚本、推理服务或自动化工作流。
-> 本文件描述训练完成后产出的所有持久化文件的**命名规则、目录结构、内容格式与读写接口**。
+> 本文件描述训练完成后产出的所有持久化文件的**命名规则、目录结构、内容格式与读写接口**，
+> 以及完整的模型加载方式和推理接口说明。
 
 ---
 
@@ -28,6 +29,18 @@
 9. [CLI 接口](#9-cli-接口)
 10. [配置文件关键参数速查](#10-配置文件关键参数速查)
 11. [常见 Agent 使用模式](#11-常见-agent-使用模式)
+12. [完整模型加载与推理接口（前端集成）](#12-完整模型加载与推理接口前端集成)
+    - [12.1 推荐加载方式：TwinBrainDigitalTwin.from_checkpoint()](#121-推荐加载方式-twinbraindigitaltwin-from_checkpoint)
+    - [12.2 模型输入格式（HeteroData）](#122-模型输入格式-heterodata)
+    - [12.3 模型输出格式](#123-模型输出格式)
+    - [12.4 推理接口一览](#124-推理接口一览)
+    - [12.5 前向重建推理](#125-前向重建推理)
+    - [12.6 未来状态预测](#126-未来状态预测)
+    - [12.7 虚拟干预仿真（TMS 数字孪生）](#127-虚拟干预仿真-tms-数字孪生)
+    - [12.8 有效连通性矩阵（EC）](#128-有效连通性矩阵-ec)
+    - [12.9 功能连通性矩阵（FC）](#129-功能连通性矩阵-fc)
+    - [12.10 梯度归因（功能指纹）](#1210-梯度归因功能指纹)
+    - [12.11 少样本个性化适应](#1211-少样本个性化适应)
 
 ---
 
@@ -752,4 +765,395 @@ else:
 
 ---
 
-*本文件由 TwinBrain V5.30 自动生成。如发现不一致之处，以源代码（`main.py`、`utils/helpers.py`、`models/graph_native_system.py`）为准。*
+## 12. 完整模型加载与推理接口（前端集成）
+
+本节是面向**前端和推理服务**的核心参考，详述如何加载训练好的模型对象（而非仅加载权重文件），以及所有推理接口的输入/输出张量格式。
+
+---
+
+### 12.1 推荐加载方式：`TwinBrainDigitalTwin.from_checkpoint()`
+
+`TwinBrainDigitalTwin` 是训练好模型的高层推理封装类，位于 `models/digital_twin_inference.py`。
+
+**推荐使用 `from_checkpoint()` 加载**，它可自动从检查点的 `model_state_dict` 键名中推断模型架构（隐藏维度 `H`、节点类型、边类型、被试数等），**无需手动重建** `GraphNativeBrainModel(...)`。
+
+```python
+from models.digital_twin_inference import TwinBrainDigitalTwin
+
+twin = TwinBrainDigitalTwin.from_checkpoint(
+    checkpoint_path="outputs/twinbrain_v5_xxx/best_model.pt",
+    # device: 'auto'（自动选 CUDA/CPU）、'cuda'、'cpu'
+    device="auto",
+    # subject_to_idx_path: 可省略；若省略则自动在检查点同目录查找 subject_to_idx.json
+    subject_to_idx_path="outputs/twinbrain_v5_xxx/subject_to_idx.json",
+)
+# twin.model: GraphNativeBrainModel（已设置为 eval()、加载到目标设备）
+# twin.device: 'cuda' 或 'cpu'
+# twin.subject_to_idx: dict[str, int]（被试 ID → 嵌入索引）
+```
+
+**参数说明**：
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `checkpoint_path` | `str \| Path` | 指向 `best_model.pt` 或任意检查点文件 |
+| `device` | `str` | `'auto'`（推荐）/ `'cuda'` / `'cpu'` |
+| `subject_to_idx_path` | `str \| Path \| None` | 省略时自动在检查点同目录寻找 `subject_to_idx.json` |
+| `config` | `dict \| None` | 通常不需要；仅在架构推断失败时传入（边类型等特殊情况） |
+
+**架构自动推断的依赖键**（检查点 `model_state_dict` 中）：
+
+| 键模式 | 推断内容 |
+|--------|---------|
+| `encoder.input_proj.<node_type>.weight` | 节点类型列表 + 隐藏维度 H |
+| `subject_embed.weight` | 被试数量 + H |
+| `run_embed.weight` | 会话数量 |
+| `stgcn_layers.*.conv_dict.<src>__<rel>__<dst>` | 边类型列表 |
+
+> **注意**：若检查点不含 `encoder.input_proj.*.weight` 也不含 `subject_embed.weight`，则会抛出 `ValueError`。此时需要手动传入 `config`，或直接用方式三（见 [3.3节](#33-加载接口)）手动加载权重。
+
+---
+
+### 12.2 模型输入格式（HeteroData）
+
+所有推理方法接收 PyG 的 `HeteroData` 对象作为输入（即图缓存加载后、附加跨模态边的完整图窗口）。
+
+#### 最小必需字段
+
+```python
+from torch_geometric.data import HeteroData
+import torch
+
+graph = HeteroData()
+
+# ── EEG 节点（若该被试有 EEG 数据）────────────────────────────
+graph['eeg'].x = torch.randn(N_eeg, T_eeg, 1)   # [N_eeg, T_eeg, 1] float32
+#                                                   必须是 3-D！最后维度 C=1
+graph['eeg'].num_nodes = N_eeg                    # int
+
+# ── fMRI 节点（若该被试有 fMRI 数据）───────────────────────────
+graph['fmri'].x = torch.randn(N_fmri, T_fmri, 1) # [N_fmri, T_fmri, 1] float32
+graph['fmri'].num_nodes = N_fmri                  # int
+
+# ── EEG 功能连通性边──────────────────────────────────────────
+graph['eeg', 'connects', 'eeg'].edge_index = eeg_ei  # [2, E_eeg] int64
+graph['eeg', 'connects', 'eeg'].edge_attr  = eeg_ea  # [E_eeg, 1] float32（可选）
+
+# ── fMRI 功能连通性边──────────────────────────────────────────
+graph['fmri', 'connects', 'fmri'].edge_index = fmri_ei  # [2, E_fmri] int64
+graph['fmri', 'connects', 'fmri'].edge_attr  = fmri_ea  # [E_fmri, 1] float32（可选）
+
+# ── 跨模态边（必须每次从节点特征动态重建，不存入缓存）──────────────
+graph['eeg', 'projects_to', 'fmri'].edge_index = cross_ei  # [2, E_cross] int64
+graph['eeg', 'projects_to', 'fmri'].edge_attr  = cross_ea  # [E_cross, 1] float32（可选）
+
+# ── 被试/会话嵌入索引（如训练时有个性化嵌入）──────────────────
+graph.subject_idx = torch.tensor(0, dtype=torch.long)  # int，对应 subject_to_idx['sub-01']
+graph.run_idx     = torch.tensor(0, dtype=torch.long)  # int（若训练时有 run_embed，可选）
+```
+
+#### 字段规范汇总
+
+| 字段 | 形状/类型 | 必须 | 说明 |
+|------|---------|------|------|
+| `graph['eeg'].x` | `[N_eeg, T_eeg, 1]` float32 | 有 EEG 时必须 | z-scored EEG 幅度，最后维 C=1 |
+| `graph['fmri'].x` | `[N_fmri, T_fmri, 1]` float32 | 有 fMRI 时必须 | z-scored BOLD 信号，最后维 C=1 |
+| `graph['eeg','connects','eeg'].edge_index` | `[2, E_eeg]` int64 | 推荐 | EEG 电极间功能连通性（稀疏 COO） |
+| `graph['fmri','connects','fmri'].edge_index` | `[2, E_fmri]` int64 | 推荐 | fMRI ROI 间功能连通性 |
+| `graph['eeg','projects_to','fmri'].edge_index` | `[2, E_cross]` int64 | 推荐 | 跨模态边，动态重建 |
+| `graph.subject_idx` | `torch.long` scalar | 有 subject_embed 时推荐 | 被试嵌入索引 |
+| `graph.run_idx` | `torch.long` scalar | 有 run_embed 时推荐 | 会话嵌入索引 |
+
+> **重要约束**：
+> - `x` 必须严格为 3-D（`[N, T, C]`），否则 `forward()` 抛出 `ValueError`
+> - `x` 中不允许 `NaN` 或 `Inf`（forward() 有显式检查）
+> - `C=1` 是当前的标量特征约定；若以后扩展到多通道，需同步修改 `in_channels_dict`
+
+#### 从缓存快速构建完整推理图
+
+```python
+import torch
+import json
+from models.graph_native_mapper import GraphNativeBrainMapper
+
+# 1. 从缓存加载节点特征和同模态边
+graph = torch.load(
+    'outputs/graph_cache/sub-01_GRADON_a1b2c3d4.pt',
+    map_location='cpu', weights_only=False,
+)
+
+# 2. 动态重建跨模态边（每次都需要重建，不从缓存读取）
+mapper = GraphNativeBrainMapper(device='cpu')
+cross_ei, cross_ea = mapper.create_simple_cross_modal_edges(
+    graph, k_cross_modal=5   # 每个 EEG 电极保留相关性最高的 k 个 fMRI ROI
+)
+graph['eeg', 'projects_to', 'fmri'].edge_index = cross_ei
+graph['eeg', 'projects_to', 'fmri'].edge_attr  = cross_ea
+
+# 3. 附加被试嵌入索引
+with open('outputs/twinbrain_v5_xxx/subject_to_idx.json') as f:
+    subject_to_idx = json.load(f)
+graph.subject_idx = torch.tensor(subject_to_idx['sub-01'], dtype=torch.long)
+
+# 4. 传入推理（详见后续各节）
+result = twin.predict_future(graph)
+```
+
+---
+
+### 12.3 模型输出格式
+
+#### `GraphNativeBrainModel.forward()` 输出
+
+```python
+# 基本推理（重建）
+reconstructed, predictions = model(graph)
+# reconstructed: dict[str, Tensor[N, T, C]]
+#   'eeg'  → Tensor[N_eeg,  T_eeg,  1]  重建的 EEG 信号（z-score 空间）
+#   'fmri' → Tensor[N_fmri, T_fmri, 1]  重建的 BOLD 信号（z-score 空间）
+# predictions: None（默认 return_prediction=False）
+
+# 带预测输出
+reconstructed, predictions = model(graph, return_prediction=True)
+# predictions: dict[str, Tensor[N, steps, H]]（潜空间预测，H=hidden_channels）
+#   'eeg'  → Tensor[N_eeg,  prediction_steps, H]
+#   'fmri' → Tensor[N_fmri, prediction_steps, H]
+
+# 带潜变量输出
+reconstructed, predictions, encoded = model(graph, return_encoded=True)
+# encoded: dict[str, Tensor[N, T, H]]（编码器输出的潜空间表示）
+#   'eeg'  → Tensor[N_eeg,  T_eeg,  H]
+#   'fmri' → Tensor[N_fmri, T_fmri, H]
+```
+
+**张量形状总结**：
+
+| 输出 | 键 | 形状 | 空间 | 说明 |
+|------|----|----|------|------|
+| `reconstructed` | `'eeg'` | `[N_eeg, T_eeg, 1]` | 信号空间 | z-scored EEG 幅度重建 |
+| `reconstructed` | `'fmri'` | `[N_fmri, T_fmri, 1]` | 信号空间 | z-scored BOLD 重建 |
+| `predictions` | `'eeg'` | `[N_eeg, steps, H]` | 潜空间 | EEG 潜空间未来预测 |
+| `predictions` | `'fmri'` | `[N_fmri, steps, H]` | 潜空间 | fMRI 潜空间未来预测 |
+| `encoded` | `'eeg'` | `[N_eeg, T_eeg, H]` | 潜空间 | EEG 编码特征 |
+| `encoded` | `'fmri'` | `[N_fmri, T_fmri, H]` | 潜空间 | fMRI 编码特征 |
+
+> **说明**：
+> - `T_eeg` 和 `T_fmri` 与输入相同（重建不改变时序长度）
+> - `steps` = `model.prediction_steps`（默认 15，约 30s fMRI 或 60ms EEG）
+> - `H` = `model.hidden_channels`（默认 128）
+> - `C=1`：当前标量特征，输出最后维也是 1
+
+---
+
+### 12.4 推理接口一览
+
+`TwinBrainDigitalTwin` 提供以下推理方法（所有方法内部使用 `torch.no_grad()`，线程安全）：
+
+| 方法 | 说明 | 输出 |
+|------|------|------|
+| `predict_future(data)` | 无扰动的因果未来预测（信号空间） | `dict[str, Tensor[N, steps, 1]]` |
+| `simulate_intervention(data, interventions)` | 虚拟 TMS 干预仿真（因果效应） | `dict`（见 12.7） |
+| `compute_effective_connectivity(windows)` | 全脑有效连通性矩阵（EC，NPI 算法） | `Tensor[N, N]` |
+| `compute_model_fc(windows)` | 全脑功能连通性矩阵（FC，Pearson 相关） | `Tensor[N, N]` |
+| `compute_attribution(data, target_modality, target_nodes)` | 梯度归因（功能指纹） | `dict[str, Tensor[N, T, C]]` |
+| `adapt_to_subject(data_list, subject_idx)` | 少样本个性化（更新被试嵌入） | `None`（原地更新） |
+
+---
+
+### 12.5 前向重建推理
+
+直接调用底层 `GraphNativeBrainModel.forward()` 获取重建结果：
+
+```python
+import torch
+
+graph = graph.to(twin.device)
+with torch.no_grad():
+    reconstructed, _ = twin.model(graph)
+
+recon_eeg  = reconstructed['eeg']    # Tensor [N_eeg, T_eeg, 1]
+recon_fmri = reconstructed['fmri']   # Tensor [N_fmri, T_fmri, 1]
+
+# 转换为 numpy
+recon_eeg_np  = recon_eeg.squeeze(-1).cpu().numpy()   # [N_eeg, T_eeg]
+recon_fmri_np = recon_fmri.squeeze(-1).cpu().numpy()  # [N_fmri, T_fmri]
+```
+
+> 重建结果已在 z-score 空间（与输入 `graph['eeg'].x` 同量纲），无需额外反归一化即可直接比对。
+
+---
+
+### 12.6 未来状态预测
+
+`predict_future()` 返回**信号空间**的因果未来预测（不注入任何扰动）：
+
+```python
+# 预测 num_steps 步后的脑信号（None = 使用模型默认 prediction_steps=15）
+pred = twin.predict_future(graph, num_steps=15)
+
+# pred: dict[str, Tensor[N, steps, 1]]
+eeg_future  = pred.get('eeg')    # Tensor [N_eeg,  15, 1] 或 None
+fmri_future = pred.get('fmri')   # Tensor [N_fmri, 15, 1]
+
+# 转为 numpy [N_fmri, 15]
+fmri_future_np = fmri_future.squeeze(-1).cpu().numpy()
+```
+
+**适用场景**：
+- 脑状态实时轨迹预测
+- 与 AR(1) 基线比较（`decorr` 指标）
+- 长程预测质量评估（`pred_r2`）
+
+---
+
+### 12.7 虚拟干预仿真（TMS 数字孪生）
+
+`simulate_intervention()` 在潜空间注入扰动，预测因果传播效应：
+
+```python
+result = twin.simulate_intervention(
+    baseline_data=graph,
+    interventions={
+        # 格式: {modality: (node_indices, delta)}
+        # delta: float（单位为该节点潜向量的标准差）
+        # delta > 0: 激活（类 TMS 兴奋性刺激）
+        # delta < 0: 抑制（类抑制性 TMS 或 GABA 药物）
+        "fmri": ([42], 2.0),          # 以 2σ 激活 ROI 42（右侧运动皮层）
+        # "eeg": ([5, 6], -1.0),      # 多节点、多模态同时干预也支持
+    },
+    num_prediction_steps=15,          # 预测步数，None = 使用模型默认值
+)
+
+# ── 输出字段 ──────────────────────────────────────────────────
+causal_effect = result['causal_effect']  # dict[str, Tensor[N, steps, 1]]
+#   causal_effect['fmri']: [N_fmri, 15, 1] — 扰动 - 基线（因果净效应）
+#   正值 = 被激活；负值 = 被抑制
+
+baseline      = result['baseline']       # dict[str, Tensor[N, steps, 1]]  无干预预测
+perturbed     = result['perturbed']      # dict[str, Tensor[N, steps, 1]]  有干预预测
+encoded_base  = result['encoded_baseline']  # dict[str, Tensor[N, T, H]]  潜空间（用于检查）
+
+# 示例：找到受激活最强的 10 个 ROI
+fmri_causal = causal_effect['fmri'].squeeze(-1)          # [N_fmri, 15]
+max_effect_per_roi = fmri_causal.abs().max(dim=1).values  # [N_fmri]
+top10_rois = max_effect_per_roi.argsort(descending=True)[:10].tolist()
+print("受影响最强的 10 个 fMRI ROI:", top10_rois)
+```
+
+**`delta` 参数说明**：
+
+| `delta` 值 | 类比实验 | 效应 |
+|-----------|---------|------|
+| `2.0` | 强兴奋性 TMS | 大幅激活目标区域 |
+| `1.0` | 温和兴奋性 TMS | 接近自然波动幅度的激活 |
+| `-1.0` | 抑制性 TMS / GABA | 抑制目标区域 |
+| `Tensor[H]` | 特定方向干预 | 在潜空间特定方向施加扰动 |
+
+---
+
+### 12.8 有效连通性矩阵（EC）
+
+`compute_effective_connectivity()` 实现 NPI（Luo et al. 2025, *Nature Methods*）算法，返回有向 N×N EC 矩阵：
+
+```python
+# 单窗口 EC 估计
+ec = twin.compute_effective_connectivity(
+    data_windows=graph,          # 单个 HeteroData 或 list[HeteroData]（多窗口平均）
+    modality='fmri',             # 计算哪个模态的 EC
+    perturbation_strength=1.0,   # 扰动幅度（单位：latent std）
+    signed=True,                 # True = 有向有符号；False = 绝对值
+    normalize=True,              # 是否归一化到 [-1, 1]
+)
+# ec: Tensor[N_fmri, N_fmri]
+# ec[j, i] = 区域 i 对区域 j 的因果影响强度
+
+# 多窗口平均（更稳定的估计，类似多试次平均）
+ec_avg = twin.compute_effective_connectivity(
+    data_windows=[graph1, graph2, graph3],
+    modality='fmri',
+)
+# ec_avg: Tensor[N_fmri, N_fmri]（跨窗口平均后归一化）
+
+# 转为 numpy
+ec_np = ec_avg.cpu().numpy()   # [N_fmri, N_fmri]
+```
+
+**输出解读**：
+
+| 值域 | 含义（`normalize=True`） |
+|------|------------------------|
+| `ec[j, i] ≈ 1.0` | 区域 i 对区域 j 有强正向因果驱动 |
+| `ec[j, i] ≈ -1.0` | 区域 i 对区域 j 有强抑制性因果作用 |
+| `ec[j, i] ≈ 0.0` | 区域 i 对区域 j 无因果影响 |
+| `ec[i, i]` | 自连通（对角线），通常强正值 |
+
+---
+
+### 12.9 功能连通性矩阵（FC）
+
+`compute_model_fc()` 计算预测潜变量的 Pearson 相关矩阵（用于与真实 FC 对比验证模型质量）：
+
+```python
+fc = twin.compute_model_fc(
+    data_windows=[graph1, graph2],  # 建议多窗口以增加统计量
+    modality='fmri',
+)
+# fc: Tensor[N_fmri, N_fmri]，对称矩阵，值域 [-1, 1]
+# fc[i, j] = 区域 i 和区域 j 的模型预测潜变量 Pearson 相关系数
+
+fc_np = fc.cpu().numpy()   # [N_fmri, N_fmri]
+```
+
+> **FC vs EC 对比**：FC 是对称相关（不含方向信息），EC 是非对称因果（有方向）。将 FC 与经验 FC（真实 BOLD 的 Pearson 矩阵）做 Pearson 相关，可验证模型是否捕获了真实的功能连接拓扑（NPI 验证策略）。
+
+---
+
+### 12.10 梯度归因（功能指纹）
+
+`compute_attribution()` 计算梯度显著性图，揭示哪些脑区驱动目标区域的预测：
+
+```python
+saliency = twin.compute_attribution(
+    data=graph,
+    target_modality='fmri',     # 预测目标的模态
+    target_nodes=[0, 1, 2],     # 目标 ROI 索引（默认网络核心节点）
+    target_timestep=-1,         # 哪个预测时间步（-1 = 最远未来步，最能体现因果性）
+)
+# saliency: dict[str, Tensor[N, T, C]]
+# saliency['eeg']:  [N_eeg,  T_eeg,  1]  EEG 节点对目标 fMRI 预测的梯度
+# saliency['fmri']: [N_fmri, T_fmri, 1]  fMRI 节点对目标 fMRI 预测的梯度
+
+# 每个节点的标量重要性
+fmri_importance = saliency['fmri'].abs().mean(dim=(1, 2))  # [N_fmri]
+eeg_importance  = saliency['eeg'].abs().mean(dim=(1, 2))   # [N_eeg]
+
+# Top-5 最重要的 fMRI ROI（功能指纹）
+top5 = fmri_importance.argsort(descending=True)[:5].tolist()
+```
+
+---
+
+### 12.11 少样本个性化适应
+
+`adapt_to_subject()` 仅更新被试嵌入（O(H) 参数），冻结所有其他参数：
+
+```python
+# subject_idx 来自 subject_to_idx 映射，新被试可追加一个新条目（新索引）
+new_subject_idx = len(twin.subject_to_idx)   # 例如 3（第 4 个被试）
+
+twin.adapt_to_subject(
+    data_list=[graph_window1, graph_window2, ...],   # 该被试的 10-50 个窗口
+    subject_idx=new_subject_idx,
+    num_steps=100,   # 梯度下降步数（100 步通常已足够）
+    lr=5e-3,         # 学习率（高于主训练，因仅更新 H 个参数）
+    verbose=True,    # 每 10 步打印 loss
+)
+# 适应后 twin.model.subject_embed.weight[new_subject_idx] 已更新
+# 后续调用 predict_future / simulate_intervention 时传入携带此 subject_idx 的 graph 即可
+```
+
+> **前提条件**：模型必须在训练时设置 `num_subjects > 0`（即训练集包含多于一个被试）。若 `num_subjects=0`，此方法抛出 `RuntimeError`。
+
+---
+
+*本文件适用于 TwinBrain V5.54+。如发现不一致之处，以源代码（`main.py`、`utils/helpers.py`、`models/graph_native_system.py`、`models/digital_twin_inference.py`）为准。*
