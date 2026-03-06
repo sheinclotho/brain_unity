@@ -118,22 +118,44 @@ def wolf_largest_lyapunov(
     log_growth: List[float] = []
     log_sum = 0.0
 
+    # `wolf_rollout_pair` correctly handles both WC mode (fixed equilibrium)
+    # and twin mode (advancing context window).  Falling back to the old
+    # `rollout()` pair is kept only for custom simulator objects that have
+    # not yet implemented this method.
+    use_wolf_pair = hasattr(simulator, "wolf_rollout_pair")
+    wolf_context = None  # opaque per-mode state carried between periods
+
     for _ in range(n_periods):
         # Perturbed initial point for this period
         x_pert = np.clip(
             x_cur + (epsilon * perturb).astype(np.float32), 0.0, 1.0
         )
 
-        # Evolve both trajectories for renorm_steps steps
-        traj_base, _ = simulator.rollout(x0=x_cur, steps=renorm_steps, stimulus=None)
-        traj_pert, _ = simulator.rollout(x0=x_pert, steps=renorm_steps, stimulus=None)
-
-        # State after renorm_steps steps
-        x_after = traj_base[-1]
-        x_after_pert = traj_pert[-1]
+        if use_wolf_pair:
+            # Preferred path: per-mode correct Wolf integration.
+            x_after, x_after_pert, wolf_context = simulator.wolf_rollout_pair(
+                x_base=x_cur,
+                x_pert=x_pert,
+                steps=renorm_steps,
+                wolf_context=wolf_context,
+            )
+        else:
+            # Legacy fallback: resets equilibrium / context every period.
+            # Kept for backward compatibility with custom simulator objects.
+            traj_base, _ = simulator.rollout(
+                x0=x_cur, steps=renorm_steps, stimulus=None
+            )
+            traj_pert, _ = simulator.rollout(
+                x0=x_pert, steps=renorm_steps, stimulus=None
+            )
+            x_after = traj_base[-1]
+            x_after_pert = traj_pert[-1]
 
         # Separation vector and its magnitude
-        delta = (x_after_pert - x_after).astype(np.float64)
+        delta = (
+            np.asarray(x_after_pert, dtype=np.float64)
+            - np.asarray(x_after, dtype=np.float64)
+        )
         r = np.linalg.norm(delta)
 
         # Guard against numerical underflow
@@ -146,7 +168,7 @@ def wolf_largest_lyapunov(
 
         # Renormalize: reset separation to ε in the direction of current delta
         perturb = delta / (r + 1e-15)
-        x_cur = x_after
+        x_cur = np.asarray(x_after, dtype=np.float32)
 
     lle = log_sum / (n_periods * renorm_steps)
     return float(lle), np.array(log_growth, dtype=np.float64)
@@ -404,6 +426,7 @@ def run_lyapunov_analysis(
         "log_growth_curve": log_growth_curve,
         "chaos_regime": chaos_info,
         "method": method,
+        "renorm_steps": int(renorm_steps),
     }
 
     if output_dir is not None:

@@ -516,7 +516,7 @@ def _save_plots(results: dict, output_dir: Path, simulator) -> None:
         if len(lya_results.get("log_growth_curve", [])) > 0:
             plot_lyapunov_growth(
                 lya_results["log_growth_curve"],
-                renorm_steps=cfg.get("lyapunov", {}).get("renorm_steps", 20),
+                renorm_steps=lya_results.get("renorm_steps", 20),
                 mean_lle=lya_results["mean_lyapunov"],
                 chaos_regime=lya_results["chaos_regime"]["regime"],
                 save_path=plots_dir / "lyapunov_growth.png",
