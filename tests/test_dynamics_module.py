@@ -809,5 +809,181 @@ class TestFreeDynamicsGPU(unittest.TestCase):
         self.assertIn(sim.device, ("cpu", "cuda"))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# predict_future improvements (num_steps forwarding, error surfacing)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPredictFutureErrorSurfacing(unittest.TestCase):
+    """Tests that predict_future surfaces real errors instead of returning {}."""
+
+    def setUp(self):
+        _models_dir = Path(__file__).parent.parent / "models"
+        if str(_models_dir.parent) not in sys.path:
+            sys.path.insert(0, str(_models_dir.parent))
+
+    def test_predict_future_passes_num_steps_to_predictor(self):
+        """predict_future forwards num_steps to predict_next (was previously ignored)."""
+        from models.graph_native_system import GraphNativeBrainModel
+        from models.digital_twin_inference import TwinBrainDigitalTwin
+        from torch_geometric.data import HeteroData
+
+        H, N_local, T_ctx = 32, N, 20
+        model = GraphNativeBrainModel(
+            node_types=["fmri"],
+            edge_types=[("fmri", "connects", "fmri")],
+            in_channels_dict={"fmri": 1},
+            hidden_channels=H,
+        )
+        model.eval()
+        twin = TwinBrainDigitalTwin(model=model, device="cpu")
+
+        g = HeteroData()
+        g["fmri"].x = torch.randn(N_local, T_ctx, 1)
+        g["fmri", "connects", "fmri"].edge_index = torch.zeros(2, 0, dtype=torch.long)
+
+        pred = twin.predict_future(g, num_steps=3)
+        self.assertIn("fmri", pred)
+        # The returned prediction should have 3 steps (not the model default of 10)
+        self.assertEqual(pred["fmri"].shape[1], 3)
+
+    def test_predict_future_raises_on_decoder_failure(self):
+        """predict_future raises RuntimeError (not returns {}) when decoder fails."""
+        from models.graph_native_system import GraphNativeBrainModel
+        from models.digital_twin_inference import TwinBrainDigitalTwin
+        from torch_geometric.data import HeteroData
+
+        H, N_local, T_ctx = 32, N, 20
+        model = GraphNativeBrainModel(
+            node_types=["fmri"],
+            edge_types=[("fmri", "connects", "fmri")],
+            in_channels_dict={"fmri": 1},
+            hidden_channels=H,
+        )
+        model.eval()
+        twin = TwinBrainDigitalTwin(model=model, device="cpu")
+
+        # Patch the decoder's forward method to always raise
+        import unittest.mock
+        with unittest.mock.patch.object(
+            model.decoder, "forward",
+            side_effect=RuntimeError("simulated decoder failure"),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                g = HeteroData()
+                g["fmri"].x = torch.randn(N_local, T_ctx, 1)
+                g["fmri", "connects", "fmri"].edge_index = torch.zeros(2, 0, dtype=torch.long)
+                twin.predict_future(g, num_steps=5)
+
+        self.assertIn("decoder failed", str(ctx.exception))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Context trimming for 8 GB GPU support
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestContextTrimming(unittest.TestCase):
+    """
+    Tests that _rollout_with_twin trims context to context_length.
+
+    This is the key 8-GB-GPU memory optimisation: the encoder always receives
+    [N, context_length, C] instead of [N, T_base, C], reducing peak activation
+    memory by T_base / context_length (≈1.9× for T_base=384, context_length=200).
+    """
+
+    def setUp(self):
+        _models_dir = Path(__file__).parent.parent / "models"
+        if str(_models_dir.parent) not in sys.path:
+            sys.path.insert(0, str(_models_dir.parent))
+
+    def _make_sim(self, T_base: int, context_length: int, pred_steps: int = 3):
+        """Create a BrainDynamicsSimulator whose base_graph has T_base timesteps."""
+        from models.graph_native_system import GraphNativeBrainModel
+        from models.digital_twin_inference import TwinBrainDigitalTwin
+        from torch_geometric.data import HeteroData
+
+        H = 16
+        model = GraphNativeBrainModel(
+            node_types=["fmri"],
+            edge_types=[("fmri", "connects", "fmri")],
+            in_channels_dict={"fmri": 1},
+            hidden_channels=H,
+            prediction_steps=pred_steps,
+            predictor_config={"context_length": context_length},
+        )
+        model.eval()
+        twin = TwinBrainDigitalTwin(model=model, device="cpu")
+
+        g = HeteroData()
+        # T_base > context_length to trigger the trimming path
+        g["fmri"].x = torch.randn(N, T_base, 1)
+        g["fmri", "connects", "fmri"].edge_index = torch.zeros(2, 0, dtype=torch.long)
+
+        sim = BrainDynamicsSimulator(model=twin, base_graph=g, modality="fmri", device="cpu")
+        return sim, twin, model
+
+    def test_context_not_mutated_by_rollout(self):
+        """_rollout_with_twin must not mutate base_graph."""
+        sim, _, _ = self._make_sim(T_base=30, context_length=10, pred_steps=3)
+        original_T = sim.base_graph["fmri"].x.shape[1]
+        sim.rollout(steps=6)
+        self.assertEqual(sim.base_graph["fmri"].x.shape[1], original_T)
+
+    def test_rollout_produces_correct_steps(self):
+        """_rollout_with_twin returns (steps, n_regions) trajectory."""
+        sim, _, _ = self._make_sim(T_base=30, context_length=10, pred_steps=3)
+        traj, times = sim.rollout(steps=9)
+        self.assertEqual(traj.shape, (9, N))
+        self.assertEqual(times.shape, (9,))
+
+    def test_context_trimmed_internally(self):
+        """
+        The context passed to the encoder must be context_length steps (not T_base).
+
+        We verify this by monkey-patching predict_future to record the input
+        context shape and checking it matches context_length, not T_base.
+        """
+        import unittest.mock
+        T_BASE = 30
+        CTX_LEN = 10
+
+        sim, twin, _ = self._make_sim(T_base=T_BASE, context_length=CTX_LEN, pred_steps=3)
+
+        observed_T = []
+        original_predict = twin.predict_future
+
+        def recording_predict(data, num_steps=None):
+            observed_T.append(data["fmri"].x.shape[1])
+            return original_predict(data, num_steps=num_steps)
+
+        with unittest.mock.patch.object(twin, "predict_future", side_effect=recording_predict):
+            sim.rollout(steps=6)
+
+        # All calls should receive exactly context_length steps
+        self.assertTrue(all(t == CTX_LEN for t in observed_T),
+                        f"Expected all context lengths == {CTX_LEN}, got {observed_T}")
+
+    def test_no_trim_when_base_shorter_than_context(self):
+        """If T_base <= context_length, no trimming should occur."""
+        import unittest.mock
+        T_BASE = 8
+        CTX_LEN = 10  # base is already shorter
+
+        sim, twin, _ = self._make_sim(T_base=T_BASE, context_length=CTX_LEN, pred_steps=3)
+
+        observed_T = []
+        original_predict = twin.predict_future
+
+        def recording_predict(data, num_steps=None):
+            observed_T.append(data["fmri"].x.shape[1])
+            return original_predict(data, num_steps=num_steps)
+
+        with unittest.mock.patch.object(twin, "predict_future", side_effect=recording_predict):
+            sim.rollout(steps=6)
+
+        # All calls should use the full T_BASE (no trimming should occur)
+        self.assertTrue(all(t == T_BASE for t in observed_T),
+                        f"Expected context length == {T_BASE} (no trim), got {observed_T}")
+
+
 if __name__ == "__main__":
     unittest.main()

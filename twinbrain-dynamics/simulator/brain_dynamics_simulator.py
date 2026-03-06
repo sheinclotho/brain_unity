@@ -767,6 +767,41 @@ class BrainDynamicsSimulator:
         trajectories = np.concatenate(all_chunks, axis=1)  # (n_batch, steps, N)
         return trajectories, times
 
+    # ── Private helpers ─────────────────────────────────────────────────────────
+
+    def _trim_context(self, context: HeteroData) -> HeteroData:
+        """
+        Trim ``context[modality].x`` to ``predictor.context_length`` timesteps.
+
+        The encoder processes all T timesteps, producing ``[N, T, H]`` activation
+        tensors.  The predictor only reads the last ``context_length`` of those T
+        steps, so sending more than ``context_length`` timesteps wastes VRAM.
+        Trimming to ``context_length`` reduces peak encoder activation memory by
+        ``T_base / context_length`` (≈1.9× for T_base=384, context_length=200),
+        enabling n_init=200, steps=1000 experiments to fit on an 8 GB GPU.
+
+        The original ``self.base_graph`` is never mutated — this operates on a
+        clone returned by ``_clone_hetero_graph``.
+
+        Returns:
+            The same ``context`` object with ``context[modality].x`` replaced by
+            its last ``context_length`` (or fewer) timesteps.
+        """
+        _predictor = getattr(getattr(self.model, "model", None), "predictor", None)
+        _ctx_len: int = getattr(_predictor, "context_length", 200)
+        if _predictor is None or not hasattr(_predictor, "context_length"):
+            logger.debug(
+                "_trim_context: predictor.context_length not found; "
+                "defaulting to %d. Model hierarchy: model=%s, model.model=%s.",
+                _ctx_len,
+                type(self.model).__name__,
+                type(getattr(self.model, "model", None)).__name__,
+            )
+        ctx_x = context[self.modality].x  # [N, T_base, C]
+        if ctx_x.shape[1] > _ctx_len:
+            context[self.modality].x = ctx_x[:, -_ctx_len:, :]
+        return context
+
     # ── Private: TwinBrain twin-mode rollout ────────────────────────────────────
 
     def _rollout_with_twin(
@@ -785,11 +820,22 @@ class BrainDynamicsSimulator:
 
         The context window is advanced by ``chunk_size`` steps at each iteration
         (sliding window: drop the oldest chunk, append the new prediction).
+
+        Memory optimisation (8 GB GPU support):
+            ``_trim_context`` is called once at rollout start to trim the history
+            from T_base (e.g. 384) down to ``predictor.context_length`` (≤200).
+            The ``_advance_context`` sliding window then maintains this shorter
+            length throughout, so the encoder always receives
+            ``[N, context_length, C]`` rather than ``[N, T_base, C]``.
+            This reduces peak encoder activation memory by T_base / context_length
+            (≈1.9× for T_base=384, context_length=200).
         """
         chunk_size: int = getattr(getattr(self.model, "model", None), "prediction_steps", 50)
 
-        # Clone the base graph to avoid mutating the original
-        context = _clone_hetero_graph(self.base_graph)
+        # Clone base_graph and trim context to predictor.context_length steps
+        # to reduce encoder activation memory (see _trim_context for details).
+        context = self._trim_context(_clone_hetero_graph(self.base_graph))
+
         trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
         times = np.arange(steps, dtype=np.float32) * self.dt
 
@@ -820,9 +866,18 @@ class BrainDynamicsSimulator:
             else:
                 pred_dict = self.model.predict_future(context, num_steps=req_steps)
                 if self.modality not in pred_dict:
+                    # predict_future now raises RuntimeError directly on decoder
+                    # failures, so reaching here means prediction was simply
+                    # unavailable (use_prediction=False or all node type sequences
+                    # were shorter than _PRED_MIN_SEQ_LEN).
                     raise RuntimeError(
                         f"模型未返回模态 '{self.modality}' 的预测。\n"
-                        f"可用模态: {list(pred_dict.keys())}"
+                        f"可用模态: {list(pred_dict.keys())}\n"
+                        "可能原因:\n"
+                        "  1. 模型以 use_prediction=False 训练（不支持自由动力学预测）。\n"
+                        "  2. 上下文序列长度 < _PRED_MIN_SEQ_LEN (4)，无法进行预测。\n"
+                        "  3. 加载检查点时缺少 config.yaml，导致 prediction_steps 不匹配。\n"
+                        f"  n_regions={self.n_regions}, modality={self.modality}"
                     )
                 pred = pred_dict[self.modality]  # [N, req_steps, 1]
 
@@ -846,10 +901,12 @@ class BrainDynamicsSimulator:
         Autoregressive rollout with multiple simultaneous stimuli using TwinBrainDigitalTwin.
 
         All active stimuli in a chunk are packed into the ``interventions`` dict.
+        Context trimming (same as ``_rollout_with_twin``) is applied to reduce
+        encoder activation memory on small GPUs.
         """
         chunk_size: int = getattr(getattr(self.model, "model", None), "prediction_steps", 50)
 
-        context = _clone_hetero_graph(self.base_graph)
+        context = self._trim_context(_clone_hetero_graph(self.base_graph))
         trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
         times = np.arange(steps, dtype=np.float32) * self.dt
 
@@ -885,7 +942,8 @@ class BrainDynamicsSimulator:
                 if self.modality not in pred_dict:
                     raise RuntimeError(
                         f"模型未返回模态 '{self.modality}' 的预测。\n"
-                        f"可用模态: {list(pred_dict.keys())}"
+                        f"可用模态: {list(pred_dict.keys())}\n"
+                        "可能原因: 模型以 use_prediction=False 训练，或上下文序列过短。"
                     )
                 pred = pred_dict[self.modality]
 

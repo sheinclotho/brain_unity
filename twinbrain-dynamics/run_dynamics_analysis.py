@@ -168,6 +168,10 @@ def run(cfg: dict) -> dict:
     """
     Run the full dynamics analysis pipeline.
 
+    Loads a trained TwinBrainDigitalTwin model and drives the complete
+    dynamics-analysis workflow (free dynamics → attractor analysis →
+    virtual stimulation → response matrix → stability analysis).
+
     Args:
         cfg: Merged configuration dictionary.
 
@@ -175,8 +179,8 @@ def run(cfg: dict) -> dict:
         results: Dictionary containing all computed artefacts.
 
     Raises:
-        RuntimeError: If the model path is provided but loading fails.
-        ValueError:   If model mode is enabled but graph_path is not specified.
+        ValueError:   If model_path or graph_path is not specified.
+        RuntimeError: If the model fails to load or run inference.
     """
     from loader.load_model import load_trained_model, load_graph_for_inference
     from simulator.brain_dynamics_simulator import BrainDynamicsSimulator
@@ -220,7 +224,7 @@ def run(cfg: dict) -> dict:
     # ── Step 1b: Load graph cache ─────────────────────────────────────────────
     if not graph_path:
         raise ValueError(
-            "使用训练模型时必须通过 --graph 或配置文件 model.graph_path 指定图缓存路径。\n"
+            "必须通过 --graph 或配置文件 model.graph_path 指定图缓存路径。\n"
             "图缓存位于 outputs/graph_cache/<subject_id>_<task>_<hash>.pt\n"
             "示例: --graph outputs/graph_cache/sub-01_notask_ff12ab34.pt"
         )
@@ -460,7 +464,7 @@ def _parse_args() -> argparse.Namespace:
         "--n-init",
         type=int,
         default=None,
-        help="自由动力学独立预测轮次数（覆盖配置，模型模式下建议 ≤ 20）",
+        help="自由动力学独立预测轮次数（覆盖配置，默认 200）",
     )
     parser.add_argument(
         "--steps",
@@ -497,7 +501,7 @@ def main() -> None:
     file_cfg = _load_config(args.config)
     cfg = _merge_config(_DEFAULTS, file_cfg)
 
-    # Apply CLI overrides
+    # Apply CLI overrides (--model and --graph are required by argparse)
     cfg["model"]["path"] = args.model
     cfg["model"]["graph_path"] = args.graph
     if args.training_config:

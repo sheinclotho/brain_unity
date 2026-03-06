@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
+import torch
 
 # Allow running as a standalone script or as an imported module
 import sys
@@ -146,6 +147,10 @@ def run_free_dynamics(
             trajectories[i] = traj
             if (i + 1) % log_interval == 0:
                 logger.info("  %d/%d 初始状态完成", i + 1, n_init)
+            # Proactively release any cached (but unused) GPU memory so that
+            # fragmentation from the previous rollout doesn't cause OOM on the next.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     logger.info("✓ 自由动力学实验完成，轨迹数组形状: %s", trajectories.shape)
 
