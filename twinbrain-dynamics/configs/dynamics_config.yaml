@@ -61,10 +61,11 @@ stability_analysis:
 # Lyapunov exponent estimation
 lyapunov:
   enabled: true
-  method: "wolf"         # "wolf" (recommended, renormalized) or "ftle" (fast)
-  epsilon: 1.0e-5        # Initial perturbation magnitude
-  renorm_steps: 20       # Steps between Wolf renormalization periods
-  skip_fraction: 0.1     # Fraction of trajectory to skip (transient, ftle only)
+  method: "both"          # "wolf" (renormalized), "ftle" (fast), or "both" (cross-validation)
+  epsilon: 1.0e-6         # Nominal perturbation magnitude (reduced from 1e-5 to lower boundary bias)
+  renorm_steps: 50        # Steps between Wolf renormalization periods (increased from 20)
+  skip_fraction: 0.1      # Fraction of trajectory to skip (transient, ftle only)
+  convergence_threshold: 0.01  # Skip Wolf if trajectory distance_ratio < this (system is stable)
 
 # Trajectory convergence analysis
 trajectory_convergence:
