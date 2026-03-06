@@ -37,6 +37,19 @@ from pathlib import Path
 # Suppress Intel OpenMP duplicate-runtime crash (see AGENTS.md)
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+# Fix joblib "Could not find the number of physical cores" warning on Windows:
+# joblib queries physical cores via a subprocess call that may fail in some
+# environments (e.g. Anaconda on Windows). Silencing it by pinning the count.
+# Trade-off: this restricts joblib to 1 worker for parallel calls, which does
+# not affect the current pipeline (all parallelism is via PyTorch/CUDA or NumPy).
+# Users who need >1 joblib worker can set LOKY_MAX_CPU_COUNT in their shell.
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
+
+# Fix sklearn KMeans "memory leak on Windows with MKL" warning:
+# Setting OMP_NUM_THREADS=1 prevents the MKL thread pool from spawning more
+# threads than KMeans chunks, eliminating the warning without affecting results.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 # Ensure the package root is on sys.path when run directly
 _ROOT = Path(__file__).parent
 if str(_ROOT) not in sys.path:
@@ -156,8 +169,11 @@ _DEFAULTS = {
     },
     "lyapunov": {
         "enabled": True,
-        "epsilon": 1e-5,       # Initial perturbation magnitude
-        "skip_fraction": 0.1,  # Skip initial transient fraction when fitting
+        "method": "both",          # "wolf", "ftle", or "both" (cross-validation)
+        "epsilon": 1e-6,           # Nominal perturbation magnitude (reduced from 1e-5)
+        "renorm_steps": 50,        # Steps per Wolf period (increased from 20)
+        "skip_fraction": 0.1,      # Skip initial transient fraction when fitting (FTLE)
+        "convergence_threshold": 0.01,  # Skip Wolf if distance_ratio < this
     },
     "trajectory_convergence": {
         "enabled": True,
@@ -393,10 +409,12 @@ def run(cfg: dict) -> dict:
             lyapunov_results = run_lyapunov_analysis(
                 trajectories=trajectories,
                 simulator=simulator,
-                epsilon=lya_cfg.get("epsilon", 1e-5),
-                renorm_steps=lya_cfg.get("renorm_steps", 20),
+                epsilon=lya_cfg.get("epsilon", 1e-6),
+                renorm_steps=lya_cfg.get("renorm_steps", 50),
                 skip_fraction=lya_cfg.get("skip_fraction", 0.1),
-                method=lya_cfg.get("method", "wolf"),
+                method=lya_cfg.get("method", "both"),
+                convergence_result=results.get("trajectory_convergence"),
+                convergence_threshold=lya_cfg.get("convergence_threshold", 0.01),
                 output_dir=output_dir,
             )
             results["lyapunov"] = lyapunov_results
