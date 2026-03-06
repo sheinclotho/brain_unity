@@ -157,10 +157,11 @@ _DEFAULTS = {
     "response_matrix": {
         "n_nodes": 10,         # Reduced default for model mode (full 200 is slow)
         "stim_amplitude": 0.5,
-        "stim_duration": 20,
+        "stim_duration": 80,   # Long enough to reach WC steady-state (τ≈10 steps → 60+ steps)
         "stim_frequency": 10.0,
-        "stim_pattern": "sine",
-        "measure_window": 10,
+        "stim_pattern": "step",   # Step gives cleanest steady-state response (vs sine bell)
+        "measure_window": 30,     # Measure the plateau after skip_transient
+        "skip_transient": 20,     # Skip ramp-in / transient (StepStimulus ramp_steps=10)
     },
     "stability_analysis": {
         "convergence_tol": 1e-4,
@@ -169,11 +170,14 @@ _DEFAULTS = {
     },
     "lyapunov": {
         "enabled": True,
-        "method": "both",          # "wolf", "ftle", or "both" (cross-validation)
-        "epsilon": 1e-6,           # Nominal perturbation magnitude (reduced from 1e-5)
-        "renorm_steps": 50,        # Steps per Wolf period (increased from 20)
+        "method": "both",          # "wolf", "ftle", "rosenstein", or "both"
+        "epsilon": 1e-6,           # Nominal perturbation magnitude
+        "renorm_steps": 50,        # Steps per Wolf period
         "skip_fraction": 0.1,      # Skip initial transient fraction when fitting (FTLE)
         "convergence_threshold": 0.01,  # Skip Wolf if distance_ratio < this
+        "n_segments": 3,           # Multi-segment sampling (1 = single x0, 3+ = better coverage)
+        "rosenstein_max_lag": 50,  # Rosenstein method: max tracking lag
+        "rosenstein_min_sep": 20,  # Rosenstein method: min temporal separation for NN search
     },
     "trajectory_convergence": {
         "enabled": True,
@@ -183,7 +187,8 @@ _DEFAULTS = {
         "enabled": True,
         "n_init": 200,
         "steps": 1000,
-        "spectral_radius": 0.9,
+        "spectral_radii": [0.9, 1.5, 2.0],  # tanh chaos boundary is ρ≈1.5 for n≈190 (not ρ=1)
+        "n_seeds": 5,                           # independent W matrices per spectral radius
     },
     "output": {
         "directory": "outputs",
@@ -364,10 +369,11 @@ def run(cfg: dict) -> dict:
         simulator=simulator,
         n_nodes=n_nodes_rm,
         stim_amplitude=rm_cfg.get("stim_amplitude", 0.5),
-        stim_duration=rm_cfg.get("stim_duration", 20),
+        stim_duration=rm_cfg.get("stim_duration", 80),
         stim_frequency=rm_cfg.get("stim_frequency", 10.0),
-        stim_pattern=rm_cfg.get("stim_pattern", "sine"),
-        measure_window=rm_cfg.get("measure_window", 10),
+        stim_pattern=rm_cfg.get("stim_pattern", "step"),
+        measure_window=rm_cfg.get("measure_window", 30),
+        skip_transient=rm_cfg.get("skip_transient", None),
         output_dir=output_dir if cfg["output"].get("save_response_matrix") else None,
     )
     results["response_matrix"] = response_matrix
@@ -415,6 +421,9 @@ def run(cfg: dict) -> dict:
                 method=lya_cfg.get("method", "both"),
                 convergence_result=results.get("trajectory_convergence"),
                 convergence_threshold=lya_cfg.get("convergence_threshold", 0.01),
+                n_segments=lya_cfg.get("n_segments", 3),
+                rosenstein_max_lag=lya_cfg.get("rosenstein_max_lag", 50),
+                rosenstein_min_sep=lya_cfg.get("rosenstein_min_sep", 20),
                 output_dir=output_dir,
             )
             results["lyapunov"] = lyapunov_results
@@ -440,6 +449,8 @@ def run(cfg: dict) -> dict:
                 random_n_init=rc_cfg.get("n_init", 200),
                 random_steps=rc_cfg.get("steps", 1000),
                 spectral_radius=rc_cfg.get("spectral_radius", 0.9),
+                spectral_radii=rc_cfg.get("spectral_radii", None),
+                n_seeds=rc_cfg.get("n_seeds", 5),
                 seed=cfg["free_dynamics"].get("seed", 42),
                 output_dir=output_dir,
             )

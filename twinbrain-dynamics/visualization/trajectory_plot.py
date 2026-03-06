@@ -204,10 +204,25 @@ def plot_lyapunov_growth(
     """
     绘制 Wolf 方法的累积对数增长曲线（log-growth curve）。
 
-    曲线斜率即为最大 Lyapunov 指数（LLE）：
-      - 正斜率 → 轨迹指数发散（混沌）
-      - 负斜率 → 轨迹指数收敛（稳定）
-      - 水平    → 边缘稳定
+    **左图 — 逐周期对数增长（Per-Period Log Growth）**
+    每个重归一化周期的 log(r/ε) 值，用柱状图显示。
+    - 正值（红色）→ 扰动放大 → 该周期混沌
+    - 负值（蓝色）→ 扰动收缩 → 该周期收敛
+    - 覆盖滑动平均线（绿色）→ 显示 LLE 估计随周期的收敛过程
+    - 橙色阴影 → ±1σ 带，显示周期到周期的波动范围
+
+    **注意：后段柱子高度一致是正常现象。**
+    Wolf 方法在扰动向量对齐到优势 Lyapunov 向量（通常 3–6 个周期）后，
+    每个周期的增长率会收敛到一个稳定值（= LLE × renorm_steps），
+    产生"完全相同"的柱子。这不是代码错误，而是算法收敛的数学必然结果。
+
+    **右图 — 去趋势累积对数增长（Detrended Cumulative Log Growth）**
+    原始累积和为 S(t) = Σ log_growth[k]，对于已收敛的 LLE 这是一条完美直线。
+    此图显示去线性趋势后的残差：S_detrended(t) = S(t) − fit(t)。
+    残差揭示：
+    - 暂态区（前几个周期）：误差最大，因 Lyapunov 向量还未对齐
+    - 收敛后：残差接近零（稳定直线）
+    - 非稳态或多吸引子系统：残差持续波动（混沌行为标志）
 
     Args:
         log_growth_curve: shape (n_periods,)，每个重归一化周期的 log(r/ε) 值。
@@ -223,46 +238,125 @@ def plot_lyapunov_growth(
     if n_periods == 0:
         return
 
-    # Cumulative sum = running total of log-growth, proportional to LLE × time
     cumulative = np.cumsum(log_growth_curve)
     steps_axis = np.arange(1, n_periods + 1) * renorm_steps
 
-    # Fit a line to the cumulative sum; slope = LLE per step
+    # Linear fit to cumulative sum (slope = LLE per step)
     coeffs = np.polyfit(steps_axis, cumulative, deg=1)
     fit_line = np.polyval(coeffs, steps_axis)
     fit_slope = coeffs[0]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    # Detrended cumulative: residuals after removing linear trend.
+    # For a fully-converged stable system this will be flat near zero.
+    # For a chaotic / non-stationary system this will fluctuate.
+    detrended = cumulative - fit_line
 
-    # Left: per-period log-growth
-    axes[0].bar(np.arange(n_periods), log_growth_curve,
-                color=["tomato" if v > 0 else "steelblue" for v in log_growth_curve],
-                alpha=0.75, edgecolor="white")
-    axes[0].axhline(0.0, color="black", linewidth=0.8, linestyle="--")
-    axes[0].axhline(float(np.mean(log_growth_curve)), color="red", linewidth=1.2,
-                    linestyle="-", label=f"mean={np.mean(log_growth_curve):.4f}")
-    axes[0].set_xlabel("Renormalization Period")
-    axes[0].set_ylabel("log(r/ε) per period")
-    axes[0].set_title("Per-Period Log Growth\n(red=chaotic, blue=convergent)")
-    axes[0].legend(fontsize=8)
-    axes[0].grid(True, alpha=0.3)
+    # Running mean (causal, window = min(5, n_periods//4+1))
+    win = max(1, min(5, n_periods // 4 + 1))
+    running_mean = np.convolve(log_growth_curve, np.ones(win) / win, mode="valid")
+    # Pad left to match length
+    pad_left = n_periods - len(running_mean)
+    running_mean = np.concatenate([np.full(pad_left, np.nan), running_mean])
 
-    # Right: cumulative sum with linear fit
-    axes[1].plot(steps_axis, cumulative, color="navy", linewidth=1.5, label="Cumulative log-growth")
-    axes[1].plot(steps_axis, fit_line, color="red", linewidth=1.2, linestyle="--",
-                 label=f"Fit slope (LLE) = {fit_slope:.5f}/step")
-    axes[1].axhline(0.0, color="black", linewidth=0.8)
-    axes[1].set_xlabel("Step")
-    axes[1].set_ylabel("Cumulative log-growth S(t)")
+    # Detect convergence: require 3 consecutive periods within 10% of final value
+    # to avoid false positives from transient dips into the tolerance window.
+    final_rm = running_mean[~np.isnan(running_mean)][-1] if n_periods > win else None
+    converge_period = None
+    if final_rm is not None and abs(final_rm) > 1e-9:
+        tol = abs(final_rm) * 0.10   # 10% tolerance
+        min_consecutive = 3
+        consecutive = 0
+        for k in range(pad_left, n_periods):
+            if abs(running_mean[k] - final_rm) < tol:
+                consecutive += 1
+                if consecutive >= min_consecutive and converge_period is None:
+                    converge_period = k - min_consecutive + 1
+            else:
+                consecutive = 0
+
+    # ±1σ statistics (from the converged portion if detectable)
+    conv_start = converge_period if converge_period is not None else n_periods // 3
+    conv_values = log_growth_curve[conv_start:]
+    conv_mean = float(np.mean(conv_values)) if len(conv_values) > 0 else float(np.mean(log_growth_curve))
+    conv_std = float(np.std(conv_values)) if len(conv_values) > 1 else 0.0
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+
+    # ── Left: per-period log-growth with running mean and ±1σ ─────────────────
+    ax = axes[0]
+    bar_colors = ["tomato" if v > 0 else "steelblue" for v in log_growth_curve]
+    ax.bar(np.arange(n_periods), log_growth_curve,
+           color=bar_colors, alpha=0.60, edgecolor="white", label="Per-period log(r/ε)")
+    ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+    ax.axhline(conv_mean, color="red", linewidth=1.2, linestyle="-",
+               label=f"converged mean = {conv_mean:.4f}")
+
+    # ±1σ band around converged mean
+    if conv_std > 0:
+        ax.fill_between(
+            np.arange(n_periods),
+            conv_mean - conv_std, conv_mean + conv_std,
+            alpha=0.12, color="orange", label=f"±1σ = {conv_std:.4f}",
+        )
+
+    # Running mean line (shows convergence)
+    ax.plot(np.arange(n_periods), running_mean, color="limegreen", linewidth=1.5,
+            linestyle="-", zorder=5, label=f"Running mean (w={win})")
+
+    # Shade the transient region
+    if converge_period is not None and converge_period > 0:
+        ax.axvspan(-0.5, converge_period - 0.5, alpha=0.06, color="gray",
+                   label=f"Transient (0–{converge_period - 1})")
+        ax.axvline(converge_period - 0.5, color="gray", linewidth=0.8, linestyle=":")
+
+    ax.set_xlabel("Renormalization Period")
+    ax.set_ylabel("log(r/ε) per period")
+    ax.set_title(
+        "Per-Period Log Growth\n"
+        "✓ Identical bars after convergence are expected (LLE has stabilised)",
+        fontsize=9,
+    )
+    ax.legend(fontsize=7, loc="upper right", ncol=2)
+    ax.grid(True, alpha=0.3)
+
+    # ── Right: detrended cumulative log-growth ────────────────────────────────
+    ax = axes[1]
+    ax.plot(steps_axis, detrended, color="navy", linewidth=1.5,
+            label="Detrended cumulative (S(t) − linear fit)")
+    ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
+
+    # Show the magnitude of transient deviation
+    if converge_period is not None and converge_period > 0:
+        ax.axvspan(steps_axis[0], steps_axis[converge_period - 1],
+                   alpha=0.08, color="gray", label=f"Transient (0–{converge_period - 1})")
+
+    # R² of the linear fit (1.0 = perfect straight line after convergence)
+    ss_res = float(np.sum((cumulative - fit_line) ** 2))
+    ss_tot = float(np.sum((cumulative - cumulative.mean()) ** 2))
+    r2 = 1.0 - ss_res / (ss_tot + 1e-30)
+
     lbl_parts = []
     if mean_lle is not None:
         lbl_parts.append(f"LLE = {mean_lle:.5f}")
     if chaos_regime:
         lbl_parts.append(chaos_regime.upper())
-    axes[1].set_title("Cumulative Log-Growth (Wolf method)\n" +
-                       ("  |  ".join(lbl_parts) if lbl_parts else ""))
-    axes[1].legend(fontsize=8)
-    axes[1].grid(True, alpha=0.3)
+    lbl_parts.append(f"R²(linear) = {r2:.4f}")
+
+    ax.set_xlabel("Step")
+    ax.set_ylabel("S(t) − linear trend")
+    ax.set_title(
+        "Detrended Cumulative Log-Growth\n" +
+        ("  |  ".join(lbl_parts) if lbl_parts else ""),
+        fontsize=9,
+    )
+    ax.text(
+        0.02, 0.05,
+        "R²≈1 → LLE fully converged (straight line)\n"
+        "R²<1 → transient or non-stationary dynamics",
+        transform=ax.transAxes, fontsize=7, va="bottom", color="dimgray",
+    )
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     _save_or_show(fig, save_path)
