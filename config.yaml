@@ -1,0 +1,132 @@
+ablation:
+  disable_cross_modal_edges: false
+data:
+  atlas:
+    file: atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_1mm.nii
+    label_file: atlases/schaefer200_mask_ready.json
+    name: schaefer200
+  cache:
+    dir: outputs/graph_cache
+    enabled: true
+  dti_structural_edges: false
+  fmri_condition_bounds: null
+  fmri_task_mapping: null
+  max_subjects: 0
+  modalities:
+  - eeg
+  - fmri
+  root_dir: F:/twinbrain_v3/test_file3
+  task: null
+  tasks: null
+device:
+  compile_mode: reduce-overhead
+  gpu_memory: 8GB
+  type: cuda
+  use_amp: true
+  use_torch_compile: false
+graph:
+  add_self_loops: true
+  cross_modal_distance_threshold: 30.0
+  eeg_connectivity_method: correlation
+  k_cross_modal: 5
+  k_nearest_eeg: 10
+  k_nearest_fmri: 10
+  make_undirected: true
+  threshold_eeg: 0.2
+  threshold_fmri: 0.3
+model:
+  dropout: 0.2
+  hidden_channels: 128
+  info_nce_temperature: 1.0
+  k_dynamic_neighbors: 5
+  loss_type: huber
+  num_decoder_layers: 3
+  num_encoder_layers: 4
+  pred_step_weight_gamma: 1.0
+  prediction_steps: 50
+  temporal_chunk_size: null
+  type: v5_optimized
+  use_cross_modal_align: true
+  use_dynamic_graph: true
+  use_info_nce: false
+  use_prediction: true
+  use_reconstruction_loss: true
+  use_run_embed: false
+  use_spectral_loss: false
+output:
+  experiment_name: twinbrain_v5
+  log_level: INFO
+  output_dir: outputs\twinbrain_v5_20260306_181440
+  save_graphs: true
+  save_predictions: true
+training:
+  augmentation:
+    enabled: true
+    noise_std: 0.01
+    scale_range:
+    - 0.9
+    - 1.1
+    time_mask_max_ratio: 0.1
+  batch_size: 1
+  best_model_criterion: pred_r2
+  cuda_clear_interval: 50
+  early_stopping_patience: 20
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0001
+  max_grad_norm: 1.0
+  max_seq_len: null
+  num_epochs: 100
+  save_frequency: 10
+  scheduler_type: cosine
+  swa_epochs: 10
+  swa_lr_ratio: 0.05
+  use_adaptive_loss: true
+  use_eeg_enhancement: true
+  use_gradient_checkpointing: true
+  use_scheduler: true
+  use_swa: false
+  val_frequency: 5
+  weight_decay: 1.0e-05
+v5_optimization:
+  adaptive_loss:
+    alpha: 1.5
+    learning_rate: 0.01
+    modality_energy_ratios:
+      eeg: 1.0
+      fmri: 1.0
+    pred_weight_floor: 0.5
+    task_priorities:
+      cross_modal: 0.3
+      pred: 6.0
+      pred_nce: 1.0
+      recon: 1.0
+      spectral: 0.5
+    update_frequency: 80
+    warmup_epochs: 10
+  advanced_prediction:
+    context_length: 200
+    num_prop_layers: 2
+    num_scales: 3
+    num_windows: 3
+    sampling_strategy: uniform
+    use_hierarchical: true
+    use_transformer: true
+    use_uncertainty: false
+  cosine_T0: 50
+  eeg_enhancement:
+    activity_weight: 0.01
+    attention_hidden_dim: 64
+    diversity_weight: 0.01
+    dropout_rate: 0.1
+    enable_attention: true
+    enable_dropout: true
+    enable_monitoring: true
+    enable_regularization: true
+    entropy_weight: 0.01
+  warmup_epochs: 5
+windowed_sampling:
+  cross_modal_align: false
+  eeg_window_size: 250
+  enabled: true
+  fmri_window_size: 50
+  stride_fraction: 0.5
