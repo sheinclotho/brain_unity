@@ -4,19 +4,27 @@ Brain Dynamics Simulator
 
 统一管理所有模拟过程的核心组件。
 
-支持：
-- 外部刺激输入（连续刺激，必须实现 Stimulus.value(t)）
-- 自由演化（无输入）
-- 有模型前向传播（nn.Module，requires can_forward=True）
-- 无模型回退（Wilson-Cowan 漏积分器，与 realtime_server 一致）
+支持两种运行模式：
+
+**模型模式**（推荐）
+  ``BrainDynamicsSimulator(twin, base_graph)``
+  使用 ``TwinBrainDigitalTwin`` 进行基于真实学习动力学的推断：
+    - 自由演化：``twin.predict_future()`` 自回归滑窗预测
+    - 受刺激演化：``twin.simulate_intervention()`` 潜空间扰动
+
+**Wilson-Cowan 模式**（独立基线，非回退）
+  ``BrainDynamicsSimulator(model=None, n_regions=N)``
+  偏差驱动漏积分器，仅供基线对比与单元测试使用。
+  当 ``model`` 被提供但无法前向推断时，**不会**自动切换到此模式，
+  而是直接抛出 ``RuntimeError``。
 
 时间尺度对齐原则（见计划书 §11）:
-  simulation_dt = EEG_dt
-  fMRI 通过下采样观察（每 fmri_subsample 步记录一次）
+  - 模型模式：dt = 1 / fmri_sampling_rate（通常 2 s per TR）
+  - WC 模式：dt = 0.004 s（EEG 采样率）
 
 所有实验均通过此接口进行：
-  step(state, external_input=None)   → 单步演化
-  rollout(x0, steps, stimulus=None) → 连续模拟轨迹
+  rollout(x0, steps, stimulus)          → 连续模拟轨迹
+  rollout_multi_stim(x0, steps, stimuli) → 多脑区同时刺激
 """
 
 from __future__ import annotations
@@ -24,13 +32,24 @@ from __future__ import annotations
 import abc
 import logging
 import math
-from typing import Callable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch_geometric.data import HeteroData
 
 logger = logging.getLogger(__name__)
+
+# Scaling factor converting normalised stimulus amplitude [0, 1] to latent-space
+# standard-deviation units used by TwinBrainDigitalTwin.simulate_intervention().
+#
+# Neuroscientific rationale (API.md §12.7):
+#   delta = 1.0  ≈ natural fluctuation amplitude (mild stimulation)
+#   delta = 2.0  ≈ strong excitatory TMS / supra-threshold stimulation
+# A normalised amplitude of 1.0 therefore maps to a delta of 2.0 σ, which
+# represents a physiologically strong but not extreme perturbation.
+_STIM_AMP_TO_LATENT_SIGMA: float = 2.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -189,17 +208,16 @@ class RampStimulus(Stimulus):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Wilson-Cowan fallback integrator (no model)
+# Wilson-Cowan standalone integrator (baseline / unit tests only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _make_connectivity(n: int, seed: int = 0) -> np.ndarray:
     """
-    生成一个用于无模型回退的合成连接矩阵。
+    生成合成连接矩阵（供 WC 模式使用）。
 
-    对角线为零，L1 归一化，Gaussian 空间衰减（距离用 Fibonacci 球面采样近似）。
+    对角线为零，L1 归一化，随机稀疏连接。
     """
     rng = np.random.default_rng(seed)
-    # Random sparse connectivity
     W = rng.random((n, n)).astype(np.float32)
     np.fill_diagonal(W, 0.0)
     W = W / (W.sum(axis=1, keepdims=True) + 1e-8)
@@ -216,6 +234,8 @@ class _WilsonCowanIntegrator:
     deviation = x(t) - x0     (x0 = 初始平衡状态)
 
     固定点在 x0 处；无刺激时 deviation 保持为 0。
+
+    **用途**：仅作为独立基线模型与单元测试使用，不是真实模型的回退选项。
     """
 
     def __init__(self, n_regions: int, x0: np.ndarray, seed: int = 0):
@@ -240,50 +260,103 @@ class BrainDynamicsSimulator:
     """
     统一管理所有模拟过程的核心组件。
 
-    接口::
+    **模型模式**（``twin`` 为 ``TwinBrainDigitalTwin`` 实例）::
 
-        sim = BrainDynamicsSimulator(model)
-        x1  = sim.step(x0, external_input)
-        traj, times = sim.rollout(x0, steps=500, stimulus=stim)
+        twin = load_trained_model("outputs/exp/best_model.pt")
+        base_graph = load_graph_for_inference("outputs/graph_cache/sub-01_notask_xx.pt")
+        sim = BrainDynamicsSimulator(model=twin, base_graph=base_graph, modality="fmri")
 
-    优先级：
-    1. 若 ``model`` 是可用的 nn.Module（can_forward=True）→ 使用模型前向传播。
-    2. 否则 → 使用 Wilson-Cowan 漏积分器（无模型回退）。
+        # Autoregressive free dynamics (model-driven)
+        traj, times = sim.rollout(steps=100)
+
+        # Stimulated dynamics
+        stim = SinStimulus(node=42, freq=10.0, amp=0.5, duration=30, onset=10)
+        traj, times = sim.rollout(steps=80, stimulus=stim)
+
+    **WC 模式**（``model=None``，仅用于基线对比）::
+
+        sim = BrainDynamicsSimulator(model=None, n_regions=200)
+        x0 = sim.sample_random_state()
+        traj, times = sim.rollout(x0, steps=1000)
+
+    重要：当 ``model`` 被提供但无法进行前向推断（``can_forward=False``），
+    将立即抛出 ``RuntimeError``，**不会**自动回退到 WC 模式。
     """
 
     def __init__(
         self,
-        model: Optional[nn.Module] = None,
+        model=None,
         n_regions: int = 200,
         dt: float = 0.004,
         fmri_subsample: int = 25,
         seed: int = 0,
+        base_graph: Optional[HeteroData] = None,
+        modality: str = "fmri",
     ):
         """
         Args:
-            model:          训练好的 nn.Module（可为 None）。
-            n_regions:      脑区数量（Schaefer-200 默认为 200）。
-            dt:             内部时间步长（秒，对齐 EEG 采样率）。
-            fmri_subsample: fMRI 下采样倍率（每 N 步记录一次 fMRI 观测）。
-            seed:           随机种子（用于无模型回退的连接矩阵生成）。
-        """
-        self.model = model
-        self.n_regions = n_regions
-        self.dt = dt
-        self.fmri_subsample = fmri_subsample
-        self.seed = seed
+            model:         ``TwinBrainDigitalTwin`` 实例（模型模式）或 ``None``（WC 模式）。
+            n_regions:     脑区数量，WC 模式下使用（模型模式从 ``base_graph`` 推断）。
+            dt:            内部时间步长（秒），WC 模式下使用（模型模式从采样率推断）。
+            fmri_subsample: fMRI 下采样倍率（仅供参考，当前未实现子采样记录）。
+            seed:           WC 模式下的随机种子。
+            base_graph:    ``HeteroData`` 上下文图（模型模式下必须提供）。
+            modality:      分析模态（``"fmri"`` 或 ``"eeg"``，模型模式下使用）。
 
-        # Determine whether model supports forward inference
-        self._use_model = (
-            model is not None
-            and getattr(model, "can_forward", True)
-            and not isinstance(model, type)
-        )
-        if not self._use_model:
+        Raises:
+            ValueError:  模型模式下未提供 ``base_graph``，
+                         或 ``base_graph`` 中不含指定 ``modality``。
+            RuntimeError: ``model`` 提供但 ``can_forward=False``（禁止无声回退）。
+        """
+        self.seed = seed
+        self.fmri_subsample = fmri_subsample
+        self.modality = modality
+        self.base_graph = base_graph
+
+        if model is not None:
+            # Hard check: reject models that explicitly declare they cannot forward
+            if not getattr(model, "can_forward", True):
+                raise RuntimeError(
+                    "提供的模型 can_forward=False，无法进行前向推断。\n"
+                    "请使用 loader.load_model.load_trained_model() 加载正确的 TwinBrain V5 检查点，\n"
+                    "或使用 model=None 以启用独立的 Wilson-Cowan 模式。"
+                )
+
+            self._use_model = True
+            self._is_twin = hasattr(model, "predict_future")
+
+            if self._is_twin:
+                if base_graph is None:
+                    raise ValueError(
+                        "使用 TwinBrainDigitalTwin 时必须提供 base_graph。\n"
+                        "请使用 load_graph_for_inference() 加载图缓存文件。"
+                    )
+                if modality not in base_graph.node_types:
+                    raise ValueError(
+                        f"base_graph 中不含模态 '{modality}'。\n"
+                        f"可用模态: {base_graph.node_types}"
+                    )
+                # Infer n_regions and dt from the graph
+                self.n_regions = int(base_graph[modality].x.shape[0])
+                sr = getattr(base_graph[modality], "sampling_rate", None)
+                self.dt = 1.0 / float(sr) if sr else dt
+            else:
+                # Plain nn.Module (rare, non-TwinBrain model)
+                self.n_regions = n_regions
+                self.dt = dt
+
+        else:
+            # WC mode: standalone, no real model
+            self._use_model = False
+            self._is_twin = False
+            self.n_regions = n_regions
+            self.dt = dt
             logger.info(
-                "BrainDynamicsSimulator: 使用 Wilson-Cowan 回退模式 (n_regions=%d)",
+                "BrainDynamicsSimulator: Wilson-Cowan 独立模式 (n_regions=%d)",
                 n_regions,
             )
+
+        self.model = model
 
     # ── Core API ───────────────────────────────────────────────────────────────
 
@@ -296,14 +369,27 @@ class BrainDynamicsSimulator:
         """
         单步动力学演化: x(t+1) = f(x(t), u(t))
 
+        **注意**：在模型模式（TwinBrainDigitalTwin）下，单步推理不被支持，
+        因为 TwinBrain 以整个上下文窗口为输入（而非单帧状态）。
+        请改用 ``rollout()``。
+
         Args:
             state:          当前脑状态，shape (n_regions,)，值域 [0, 1]。
             external_input: 外部刺激向量，shape (n_regions,)。若为 None 则全零。
-            _wc:            Wilson-Cowan 积分器实例（由 rollout 传入，保证一致性）。
+            _wc:            Wilson-Cowan 积分器实例（由 rollout 传入）。
 
         Returns:
             新脑状态，shape (n_regions,)。
+
+        Raises:
+            NotImplementedError: TwinBrainDigitalTwin 模式下调用此方法时。
         """
+        if self._is_twin:
+            raise NotImplementedError(
+                "TwinBrainDigitalTwin 不支持单步 step()。\n"
+                "请使用 rollout() 或 rollout_multi_stim() 进行轨迹预测。"
+            )
+
         if external_input is None:
             external_input = np.zeros(self.n_regions, dtype=np.float32)
 
@@ -315,68 +401,110 @@ class BrainDynamicsSimulator:
 
     def rollout(
         self,
-        x0: np.ndarray,
-        steps: int,
+        x0: Optional[np.ndarray] = None,
+        steps: int = 50,
         stimulus: Optional[Stimulus] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         连续动力学模拟。
 
+        在**模型模式**下，使用 ``TwinBrainDigitalTwin`` 进行自回归滑窗预测：
+        每次调用 ``predict_future()`` 或 ``simulate_intervention()`` 获取
+        ``prediction_steps`` 步的预测，然后将上下文窗口滑动 ``prediction_steps`` 步，
+        重复直到累计 ``steps`` 步。``x0`` 在模型模式下被忽略（上下文由 ``base_graph``
+        提供）。
+
+        在 **WC 模式**下，逐步积分：``x0`` 为必须参数。
+
         Args:
-            x0:       初始脑状态，shape (n_regions,)。
-            steps:    模拟步数。
+            x0:       WC 模式的初始脑状态，shape (n_regions,)；模型模式下忽略。
+            steps:    模拟步数（模型模式：fMRI TR 数；WC 模式：积分步数）。
             stimulus: 刺激对象（实现 Stimulus.value(t)）；None → 自由演化。
 
         Returns:
             trajectory: shape (steps, n_regions)，每步的脑状态。
             times:      shape (steps,)，以秒为单位的时间轴。
         """
+        if self._is_twin:
+            return self._rollout_with_twin(steps=steps, stimulus=stimulus)
+
+        # WC / plain nn.Module mode
+        if x0 is None:
+            x0 = self.sample_random_state()
         x0 = np.asarray(x0, dtype=np.float32).flatten()
         if x0.shape[0] != self.n_regions:
             raise ValueError(
                 f"x0 shape mismatch: expected ({self.n_regions},), got {x0.shape}"
             )
-
-        trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
-        times = np.arange(steps, dtype=np.float32) * self.dt
-
-        # Create Wilson-Cowan integrator once (preserves connectivity W across steps)
-        wc = _WilsonCowanIntegrator(self.n_regions, x0=x0, seed=self.seed)
-
-        state = x0.copy()
-        for t in range(steps):
-            # Build external input vector
-            u = np.zeros(self.n_regions, dtype=np.float32)
-            if stimulus is not None and stimulus.is_active(t):
-                node_idx = stimulus.node
-                if 0 <= node_idx < self.n_regions:
-                    u[node_idx] = stimulus.value(t)
-
-            # Evolve
-            state = self._step_internal(state, u, wc)
-            trajectory[t] = state
-
-        return trajectory, times
+        return self._rollout_wc(x0, steps=steps, stimulus=stimulus)
 
     def rollout_multi_stim(
         self,
-        x0: np.ndarray,
-        steps: int,
-        stimuli: List[Stimulus],
+        x0: Optional[np.ndarray] = None,
+        steps: int = 50,
+        stimuli: Optional[List[Stimulus]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         多脑区同时刺激的连续模拟。
 
+        在**模型模式**下，使用 ``TwinBrainDigitalTwin.simulate_intervention()``，
+        同时将所有活跃刺激的脑区和幅度打包为 ``interventions`` 字典。
+
+        在 **WC 模式**下，逐步积分并叠加各刺激。
+
         Args:
-            x0:       初始脑状态，shape (n_regions,)。
+            x0:       WC 模式的初始脑状态；模型模式下忽略。
             steps:    模拟步数。
-            stimuli:  多个 Stimulus 对象的列表。
+            stimuli:  多个 ``Stimulus`` 对象的列表（None → 自由演化，等同于 rollout）。
 
         Returns:
             trajectory: shape (steps, n_regions)。
             times:      shape (steps,)。
         """
+        if stimuli is None:
+            stimuli = []
+
+        if self._is_twin:
+            return self._rollout_multi_stim_with_twin(steps=steps, stimuli=stimuli)
+
+        if x0 is None:
+            x0 = self.sample_random_state()
         x0 = np.asarray(x0, dtype=np.float32).flatten()
+        return self._rollout_multi_stim_wc(x0, steps=steps, stimuli=stimuli)
+
+    # ── Private: WC rollout ────────────────────────────────────────────────────
+
+    def _rollout_wc(
+        self,
+        x0: np.ndarray,
+        steps: int,
+        stimulus: Optional[Stimulus],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Wilson-Cowan step-by-step rollout."""
+        trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
+        times = np.arange(steps, dtype=np.float32) * self.dt
+
+        wc = _WilsonCowanIntegrator(self.n_regions, x0=x0, seed=self.seed)
+        state = x0.copy()
+
+        for t in range(steps):
+            u = np.zeros(self.n_regions, dtype=np.float32)
+            if stimulus is not None and stimulus.is_active(t):
+                node_idx = stimulus.node
+                if 0 <= node_idx < self.n_regions:
+                    u[node_idx] = stimulus.value(t)
+            state = self._step_internal(state, u, wc)
+            trajectory[t] = state
+
+        return trajectory, times
+
+    def _rollout_multi_stim_wc(
+        self,
+        x0: np.ndarray,
+        steps: int,
+        stimuli: List[Stimulus],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Wilson-Cowan step-by-step rollout with multiple stimuli."""
         trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
         times = np.arange(steps, dtype=np.float32) * self.dt
 
@@ -388,13 +516,143 @@ class BrainDynamicsSimulator:
             for stim in stimuli:
                 if stim.is_active(t) and 0 <= stim.node < self.n_regions:
                     u[stim.node] += stim.value(t)
-
             state = self._step_internal(state, u, wc)
             trajectory[t] = state
 
         return trajectory, times
 
-    # ── Private helpers ────────────────────────────────────────────────────────
+    # ── Private: TwinBrain twin-mode rollout ────────────────────────────────────
+
+    def _rollout_with_twin(
+        self,
+        steps: int,
+        stimulus: Optional[Stimulus],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Autoregressive rollout using TwinBrainDigitalTwin.
+
+        For each chunk of ``chunk_size`` steps:
+          - If any stimulus is active in that chunk, call ``simulate_intervention()``
+            with the peak stimulus amplitude × 2σ scaling, and use the
+            ``perturbed`` prediction as the new context.
+          - Otherwise, call ``predict_future()`` and use the prediction as context.
+
+        The context window is advanced by ``chunk_size`` steps at each iteration
+        (sliding window: drop the oldest chunk, append the new prediction).
+        """
+        chunk_size: int = getattr(getattr(self.model, "model", None), "prediction_steps", 50)
+
+        # Clone the base graph to avoid mutating the original
+        context = _clone_hetero_graph(self.base_graph)
+        trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
+        times = np.arange(steps, dtype=np.float32) * self.dt
+
+        t_offset = 0
+        while t_offset < steps:
+            remaining = steps - t_offset
+            req_steps = min(chunk_size, remaining)
+
+            # Check whether stimulus is active in this chunk
+            if stimulus is not None and any(
+                stimulus.is_active(t_offset + i) for i in range(req_steps)
+            ):
+                # Compute the peak amplitude in this chunk for the perturbation
+                peak_amp = max(
+                    stimulus.value(t_offset + i)
+                    for i in range(req_steps)
+                    if stimulus.is_active(t_offset + i)
+                )
+                # Convert normalised amplitude [0,1] → latent-std delta
+                # (API.md §12.7: delta=1.0 ≈ natural fluctuation, 2.0 = strong TMS)
+                delta = float(peak_amp) * _STIM_AMP_TO_LATENT_SIGMA
+                result = self.model.simulate_intervention(
+                    baseline_data=context,
+                    interventions={self.modality: ([stimulus.node], delta)},
+                    num_prediction_steps=req_steps,
+                )
+                pred = result["perturbed"][self.modality]  # [N, req_steps, 1]
+            else:
+                pred_dict = self.model.predict_future(context, num_steps=req_steps)
+                if self.modality not in pred_dict:
+                    raise RuntimeError(
+                        f"模型未返回模态 '{self.modality}' 的预测。\n"
+                        f"可用模态: {list(pred_dict.keys())}"
+                    )
+                pred = pred_dict[self.modality]  # [N, req_steps, 1]
+
+            # Detach and move to CPU; shape: [req_steps, N]
+            chunk_np = pred.squeeze(-1).detach().cpu().numpy().T
+            trajectory[t_offset: t_offset + req_steps] = chunk_np[:req_steps]
+            t_offset += req_steps
+
+            # Roll the context window forward: drop oldest chunk, append prediction
+            if t_offset < steps:
+                context = _advance_context(context, pred, self.modality)
+
+        return trajectory, times
+
+    def _rollout_multi_stim_with_twin(
+        self,
+        steps: int,
+        stimuli: List[Stimulus],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Autoregressive rollout with multiple simultaneous stimuli using TwinBrainDigitalTwin.
+
+        All active stimuli in a chunk are packed into the ``interventions`` dict.
+        """
+        chunk_size: int = getattr(getattr(self.model, "model", None), "prediction_steps", 50)
+
+        context = _clone_hetero_graph(self.base_graph)
+        trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
+        times = np.arange(steps, dtype=np.float32) * self.dt
+
+        t_offset = 0
+        while t_offset < steps:
+            remaining = steps - t_offset
+            req_steps = min(chunk_size, remaining)
+
+            # Build interventions dict: {modality: ([node_indices], delta)}
+            # Aggregate peak amplitudes for each node across the chunk
+            node_deltas: Dict[int, float] = {}
+            for stim in stimuli:
+                if 0 <= stim.node < self.n_regions:
+                    for i in range(req_steps):
+                        if stim.is_active(t_offset + i):
+                            v = stim.value(t_offset + i) * _STIM_AMP_TO_LATENT_SIGMA  # → latent-std
+                            node_deltas[stim.node] = max(
+                                node_deltas.get(stim.node, 0.0), v
+                            )
+
+            if node_deltas:
+                # Use the mean delta across all stimulated nodes
+                node_list = list(node_deltas.keys())
+                mean_delta = float(np.mean(list(node_deltas.values())))
+                result = self.model.simulate_intervention(
+                    baseline_data=context,
+                    interventions={self.modality: (node_list, mean_delta)},
+                    num_prediction_steps=req_steps,
+                )
+                pred = result["perturbed"][self.modality]  # [N, req_steps, 1]
+            else:
+                pred_dict = self.model.predict_future(context, num_steps=req_steps)
+                if self.modality not in pred_dict:
+                    raise RuntimeError(
+                        f"模型未返回模态 '{self.modality}' 的预测。\n"
+                        f"可用模态: {list(pred_dict.keys())}"
+                    )
+                pred = pred_dict[self.modality]
+
+            chunk_np = pred.squeeze(-1).detach().cpu().numpy().T
+            trajectory[t_offset: t_offset + req_steps] = chunk_np[:req_steps]
+            t_offset += req_steps
+
+            if t_offset < steps:
+                context = _advance_context(context, pred, self.modality)
+
+        return trajectory, times
+
+    # ── Private: plain nn.Module step (non-twin model mode) ────────────────────
 
     def _step_internal(
         self,
@@ -402,35 +660,145 @@ class BrainDynamicsSimulator:
         u: np.ndarray,
         wc: _WilsonCowanIntegrator,
     ) -> np.ndarray:
-        """Route to model or Wilson-Cowan depending on availability."""
+        """Route to model or WC depending on mode."""
         if self._use_model:
+            # Plain nn.Module path (not TwinBrainDigitalTwin)
             return self._model_step(state, u)
         return wc.step(state, u)
 
     def _model_step(self, state: np.ndarray, u: np.ndarray) -> np.ndarray:
         """
-        使用训练好的模型进行单步演化。
+        使用普通 nn.Module 进行单步演化（非 TwinBrainDigitalTwin 路径）。
 
-        当前实现：将 (n_regions,) 状态张量直接传入模型。
-        若模型接口不兼容，记录警告并回退到 Wilson-Cowan。
+        注意：此接口假设模型接受 (1, N) 张量并返回相同形状的张量。
+        若模型接口不兼容（如需要 HeteroData），将抛出异常而非回退到 WC。
         """
-        try:
-            state_t = torch.from_numpy(state).float().unsqueeze(0)  # (1, N)
-            u_t = torch.from_numpy(u).float().unsqueeze(0)           # (1, N)
-            with torch.no_grad():
-                # Attempt generic call; real TwinBrain GNN has a richer interface.
-                # Downstream experiments may subclass and override this method.
-                out = self.model(state_t + u_t)
-            return out.squeeze(0).cpu().numpy().astype(np.float32)
-        except Exception as exc:
-            logger.debug("Model step failed (%s), falling back to WC.", exc)
-            wc = _WilsonCowanIntegrator(self.n_regions, x0=state, seed=self.seed)
-            return wc.step(state, u)
+        state_t = torch.from_numpy(state).float().unsqueeze(0)  # (1, N)
+        u_t = torch.from_numpy(u).float().unsqueeze(0)           # (1, N)
+        with torch.no_grad():
+            out = self.model(state_t + u_t)
+        return out.squeeze(0).cpu().numpy().astype(np.float32)
 
     # ── Convenience sampling ───────────────────────────────────────────────────
 
-    def sample_random_state(self, rng: Optional[np.random.Generator] = None) -> np.ndarray:
-        """Sample a random brain state uniformly in [0, 1]^n_regions."""
+    def sample_random_state(
+        self, rng: Optional[np.random.Generator] = None
+    ) -> np.ndarray:
+        """
+        采样随机初始脑状态。
+
+        - **WC 模式**：在 [0, 1]^n_regions 上均匀采样。
+        - **模型模式**：从 ``base_graph`` 数据的均值附近添加随机噪声，
+          以获取在生理范围内的初始状态（仅供参考，模型模式下 rollout 会忽略 x0）。
+        """
         if rng is None:
             rng = np.random.default_rng(self.seed)
+
+        if self._is_twin and self.base_graph is not None:
+            # Use mean + small noise from the real data
+            x_data = self.base_graph[self.modality].x  # [N, T, 1]
+            mean_state = x_data.squeeze(-1).mean(dim=1).cpu().numpy()  # [N]
+            noise = rng.normal(0, 0.05, self.n_regions).astype(np.float32)
+            return np.clip(mean_state + noise, 0.0, 1.0)
+
         return rng.random(self.n_regions).astype(np.float32)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Graph context helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _clone_hetero_graph(graph: HeteroData) -> HeteroData:
+    """
+    Clone a HeteroData graph, detaching tensor data to avoid gradient accumulation.
+
+    Unlike ``graph.clone()``, this also detaches node feature tensors so that
+    rolling the context window does not build up a computation graph over multiple
+    prediction rounds.
+
+    **Why deep clone?**
+    Each autoregressive step produces a new context by concatenating old and new
+    tensors.  Without detaching, PyTorch retains the full computation history for
+    every tensor in the context window (potentially hundreds of TR steps × N_nodes
+    × H_hidden), which causes quadratic memory growth over long rollouts.
+    ``detach().clone()`` breaks the gradient tape at each rollout step so that
+    memory stays O(T_context) regardless of rollout length.
+    """
+    cloned = HeteroData()
+
+    # Copy node attributes
+    for node_type in graph.node_types:
+        src = graph[node_type]
+        for attr_name in src.keys():
+            val = getattr(src, attr_name, None)
+            if val is None:
+                continue
+            if isinstance(val, torch.Tensor):
+                setattr(cloned[node_type], attr_name, val.detach().clone())
+            else:
+                setattr(cloned[node_type], attr_name, val)
+
+    # Copy edge attributes
+    for edge_type in graph.edge_types:
+        src = graph[edge_type]
+        for attr_name in src.keys():
+            val = getattr(src, attr_name, None)
+            if val is None:
+                continue
+            if isinstance(val, torch.Tensor):
+                setattr(cloned[edge_type], attr_name, val.detach().clone())
+            else:
+                setattr(cloned[edge_type], attr_name, val)
+
+    # Copy graph-level attributes (subject_idx, run_idx, etc.)
+    for attr_name in graph.keys():
+        if attr_name not in graph.node_types and attr_name not in [
+            f"{s}__{r}__{d}" for s, r, d in graph.edge_types
+        ]:
+            try:
+                val = graph[attr_name]
+                if isinstance(val, torch.Tensor):
+                    cloned[attr_name] = val.detach().clone()
+                else:
+                    cloned[attr_name] = val
+            except (KeyError, AttributeError):
+                pass
+
+    return cloned
+
+
+def _advance_context(
+    context: HeteroData,
+    pred: torch.Tensor,
+    modality: str,
+) -> HeteroData:
+    """
+    Advance the context window by appending new predictions and dropping the
+    oldest time steps.
+
+    The context window length ``T_ctx`` is kept constant:
+      new_x[:, :, :] = concat(old_x[:, chunk:, :], pred[:, :, :], dim=1)
+
+    Args:
+        context:  Current context HeteroData with x shape [N, T_ctx, 1].
+        pred:     New predictions from the model, shape [N, chunk, 1].
+        modality: Node type to update (``'fmri'`` or ``'eeg'``).
+
+    Returns:
+        New context HeteroData with the same T_ctx but shifted by ``chunk`` steps.
+    """
+    new_ctx = _clone_hetero_graph(context)
+    old_x = context[modality].x  # [N, T_ctx, 1]
+    chunk = pred.shape[1]
+    pred_clean = pred.detach().to(old_x.device)
+
+    # Sliding window: drop oldest chunk steps, append prediction
+    if chunk >= old_x.shape[1]:
+        # Prediction is as long as or longer than the context → replace entirely
+        new_ctx[modality].x = pred_clean[:, -old_x.shape[1]:, :]
+    else:
+        new_ctx[modality].x = torch.cat(
+            [old_x[:, chunk:, :], pred_clean], dim=1
+        )
+
+    return new_ctx

@@ -4,13 +4,15 @@ Tests for the twinbrain-dynamics module
 
 Covers:
   - Stimulus classes (SinStimulus, SquareWaveStimulus, StepStimulus, RampStimulus)
-  - BrainDynamicsSimulator (step, rollout)
+  - _WilsonCowanIntegrator (standalone WC integrator)
+  - BrainDynamicsSimulator in WC mode (model=None)
+  - BrainDynamicsSimulator validation: rejects can_forward=False models
   - Free dynamics experiment
   - Attractor analysis
   - Virtual stimulation experiment
   - Response matrix
   - Stability analysis
-  - load_model (StateWrapper, file-not-found)
+  - load_model: error behavior for missing / non-TwinBrain checkpoints
 """
 
 import json
@@ -44,7 +46,7 @@ from analysis.stability_analysis import (
     compute_state_deltas,
     run_stability_analysis,
 )
-from loader.load_model import load_trained_model, _StateWrapper
+from loader.load_model import load_trained_model
 
 
 # ── Constants used across tests ───────────────────────────────────────────────
@@ -498,28 +500,56 @@ class TestStabilityAnalysis(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestLoadModel(unittest.TestCase):
-    def test_nonexistent_file_returns_none(self):
-        result = load_trained_model("/nonexistent/path/model.pt")
-        self.assertIsNone(result)
+    def test_nonexistent_file_raises_file_not_found(self):
+        """Missing checkpoint → FileNotFoundError (no fallback, no None return)."""
+        with self.assertRaises(FileNotFoundError):
+            load_trained_model("/nonexistent/path/model.pt")
 
-    def test_state_dict_returns_wrapper(self):
-        """A plain dict checkpoint → _StateWrapper."""
+    def test_non_twinbrain_dict_checkpoint_raises_runtime_error(self):
+        """
+        A plain dict checkpoint without 'model_state_dict' key is not a valid
+        TwinBrain V5 checkpoint and must raise RuntimeError.
+        """
         with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
             torch.save({"model": {"weight": torch.randn(10, 5)}}, f.name)
-            wrapper = load_trained_model(f.name)
-        self.assertIsInstance(wrapper, _StateWrapper)
-        self.assertFalse(wrapper.can_forward)
+            fname = f.name
+        with self.assertRaises(RuntimeError):
+            load_trained_model(fname)
 
-    def test_nn_module_loads_and_freezes(self):
-        """A saved nn.Module should load, eval, and be frozen."""
+    def test_raw_nn_module_raises_runtime_error(self):
+        """
+        A directly-serialised nn.Module (not a TwinBrain checkpoint dict) must
+        raise RuntimeError — it cannot be loaded as TwinBrainDigitalTwin.
+        """
         model = torch.nn.Linear(5, 3)
         with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
             torch.save(model, f.name)
-            loaded = load_trained_model(f.name)
-        self.assertIsNotNone(loaded)
-        self.assertFalse(loaded.training)
-        for p in loaded.parameters():
-            self.assertFalse(p.requires_grad)
+            fname = f.name
+        with self.assertRaises(RuntimeError):
+            load_trained_model(fname)
+
+    def test_simulator_rejects_can_forward_false_model(self):
+        """
+        BrainDynamicsSimulator must raise RuntimeError when the provided model
+        has can_forward=False — no silent WC fallback.
+        """
+        class _FakeNoForward:
+            can_forward = False
+
+        with self.assertRaises(RuntimeError):
+            BrainDynamicsSimulator(model=_FakeNoForward(), n_regions=N)
+
+    def test_simulator_rejects_nn_module_with_can_forward_false(self):
+        """
+        An actual nn.Module subclass with can_forward=False must also be rejected.
+        """
+        class _NoForwardModule(torch.nn.Module):
+            can_forward = False
+            def forward(self, x):  # pragma: no cover
+                return x
+
+        with self.assertRaises(RuntimeError):
+            BrainDynamicsSimulator(model=_NoForwardModule(), n_regions=N)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
