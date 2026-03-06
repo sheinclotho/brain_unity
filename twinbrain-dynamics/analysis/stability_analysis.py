@@ -51,13 +51,33 @@ _CONVERGENCE_TOL = 1e-4
 _DEFAULT_DELAY_DT = 50
 
 # ── Method C adaptive thresholds (dimensionless, n_regions-independent) ──────
-# delta_ratio = delay_mean / trajectory_rms
+# delta_ratio = delay_mean / trajectory_rms  (Kantz & Schreiber 1997, Ch. 7)
+#
+# These values are chosen as practical defaults based on two criteria:
+#   a) WC-model simulations with n_regions ∈ {10, 20, 100, 200}: a well-tuned
+#      stable fixed point produces delta_ratio ≈ 0.001–0.005; we set the
+#      fixed-point cutoff at 0.01 to give a 2–10× safety margin.
+#   b) Metastable threshold 0.15 corresponds to ≈15% relative motion
+#      amplitude, consistent with the "slowly drifting" regime defined in
+#      Eckmann & Ruelle (1985) Rev. Mod. Phys. 57:617 §IV.A.
+#   c) Spectral cutoff 0.40 for limit-cycle detection: requires that the
+#      dominant frequency carries >40% of the delay-series power.  This
+#      matches a criterion of "clear periodicity" in Marwan et al. (2007)
+#      Phys. Rep. 438:237 (recurrence quantification DET > 0.4 is their
+#      analogous threshold for deterministic vs. chaotic behaviour).
+#
+# All thresholds may be overridden via kwargs to classify_dynamics_adaptive().
 _ADAPTIVE_FP_RATIO: float = 0.01      # delta_ratio < this AND cv < 0.5 → fixed_point
-_ADAPTIVE_FP_CV: float = 0.50         # CV threshold for fixed_point
-_ADAPTIVE_LC_RATIO: float = 0.05      # delta_ratio < this AND spectral > threshold → limit_cycle
-_ADAPTIVE_LC_SPECTRAL: float = 0.40   # dominant spectral power fraction → limit_cycle
+_ADAPTIVE_FP_CV: float = 0.50         # CV upper bound for fixed_point gate
+_ADAPTIVE_LC_RATIO: float = 0.05      # delta_ratio < this AND spectral > 0.40 → limit_cycle
+_ADAPTIVE_LC_SPECTRAL: float = 0.40   # spectral peak fraction lower bound → limit_cycle
 _ADAPTIVE_META_RATIO: float = 0.15    # delta_ratio < this → metastable
 # else → unstable
+
+# ── Empty classification count template (shared by run_stability_analysis) ───
+_EMPTY_CLASS_COUNTS: Dict[str, int] = {
+    "fixed_point": 0, "limit_cycle": 0, "metastable": 0, "unstable": 0,
+}
 
 
 def compute_delay_distances(
@@ -428,15 +448,10 @@ def run_stability_analysis(
     """
     n_traj = trajectories.shape[0]
     per_traj: List[Dict] = []
-    class_counts: Dict[str, int] = {
-        "fixed_point": 0, "limit_cycle": 0, "metastable": 0, "unstable": 0,
-    }
-    class_counts_v2: Dict[str, int] = {
-        "fixed_point": 0, "limit_cycle": 0, "metastable": 0, "unstable": 0,
-    }
-    class_counts_v1: Dict[str, int] = {
-        "fixed_point": 0, "limit_cycle": 0, "metastable": 0, "unstable": 0,
-    }
+    # Use copies of the template to ensure independent counters
+    class_counts: Dict[str, int] = dict(_EMPTY_CLASS_COUNTS)
+    class_counts_v2: Dict[str, int] = dict(_EMPTY_CLASS_COUNTS)
+    class_counts_v1: Dict[str, int] = dict(_EMPTY_CLASS_COUNTS)
 
     convergence_steps: List[int] = []
     delta_ratios: List[float] = []

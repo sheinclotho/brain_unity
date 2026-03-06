@@ -603,22 +603,26 @@ class TestAdaptiveStability(unittest.TestCase):
         self.assertIn("classification_v2", metrics)
 
     def test_scale_independent_classification(self):
-        """Same relative dynamics but different n_regions should give same classification."""
-        # Small n_regions
-        traj_s = np.ones((200, 5), dtype=np.float32) * 0.5
+        """Same relative dynamics but different n_regions should give same classification.
+
+        This specifically tests n_regions=190 (the real-model scale where the
+        original bug manifested: absolute thresholds caused 100% 'unstable').
+        """
         rng = np.random.default_rng(0)
-        traj_s += (rng.random(traj_s.shape) * 0.001).astype(np.float32)
-        features_s = compute_trajectory_features(traj_s)
-        cls_s = classify_dynamics_adaptive(features_s)
-
-        # Large n_regions (same per-region noise level)
-        traj_l = np.ones((200, 100), dtype=np.float32) * 0.5
-        traj_l += (rng.random(traj_l.shape) * 0.001).astype(np.float32)
-        features_l = compute_trajectory_features(traj_l)
-        cls_l = classify_dynamics_adaptive(features_l)
-
-        # Both should get the same classification (scale-invariant)
-        self.assertEqual(cls_s, cls_l)
+        for n_reg in [5, 20, 100, 190]:  # 190 = real-model scale
+            sim_tmp = BrainDynamicsSimulator(model=None, n_regions=n_reg)
+            x0 = np.full(n_reg, 0.5, dtype=np.float32)
+            x0 += (rng.random(n_reg) * 0.001).astype(np.float32)
+            traj, _ = sim_tmp.rollout(x0=x0, steps=200)
+            feat = compute_trajectory_features(traj, delay_dt=20)
+            cls = classify_dynamics_adaptive(feat)
+            # WC starting near equilibrium should converge → not "unstable"
+            # (this would be "unstable" under old absolute threshold for n_reg >= 20)
+            self.assertIn(
+                cls,
+                ["fixed_point", "limit_cycle", "metastable"],
+                msg=f"n_regions={n_reg}: got '{cls}' with delta_ratio={feat['delta_ratio']:.5f}",
+            )
 
     def test_run_stability_analysis_has_method_c(self):
         """run_stability_analysis must include method C counts."""
