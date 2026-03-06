@@ -167,3 +167,179 @@ def _save_or_show(fig: "plt.Figure", save_path: Optional[Path]) -> None:
     else:
         plt.show()
     plt.close(fig)
+
+
+def plot_trajectory_convergence(
+    mean_distances: np.ndarray,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    绘制轨迹对均值距离随时间的变化（收敛分析图）。
+
+    Args:
+        mean_distances: shape (steps,)，均值 L2 距离。
+        save_path:      保存路径；None → 显示。
+    """
+    if not _MPL_AVAILABLE:
+        return
+
+    steps = len(mean_distances)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(np.arange(steps), mean_distances, color="steelblue", linewidth=1.2)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Mean Pairwise Distance")
+    ax.set_title("Trajectory Convergence — Mean Pairwise Distance over Time\n"
+                 "(↓ converging, → no structure, ↑ diverging)")
+    ax.grid(True, alpha=0.3)
+    _save_or_show(fig, save_path)
+
+
+def plot_lyapunov_growth(
+    log_growth_curve: np.ndarray,
+    renorm_steps: int = 20,
+    mean_lle: Optional[float] = None,
+    chaos_regime: Optional[str] = None,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    绘制 Wolf 方法的累积对数增长曲线（log-growth curve）。
+
+    曲线斜率即为最大 Lyapunov 指数（LLE）：
+      - 正斜率 → 轨迹指数发散（混沌）
+      - 负斜率 → 轨迹指数收敛（稳定）
+      - 水平    → 边缘稳定
+
+    Args:
+        log_growth_curve: shape (n_periods,)，每个重归一化周期的 log(r/ε) 值。
+        renorm_steps:     每个周期的步数（用于计算累积步轴）。
+        mean_lle:         平均 LLE（显示在标题中）。
+        chaos_regime:     混沌分类标签。
+        save_path:        保存路径；None → 显示。
+    """
+    if not _MPL_AVAILABLE:
+        return
+
+    n_periods = len(log_growth_curve)
+    if n_periods == 0:
+        return
+
+    # Cumulative sum = running total of log-growth, proportional to LLE × time
+    cumulative = np.cumsum(log_growth_curve)
+    steps_axis = np.arange(1, n_periods + 1) * renorm_steps
+
+    # Fit a line to the cumulative sum; slope = LLE per step
+    coeffs = np.polyfit(steps_axis, cumulative, deg=1)
+    fit_line = np.polyval(coeffs, steps_axis)
+    fit_slope = coeffs[0]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    # Left: per-period log-growth
+    axes[0].bar(np.arange(n_periods), log_growth_curve,
+                color=["tomato" if v > 0 else "steelblue" for v in log_growth_curve],
+                alpha=0.75, edgecolor="white")
+    axes[0].axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+    axes[0].axhline(float(np.mean(log_growth_curve)), color="red", linewidth=1.2,
+                    linestyle="-", label=f"mean={np.mean(log_growth_curve):.4f}")
+    axes[0].set_xlabel("Renormalization Period")
+    axes[0].set_ylabel("log(r/ε) per period")
+    axes[0].set_title("Per-Period Log Growth\n(red=chaotic, blue=convergent)")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(True, alpha=0.3)
+
+    # Right: cumulative sum with linear fit
+    axes[1].plot(steps_axis, cumulative, color="navy", linewidth=1.5, label="Cumulative log-growth")
+    axes[1].plot(steps_axis, fit_line, color="red", linewidth=1.2, linestyle="--",
+                 label=f"Fit slope (LLE) = {fit_slope:.5f}/step")
+    axes[1].axhline(0.0, color="black", linewidth=0.8)
+    axes[1].set_xlabel("Step")
+    axes[1].set_ylabel("Cumulative log-growth S(t)")
+    lbl_parts = []
+    if mean_lle is not None:
+        lbl_parts.append(f"LLE = {mean_lle:.5f}")
+    if chaos_regime:
+        lbl_parts.append(chaos_regime.upper())
+    axes[1].set_title("Cumulative Log-Growth (Wolf method)\n" +
+                       ("  |  ".join(lbl_parts) if lbl_parts else ""))
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    _save_or_show(fig, save_path)
+
+
+def plot_lyapunov_histogram(
+    lyapunov_values: np.ndarray,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    绘制 Lyapunov 指数分布直方图。
+
+    Args:
+        lyapunov_values: shape (n_init,)，每条轨迹的 Lyapunov 指数。
+        save_path:       保存路径；None → 显示。
+    """
+    if not _MPL_AVAILABLE:
+        return
+
+    mean_lam = float(np.mean(lyapunov_values))
+    median_lam = float(np.median(lyapunov_values))
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(lyapunov_values, bins=min(30, max(10, len(lyapunov_values) // 3)),
+            color="salmon", edgecolor="white", alpha=0.85)
+    ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0, label="λ=0")
+    ax.axvline(mean_lam, color="red", linestyle="-", linewidth=1.2,
+               label=f"mean={mean_lam:.4f}")
+    ax.axvline(median_lam, color="orange", linestyle=":", linewidth=1.2,
+               label=f"median={median_lam:.4f}")
+    ax.set_xlabel("Lyapunov Exponent λ (per step)")
+    ax.set_ylabel("Count")
+    ax.set_title("Lyapunov Exponent Distribution\n"
+                 "(λ<0: convergent, λ≈0: marginal, λ>0: chaotic)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    _save_or_show(fig, save_path)
+
+
+def plot_basin_sizes(
+    basin_distribution: dict,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    绘制吸引子 basin 大小分布条形图。
+
+    Args:
+        basin_distribution: {attractor_id: fraction} 字典（int 键或 str 键均可）。
+        save_path:          保存路径；None → 显示。
+    """
+    if not _MPL_AVAILABLE:
+        return
+
+    labels_abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    ids = sorted(basin_distribution.keys())
+    fractions = [basin_distribution[k] for k in ids]
+    bar_labels = [
+        (f"Attractor {labels_abc[k]}" if isinstance(k, int) and k < len(labels_abc)
+         else str(k))
+        for k in ids
+    ]
+
+    fig, ax = plt.subplots(figsize=(max(4, len(ids) * 1.5), 4))
+    cmap = plt.get_cmap("tab10", len(ids))
+    bars = ax.bar(bar_labels, fractions, color=[cmap(i) for i in range(len(ids))],
+                  edgecolor="white")
+    for bar, frac in zip(bars, fractions):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height() + 0.01,
+            f"{frac:.1%}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+    ax.set_ylim(0, min(1.15, max(fractions) + 0.15))
+    ax.set_ylabel("Basin Size (fraction of trajectories)")
+    ax.set_title("Attractor Basin Size Distribution")
+    ax.grid(True, axis="y", alpha=0.3)
+    _save_or_show(fig, save_path)

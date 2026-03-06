@@ -54,8 +54,29 @@ response_matrix:
 
 # Stability analysis
 stability_analysis:
-  convergence_tol: 1e-4   # ||Δx|| < tol → classify as fixed point
-  period_max_lag: 100     # Maximum lag to check for periodic orbits
+  convergence_tol: 1e-4   # ||Δx|| < tol → classify as fixed point (method A)
+  period_max_lag: 100     # Maximum lag to check for periodic orbits (method A)
+  delay_dt: 50            # Delay lag for improved delay-distance classification (method B)
+
+# Lyapunov exponent estimation
+lyapunov:
+  enabled: true
+  method: "wolf"         # "wolf" (recommended, renormalized) or "ftle" (fast)
+  epsilon: 1.0e-5        # Initial perturbation magnitude
+  renorm_steps: 20       # Steps between Wolf renormalization periods
+  skip_fraction: 0.1     # Fraction of trajectory to skip (transient, ftle only)
+
+# Trajectory convergence analysis
+trajectory_convergence:
+  enabled: true
+  n_pairs: 50             # Number of random trajectory pairs to compare
+
+# Random model comparison
+random_comparison:
+  enabled: true
+  n_init: 200             # Random initial states for random model
+  steps: 1000             # Steps for random model trajectories
+  spectral_radius: 0.9    # Target spectral radius of random weight matrix
 
 # Output configuration
 output:

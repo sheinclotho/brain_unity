@@ -11,7 +11,10 @@ Covers:
   - Attractor analysis
   - Virtual stimulation experiment
   - Response matrix
-  - Stability analysis
+  - Stability analysis (method A + method B delay-distance)
+  - Lyapunov exponent estimation
+  - Trajectory convergence analysis
+  - Random model comparison
   - load_model: error behavior for missing / non-TwinBrain checkpoints
 """
 
@@ -43,8 +46,25 @@ from experiments.virtual_stimulation import run_stimulation, run_virtual_stimula
 from analysis.response_matrix import compute_response_matrix
 from analysis.stability_analysis import (
     analyze_trajectory_stability,
+    classify_dynamics_delay,
+    compute_delay_distances,
     compute_state_deltas,
     run_stability_analysis,
+)
+from analysis.lyapunov import (
+    wolf_largest_lyapunov,
+    ftle_lyapunov,
+    classify_chaos_regime,
+    run_lyapunov_analysis,
+)
+from analysis.trajectory_convergence import (
+    compute_pairwise_distances,
+    run_trajectory_convergence,
+)
+from analysis.random_comparison import (
+    _make_random_dynamics_matrix,
+    run_random_trajectories,
+    run_random_model_comparison,
 )
 from loader.load_model import load_trained_model
 
@@ -493,6 +513,442 @@ class TestStabilityAnalysis(unittest.TestCase):
             with open(json_path) as fh:
                 data = json.load(fh)
             self.assertIn("classification_counts", data)
+
+    def test_v2_classification_both_v1_v2_present(self):
+        """analyze_trajectory_stability must return both classification and classification_v1."""
+        traj = np.ones((100, N), dtype=np.float32) * 0.5
+        metrics = analyze_trajectory_stability(traj)
+        self.assertIn("classification", metrics)
+        self.assertIn("classification_v1", metrics)
+        self.assertIn("delay_mean", metrics)
+        self.assertIn("delay_var", metrics)
+
+    def test_delay_distance_shape(self):
+        """compute_delay_distances should return (T - delay_dt,) array."""
+        traj = np.random.rand(100, N).astype(np.float32)
+        delays = compute_delay_distances(traj, delay_dt=20)
+        self.assertEqual(delays.shape, (80,))
+
+    def test_classify_dynamics_delay_fixed_point(self):
+        """Constant trajectory → fixed_point under delay method."""
+        traj = np.ones((200, N), dtype=np.float32) * 0.5
+        result = classify_dynamics_delay(traj, delay_dt=50)
+        self.assertEqual(result, "fixed_point")
+
+    def test_classify_dynamics_delay_unstable(self):
+        """Random walk → unstable under delay method."""
+        rng = np.random.default_rng(0)
+        traj = rng.random((200, N)).astype(np.float32)
+        result = classify_dynamics_delay(traj, delay_dt=50)
+        self.assertIn(result, ["unstable", "metastable"])
+
+    def test_json_contains_both_methods(self):
+        """stability_metrics.json must contain counts for both method A and method B."""
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs = np.random.rand(4, 60, N).astype(np.float32)
+            run_stability_analysis(trajs, output_dir=Path(tmp), delay_dt=10)
+            with open(Path(tmp) / "stability_metrics.json") as fh:
+                data = json.load(fh)
+            self.assertIn("classification_counts", data)
+            self.assertIn("classification_counts_v1", data)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Lyapunov Exponent Tests (Wolf-Benettin method + FTLE + classification)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestLyapunovAnalysis(unittest.TestCase):
+    def setUp(self):
+        self.sim = BrainDynamicsSimulator(model=None, n_regions=N)
+        self.rng = np.random.default_rng(0)
+
+    # ── wolf_largest_lyapunov ─────────────────────────────────────────────────
+
+    def test_wolf_returns_float_and_log_growth(self):
+        x0 = np.random.rand(N).astype(np.float32)
+        lle, lg = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=60, renorm_steps=10, rng=self.rng
+        )
+        self.assertIsInstance(lle, float)
+        self.assertTrue(np.isfinite(lle))
+        self.assertIsInstance(lg, np.ndarray)
+        self.assertEqual(lg.shape, (6,))   # total_steps // renorm_steps
+
+    def test_wolf_log_growth_finite(self):
+        x0 = np.full(N, 0.5, dtype=np.float32)
+        _, lg = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=80, renorm_steps=20, rng=self.rng
+        )
+        self.assertTrue(np.all(np.isfinite(lg)))
+
+    def test_wolf_stable_system_negative_lle(self):
+        """WC at equilibrium x0=0.5 should have LLE ≤ 0 (stable system)."""
+        x0 = np.full(N, 0.5, dtype=np.float32)
+        lle, _ = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=200, renorm_steps=20, rng=self.rng
+        )
+        # WC with no stimulus is stable around x0; LLE should not be strongly positive
+        self.assertLess(lle, 0.2)
+
+    def test_wolf_reproducible_with_same_rng(self):
+        """Same seed → same LLE."""
+        x0 = np.random.rand(N).astype(np.float32)
+        lle1, _ = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=60, renorm_steps=10,
+            rng=np.random.default_rng(7),
+        )
+        lle2, _ = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=60, renorm_steps=10,
+            rng=np.random.default_rng(7),
+        )
+        self.assertAlmostEqual(lle1, lle2, places=8)
+
+    def test_wolf_single_period(self):
+        """total_steps == renorm_steps → one period, still returns a scalar LLE."""
+        x0 = np.random.rand(N).astype(np.float32)
+        lle, lg = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=10, renorm_steps=10, rng=self.rng
+        )
+        self.assertEqual(len(lg), 1)
+        self.assertTrue(np.isfinite(lle))
+
+    # ── ftle_lyapunov ─────────────────────────────────────────────────────────
+
+    def test_ftle_returns_finite_float(self):
+        traj = np.random.rand(50, N).astype(np.float32)
+        lam = ftle_lyapunov(traj, self.sim, rng=self.rng)
+        self.assertIsInstance(lam, float)
+        self.assertTrue(np.isfinite(lam))
+
+    def test_ftle_too_short_returns_zero(self):
+        """Only 1 usable point after skip → slope undefined → 0.0."""
+        traj = np.random.rand(2, N).astype(np.float32)
+        lam = ftle_lyapunov(traj, self.sim, skip_fraction=0.9, rng=self.rng)
+        self.assertEqual(lam, 0.0)
+
+    # ── classify_chaos_regime ─────────────────────────────────────────────────
+
+    def test_classify_strongly_stable(self):
+        r = classify_chaos_regime(-0.05)
+        self.assertEqual(r["regime"], "stable")
+        self.assertFalse(r["is_chaotic"])
+        self.assertFalse(r["near_chaos_edge"])
+
+    def test_classify_marginal(self):
+        r = classify_chaos_regime(-0.005)
+        self.assertEqual(r["regime"], "marginal_stable")
+        self.assertFalse(r["is_chaotic"])
+
+    def test_classify_edge_of_chaos(self):
+        r = classify_chaos_regime(0.005)
+        self.assertEqual(r["regime"], "edge_of_chaos")
+        self.assertFalse(r["is_chaotic"])
+        self.assertTrue(r["near_chaos_edge"])
+
+    def test_classify_weakly_chaotic(self):
+        r = classify_chaos_regime(0.05)
+        self.assertEqual(r["regime"], "weakly_chaotic")
+        self.assertTrue(r["is_chaotic"])
+
+    def test_classify_strongly_chaotic(self):
+        r = classify_chaos_regime(0.5)
+        self.assertEqual(r["regime"], "strongly_chaotic")
+        self.assertTrue(r["is_chaotic"])
+        self.assertFalse(r["near_chaos_edge"])
+
+    def test_classify_interpretation_not_empty(self):
+        for lam in [-0.1, -0.005, 0.005, 0.05, 0.5]:
+            r = classify_chaos_regime(lam)
+            self.assertTrue(len(r["interpretation_zh"]) > 10)
+
+    # ── run_lyapunov_analysis ─────────────────────────────────────────────────
+
+    def test_run_wolf_keys(self):
+        trajs = np.random.rand(4, 60, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, renorm_steps=10, method="wolf")
+        for key in ("lyapunov_values", "mean_lyapunov", "median_lyapunov",
+                    "std_lyapunov", "fraction_positive", "fraction_negative",
+                    "log_growth_curve", "chaos_regime", "method"):
+            self.assertIn(key, results)
+
+    def test_run_ftle_keys(self):
+        trajs = np.random.rand(3, 50, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, method="ftle")
+        self.assertIn("lyapunov_values", results)
+        self.assertEqual(results["method"], "ftle")
+
+    def test_run_lyapunov_shape(self):
+        n = 5
+        trajs = np.random.rand(n, 60, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, renorm_steps=10, method="wolf")
+        self.assertEqual(results["lyapunov_values"].shape, (n,))
+
+    def test_log_growth_curve_shape(self):
+        trajs = np.random.rand(3, 60, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, renorm_steps=20, method="wolf")
+        n_periods = 60 // 20
+        self.assertEqual(len(results["log_growth_curve"]), n_periods)
+
+    def test_chaos_regime_in_results(self):
+        trajs = np.random.rand(3, 60, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, renorm_steps=10, method="wolf")
+        self.assertIn("regime", results["chaos_regime"])
+        self.assertIn(results["chaos_regime"]["regime"],
+                      ["stable", "marginal_stable", "edge_of_chaos",
+                       "weakly_chaotic", "strongly_chaotic"])
+
+    def test_fractions_in_0_1(self):
+        trajs = np.random.rand(5, 60, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, renorm_steps=10, method="wolf")
+        self.assertGreaterEqual(results["fraction_positive"], 0.0)
+        self.assertLessEqual(results["fraction_positive"], 1.0)
+
+    def test_saves_npy_and_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs = np.random.rand(3, 40, N).astype(np.float32)
+            run_lyapunov_analysis(trajs, self.sim, renorm_steps=10,
+                                  method="wolf", output_dir=Path(tmp))
+            self.assertTrue((Path(tmp) / "lyapunov_values.npy").exists())
+            self.assertTrue((Path(tmp) / "log_growth_curve.npy").exists())
+            self.assertTrue((Path(tmp) / "lyapunov_report.json").exists())
+            with open(Path(tmp) / "lyapunov_report.json") as fh:
+                report = json.load(fh)
+            self.assertIn("chaos_regime", report)
+            self.assertIn("mean_lyapunov", report)
+            self.assertIn("is_chaotic", report)
+
+    def test_wc_stable_system_lle_not_strongly_positive(self):
+        """WC system at equilibrium should have non-positive or small-positive LLE."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, seed=42)
+        trajs = np.tile(
+            np.full((1, 100, N), 0.5, dtype=np.float32),
+            (4, 1, 1)
+        )
+        # Add small perturbations so trajectories differ
+        rng = np.random.default_rng(0)
+        trajs += (rng.random(trajs.shape) * 0.02).astype(np.float32)
+        trajs = np.clip(trajs, 0, 1)
+        results = run_lyapunov_analysis(trajs, sim, renorm_steps=20, method="wolf")
+        # WC is stable so LLE should not be strongly positive
+        self.assertLess(results["mean_lyapunov"], 0.3)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Trajectory Convergence Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTrajectoryConvergence(unittest.TestCase):
+    def test_compute_pairwise_distances_shape(self):
+        trajs = np.random.rand(10, 50, N).astype(np.float32)
+        mean_dist = compute_pairwise_distances(trajs, n_pairs=5, seed=0)
+        self.assertEqual(mean_dist.shape, (50,))
+
+    def test_compute_pairwise_distances_dtype(self):
+        trajs = np.random.rand(10, 20, N).astype(np.float32)
+        mean_dist = compute_pairwise_distances(trajs, n_pairs=5)
+        self.assertEqual(mean_dist.dtype, np.float32)
+
+    def test_distances_non_negative(self):
+        trajs = np.random.rand(10, 30, N).astype(np.float32)
+        mean_dist = compute_pairwise_distances(trajs, n_pairs=5)
+        self.assertTrue(np.all(mean_dist >= 0.0))
+
+    def test_identical_trajectories_distance_zero(self):
+        """If all trajectories are identical, pairwise distance should be zero."""
+        base = np.random.rand(1, 50, N).astype(np.float32)
+        trajs = np.tile(base, (8, 1, 1))
+        mean_dist = compute_pairwise_distances(trajs, n_pairs=10)
+        np.testing.assert_allclose(mean_dist, 0.0, atol=1e-6)
+
+    def test_run_trajectory_convergence_keys(self):
+        trajs = np.random.rand(8, 40, N).astype(np.float32)
+        results = run_trajectory_convergence(trajs, n_pairs=5)
+        self.assertIn("mean_distances", results)
+        self.assertIn("initial_mean_distance", results)
+        self.assertIn("final_mean_distance", results)
+        self.assertIn("distance_ratio", results)
+        self.assertIn("convergence_label", results)
+
+    def test_convergence_label_converging(self):
+        """Trajectories converging to same point should get 'converging' label."""
+        rng = np.random.default_rng(0)
+        n_init, steps = 10, 60
+        # All trajectories start dispersed but converge to the same point (0.5)
+        trajs = np.zeros((n_init, steps, N), dtype=np.float32)
+        for i in range(n_init):
+            start = rng.random(N).astype(np.float32)
+            for t in range(steps):
+                alpha = t / (steps - 1)
+                trajs[i, t] = (1 - alpha) * start + alpha * 0.5
+        results = run_trajectory_convergence(trajs, n_pairs=10)
+        self.assertEqual(results["convergence_label"], "converging")
+
+    def test_saves_npy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs = np.random.rand(5, 20, N).astype(np.float32)
+            run_trajectory_convergence(trajs, n_pairs=4, output_dir=Path(tmp))
+            self.assertTrue((Path(tmp) / "distance_curve.npy").exists())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Random Model Comparison Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRandomModelComparison(unittest.TestCase):
+    def test_random_dynamics_matrix_shape(self):
+        W = _make_random_dynamics_matrix(n_regions=N, target_spectral_radius=0.9)
+        self.assertEqual(W.shape, (N, N))
+
+    def test_random_dynamics_matrix_spectral_radius(self):
+        W = _make_random_dynamics_matrix(n_regions=20, target_spectral_radius=0.9)
+        sr = float(np.abs(np.linalg.eigvals(W)).max())
+        self.assertAlmostEqual(sr, 0.9, places=4)
+
+    def test_run_random_trajectories_shape(self):
+        trajs = run_random_trajectories(n_regions=N, n_init=5, steps=20)
+        self.assertEqual(trajs.shape, (5, 20, N))
+
+    def test_run_random_trajectories_values_in_0_1(self):
+        trajs = run_random_trajectories(n_regions=N, n_init=5, steps=20)
+        self.assertTrue(np.all(trajs >= 0.0))
+        self.assertTrue(np.all(trajs <= 1.0))
+
+    def test_run_random_trajectories_saves_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_random_trajectories(
+                n_regions=N, n_init=3, steps=10, output_dir=Path(tmp)
+            )
+            self.assertTrue((Path(tmp) / "random_trajectories.npy").exists())
+
+    def test_run_random_model_comparison_keys(self):
+        trajs = np.random.rand(5, 20, N).astype(np.float32)
+        result = run_random_model_comparison(
+            trajectories=trajs,
+            random_n_init=5,
+            random_steps=15,
+        )
+        self.assertIn("model", result)
+        self.assertIn("random", result)
+        self.assertIn("trajectory_variance", result["model"])
+        self.assertIn("trajectory_variance", result["random"])
+
+    def test_run_random_model_comparison_saves_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs = np.random.rand(4, 20, N).astype(np.float32)
+            run_random_model_comparison(
+                trajectories=trajs,
+                random_n_init=4,
+                random_steps=15,
+                output_dir=Path(tmp),
+            )
+            self.assertTrue((Path(tmp) / "analysis_comparison.json").exists())
+            with open(Path(tmp) / "analysis_comparison.json") as fh:
+                data = json.load(fh)
+            self.assertIn("model", data)
+            self.assertIn("random", data)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Attractor Analysis: basin_distribution.json saving
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Response Matrix — shared-x0 fix
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestResponseMatrixSharedX0(unittest.TestCase):
+    """
+    Verify that compute_response_matrix uses a shared x0 for all rows so that
+    R[i,j] reflects stimulus-propagation structure, not equilibrium-state noise.
+    """
+
+    def _compute_R(self, seed=42):
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, seed=0)
+        from analysis.response_matrix import compute_response_matrix
+        return compute_response_matrix(
+            sim,
+            n_nodes=N,
+            stim_duration=30,
+            pre_steps=30,
+            measure_window=15,
+            stim_amplitude=0.5,
+            seed=seed,
+        )
+
+    def test_row_norms_are_comparable(self):
+        """All row norms should be within the same order of magnitude."""
+        R = self._compute_R()
+        norms = np.linalg.norm(R, axis=1)
+        self.assertGreater(norms.min(), 0.0)
+        ratio = norms.max() / (norms.min() + 1e-10)
+        # With shared x0, the ratio should be modest (< 10×).
+        # Previously, with different x0 per row, ratios > 100× were possible.
+        self.assertLess(ratio, 10.0,
+                        msg=f"Row norm ratio {ratio:.2f} too large — "
+                            "likely still using different x0 per row")
+
+    def test_zero_amplitude_gives_near_zero_response(self):
+        """With amplitude=0 every row of R should be essentially zero."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, seed=0)
+        from analysis.response_matrix import compute_response_matrix
+        R = compute_response_matrix(
+            sim, n_nodes=N, stim_duration=30, pre_steps=30,
+            measure_window=15, stim_amplitude=0.0, seed=42,
+        )
+        self.assertAlmostEqual(float(np.abs(R).max()), 0.0, places=4)
+
+    def test_response_matrix_shape(self):
+        R = self._compute_R()
+        self.assertEqual(R.shape, (N, N))
+
+    def test_different_seeds_give_different_R(self):
+        """Different seeds → different x0 → different R matrices."""
+        R1 = self._compute_R(seed=1)
+        R2 = self._compute_R(seed=99)
+        self.assertFalse(np.allclose(R1, R2))
+
+    def test_column_stats_attributes(self):
+        """column_mean and stim_specificity can be computed from R."""
+        R = self._compute_R()
+        col_mean = np.abs(R).mean(axis=0)
+        stim_specificity = R.std(axis=1)
+        self.assertEqual(col_mean.shape, (N,))
+        self.assertEqual(stim_specificity.shape, (N,))
+        self.assertTrue(np.all(col_mean >= 0))
+        self.assertTrue(np.all(stim_specificity >= 0))
+
+
+class TestAttractorBasinJSON(unittest.TestCase):
+    def _make_two_attractor_trajs(self):
+        rng = np.random.default_rng(0)
+        n_init, steps, n_regions = 20, 50, N
+        trajs = np.zeros((n_init, steps, n_regions), dtype=np.float32)
+        for i in range(n_init):
+            final = np.zeros(n_regions) + (0.2 if i < 10 else 0.8)
+            trajs[i] = final + rng.random((steps, n_regions)) * 0.01
+        return trajs.astype(np.float32)
+
+    def test_saves_basin_distribution_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs = self._make_two_attractor_trajs()
+            run_attractor_analysis(
+                trajs,
+                tail_steps=5,
+                k_candidates=[2],
+                k_best=2,
+                output_dir=Path(tmp),
+            )
+            json_path = Path(tmp) / "basin_distribution.json"
+            self.assertTrue(json_path.exists())
+            with open(json_path) as fh:
+                data = json.load(fh)
+            # Keys should look like "attractor_A", "attractor_B", etc.
+            self.assertTrue(len(data) >= 1)
+            for key in data:
+                self.assertTrue(key.startswith("attractor_"))
+            # All fractions should sum to ~1
+            total = sum(data.values())
+            self.assertAlmostEqual(total, 1.0, places=4)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
