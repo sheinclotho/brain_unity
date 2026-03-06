@@ -155,13 +155,8 @@ _DEFAULTS = {
         "patterns": ["sine"],
     },
     "response_matrix": {
-        "n_nodes": 10,         # Reduced default for model mode (full 200 is slow)
+        "n_nodes": 10,         # Number of source nodes to stimulate (full 200 is slow)
         "stim_amplitude": 0.5,
-        "stim_duration": 80,   # Long enough to reach WC steady-state (τ≈10 steps → 60+ steps)
-        "stim_frequency": 10.0,
-        "stim_pattern": "step",   # Step gives cleanest steady-state response (vs sine bell)
-        "measure_window": 30,     # Measure the plateau after skip_transient
-        "skip_transient": 20,     # Skip ramp-in / transient (StepStimulus ramp_steps=10)
     },
     "stability_analysis": {
         "convergence_tol": 1e-4,
@@ -322,9 +317,10 @@ def run(cfg: dict) -> dict:
     logger.info("=" * 60)
     logger.info("步骤 3/10  自由动力学实验")
     fd_cfg = cfg["free_dynamics"]
-    # In model mode, each rollout() call ignores x0 and uses base_graph context.
-    # n_init > 1 produces n_init independent rollout segments (identical context
-    # but the predictor may have stochastic components from dropout if enabled).
+    # Each rollout() injects a different random x0 into the LAST time step of the
+    # base_graph context.  The preceding (context_length − 1) steps are shared.
+    # The resulting trajectory diversity depends on how strongly the model responds
+    # to the last-step perturbation vs the shared context history.
     trajectories = run_free_dynamics(
         simulator=simulator,
         n_init=fd_cfg.get("n_init", 10),
@@ -388,11 +384,6 @@ def run(cfg: dict) -> dict:
         simulator=simulator,
         n_nodes=n_nodes_rm,
         stim_amplitude=rm_cfg.get("stim_amplitude", 0.5),
-        stim_duration=rm_cfg.get("stim_duration", 80),
-        stim_frequency=rm_cfg.get("stim_frequency", 10.0),
-        stim_pattern=rm_cfg.get("stim_pattern", "step"),
-        measure_window=rm_cfg.get("measure_window", 30),
-        skip_transient=rm_cfg.get("skip_transient", None),
         output_dir=output_dir if cfg["output"].get("save_response_matrix") else None,
     )
     results["response_matrix"] = response_matrix

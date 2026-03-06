@@ -5,9 +5,9 @@ Lyapunov Exponent Analysis
 估计系统最大 Lyapunov 指数（Largest Lyapunov Exponent, LLE），
 判断系统是否接近混沌状态。
 
-提供四种估计方法，均可从已生成的 trajectories.npy 使用：
+提供三种估计方法，均可从已生成的 trajectories.npy 使用：
 
-**方法 1 — Wolf-Benettin 重归一化（经典，适合 WC 模式）**
+**方法 1 — Wolf-Benettin 重归一化**
 
   经典的 Wolf 1985 方法，以周期性重归一化避免扰动向量饱和/发散：
 
@@ -28,7 +28,7 @@ Lyapunov Exponent Analysis
   在 TwinBrainDigitalTwin 模式下，模型使用长度为 L 的上下文窗口进行预测。
   Wolf 的扰动仅施加在上下文最后一步，上下文历史保持不变。
   当 L >> 1 时，单步扰动被注意力机制"稀释"，使得测量到的扰动增长率
-  偏向负值（实际 LLE 被低估）——这与 FTLE/Rosenstein 方法的结果存在
+  偏向负值（实际 LLE 被低估）——这与 Rosenstein 方法的结果存在
   显著差异，是已知的系统性偏差。请与 Rosenstein 方法交叉验证。
 
 **方法 2 — 简单 FTLE 线性拟合（快速对照）**
@@ -36,7 +36,7 @@ Lyapunov Exponent Analysis
   运行双轨迹，对 log(||δ(t)||) 做线性回归。
   计算快速但可能受瞬态/饱和影响；对收敛系统更稳健。
 
-**方法 3 — Rosenstein (1993) — 从轨迹直接估计（推荐，非马尔可夫系统）**
+**方法 3 — Rosenstein (1993) — 从轨迹直接估计（推荐，twin 模式）**
 
   Rosenstein-Collins-De Luca (1993) 方法，无需重新运行模拟器，
   直接从已有轨迹数据估计 LLE：
@@ -135,6 +135,13 @@ _DEFAULT_ROSENSTEIN_MIN_SEP: int = 20
 # Empirically confirmed: the log shows std=0.00006 for 200 twin-mode trajectories.
 _WOLF_BIAS_STD_THRESHOLD: float = 1e-3
 
+# Trajectory diversity threshold: if mean per-region std across trajectories < this,
+# the 200 trajectories are near-identical (all start from essentially the same state).
+# This happens in twin mode when base_graph context dominates over the injected x0.
+# For uniform random x0 in [0,1]^N: expected std ≈ sqrt(1/12) ≈ 0.289.
+# A value < 0.02 means trajectories differ by < 7% of a random baseline → context-dominated.
+_TRAJECTORY_DIVERSITY_LOW_THRESHOLD: float = 0.02
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Wolf-Benettin renormalization method (primary)
@@ -188,10 +195,9 @@ def wolf_largest_lyapunov(
     log_sum = 0.0
     n_valid = 0  # periods with non-degenerate perturbation after clipping
 
-    # `wolf_rollout_pair` correctly handles both WC mode (fixed equilibrium)
-    # and twin mode (advancing context window).  Falling back to the old
-    # `rollout()` pair is kept only for custom simulator objects that have
-    # not yet implemented this method.
+    # `wolf_rollout_pair` correctly handles twin mode (advancing context window).
+    # Falling back to the old `rollout()` pair is kept only for custom simulator
+    # objects that have not yet implemented this method.
     use_wolf_pair = hasattr(simulator, "wolf_rollout_pair")
     wolf_context = None  # opaque per-mode state carried between periods
 
@@ -727,6 +733,40 @@ def run_lyapunov_analysis(
         n_segments,
     )
 
+    # ── Trajectory diversity diagnostic ──────────────────────────────────────
+    # Compute inter-trajectory state diversity at start and end.
+    # This is crucial for interpreting the LLE uniformity:
+    #   - Low initial diversity → context-dominated twin mode (base_graph overwhelms x0)
+    #   - Normal initial diversity → different start states genuinely tested
+    #   - Low final diversity → convergence evidence (attractor)
+    initial_diversity = float(np.std(trajectories[:, 0, :], axis=0).mean())
+    final_diversity   = float(np.std(trajectories[:, -1, :], axis=0).mean())
+    context_dominated = initial_diversity < _TRAJECTORY_DIVERSITY_LOW_THRESHOLD
+
+    logger.info(
+        "  轨迹多样性: 初始 std=%.4f, 终止 std=%.4f  "
+        "(随机基线预期 ≈ 0.289; 阈值 %.3f)",
+        initial_diversity, final_diversity, _TRAJECTORY_DIVERSITY_LOW_THRESHOLD,
+    )
+    if context_dominated:
+        logger.warning(
+            "  ⚠  初始轨迹多样性极低（%.4f < %.3f）：%d 条轨迹起点几乎相同。\n"
+            "     根本原因：TwinBrainDigitalTwin 上下文窗口（context_length 步）中，\n"
+            "     每条轨迹只有最后 1 步被 x0 覆盖，其余历史步由 base_graph 提供。\n"
+            "     当 context_length >> 1 时，不同 x0 对模型输出的影响被大量相同\n"
+            "     历史所稀释，导致所有轨迹在统计上无法区分。\n"
+            "     后果：Wolf/FTLE/Rosenstein 三种方法均会给出几乎相同的 LLE，\n"
+            "     这不是计算错误，而是架构特性。\n"
+            "     要获得真正独立的轨迹，需要使用不同的 base_graph（不同时间段\n"
+            "     或不同受试者的图缓存），而不是同一图的不同 x0 注入。",
+            initial_diversity, _TRAJECTORY_DIVERSITY_LOW_THRESHOLD, n_traj,
+        )
+    else:
+        logger.info(
+            "  轨迹多样性正常（%.4f ≥ %.3f）：%d 条轨迹从不同初始状态出发。",
+            initial_diversity, _TRAJECTORY_DIVERSITY_LOW_THRESHOLD, n_traj,
+        )
+
     rng = np.random.default_rng(42)
     values = np.zeros(n_traj, dtype=np.float64)
     ftle_values = np.zeros(n_traj, dtype=np.float64)
@@ -847,12 +887,21 @@ def run_lyapunov_analysis(
         wolf_bias_warning = True
         logger.warning(
             "  ⚠  Wolf LLE 跨轨迹标准差 std=%.2e < %.2e：所有轨迹的 Wolf 估计几乎相同。"
-            "\n     这是 TwinBrainDigitalTwin 上下文稀释偏差的典型症状：Wolf 扰动仅施加"
-            "于上下文窗口最后一步，被注意力机制稀释后导致所有轨迹测量到相同的收缩率。"
-            "\n     建议：使用 method='rosenstein' 或 method='both' 以获取无偏估计。"
-            "\n     FTLE 估计（如已运行）更接近真实 LLE。",
+            "\n     Wolf 扰动仅施加于上下文窗口最后一步，被 (context_length-1) 个相同历史步"
+            "稀释，导致所有轨迹测量到相同的收缩率。"
+            "\n     %s"
+            "\n     建议：使用 method='rosenstein' 或 method='both' 以获取无偏估计。",
             std_lam, _WOLF_BIAS_STD_THRESHOLD,
+            "且初始轨迹多样性低（context主导）——见上方⚠警告。" if context_dominated
+            else "但初始轨迹多样性正常——Wolf偏差来自注意力稀释，而非轨迹本身相同。",
         )
+
+    # Compute Rosenstein std for cross-method comparison
+    std_rosen: float = float("nan")
+    if run_rosenstein:
+        valid_rosen = rosenstein_values[np.isfinite(rosenstein_values)]
+        if len(valid_rosen) > 1:
+            std_rosen = float(np.std(valid_rosen))
 
     # Chaos regime classification
     # Prefer Rosenstein for regime classification if it's available and Wolf bias detected
@@ -880,7 +929,7 @@ def run_lyapunov_analysis(
             f"Wolf 计算已跳过。FTLE 均值 λ={mean_lam:.4f}，确认稳定。"
         )
 
-    # Logging summary
+    # ── Logging summary ────────────────────────────────────────────────────────
     logger.info(
         "  均值 λ=%.5f  中位数=%.5f  std=%.5f  "
         "混沌比例=%.1f%%  收敛比例=%.1f%%",
@@ -897,23 +946,35 @@ def run_lyapunov_analysis(
         valid_rosen = rosenstein_values[np.isfinite(rosenstein_values)]
         mean_rosen = float(np.mean(valid_rosen)) if len(valid_rosen) > 0 else float("nan")
         logger.info(
-            "  Rosenstein 均值=%.5f  (参考: Rosenstein et al. 1993)",
-            mean_rosen,
+            "  Rosenstein 均值=%.5f  std=%.5f  (参考: Rosenstein et al. 1993)",
+            mean_rosen, std_rosen if np.isfinite(std_rosen) else float("nan"),
         )
+        # Explain why Rosenstein std may also be near-zero
+        if np.isfinite(std_rosen) and std_rosen < _WOLF_BIAS_STD_THRESHOLD:
+            if context_dominated:
+                logger.warning(
+                    "  ⚠  Rosenstein std=%.2e 也极小：这是因为 %d 条轨迹本身几乎相同\n"
+                    "     （初始多样性=%.4f），Rosenstein 从同质轨迹中自然得到相同 LLE。\n"
+                    "     这不是 Rosenstein 的计算错误，而是轨迹集合缺乏多样性导致的。\n"
+                    "     → LLE=%.5f 是模型沿当前 base_graph 吸引子轨迹的 Lyapunov 指数，\n"
+                    "     不代表对不同初始条件的响应多样性。",
+                    std_rosen, n_traj, initial_diversity, mean_rosen,
+                )
+            else:
+                logger.info(
+                    "  Rosenstein std=%.2e：尽管轨迹初始多样性正常（%.4f），\n"
+                    "  各轨迹的 Rosenstein LLE 仍高度一致——\n"
+                    "  这是系统存在单一全局吸引子的有力证据（λ 是吸引子的性质，\n"
+                    "  与初始条件无关，不同起点最终测量到相同收缩率是正确行为）。",
+                    std_rosen, initial_diversity,
+                )
         if run_wolf and np.isfinite(mean_rosen):
-            # 0.03 threshold: empirically, both Wolf and Rosenstein agree to within
-            # ±0.01–0.02 for WC-mode trajectories (where no context dilution exists).
-            # A discrepancy > 0.03 (~3×σ_method) indicates something beyond normal
-            # estimation variance — the most common cause in twin mode is context
-            # dilution (all 200 Wolf estimates converging to the same value because
-            # the base_graph context is shared, as seen in the observed std≈0.00006).
-            # This choice corresponds to 3 classification boundaries (stable/marginal/edge)
-            # being spaced at 0.01 intervals, so 0.03 = 3 full tier jumps.
+            diff = mean_lam - mean_rosen
             logger.info(
                 "  Wolf vs Rosenstein 差异=%.5f%s",
-                mean_lam - mean_rosen,
+                diff,
                 "  [⚠ 差异显著，可能存在 Wolf 上下文稀释偏差]"
-                if abs(mean_lam - mean_rosen) > 0.03 else "",
+                if abs(diff) > 0.03 else "",
             )
     logger.info(
         "  混沌评估: [%s] %s",
@@ -933,6 +994,10 @@ def run_lyapunov_analysis(
         "renorm_steps": int(renorm_steps),
         "skipped_wolf": skipped_wolf,
         "wolf_bias_warning": wolf_bias_warning,
+        # Trajectory diversity metrics (key for interpreting LLE uniformity)
+        "initial_trajectory_diversity": initial_diversity,
+        "final_trajectory_diversity": final_diversity,
+        "context_dominated": context_dominated,
     }
 
     if run_ftle or effective_method == "ftle":
@@ -943,6 +1008,7 @@ def run_lyapunov_analysis(
         results["rosenstein_values"] = rosenstein_values.astype(np.float32)
         valid_r = rosenstein_values[np.isfinite(rosenstein_values)]
         results["mean_rosenstein"] = float(np.mean(valid_r)) if len(valid_r) > 0 else float("nan")
+        results["std_rosenstein"] = float(std_rosen) if np.isfinite(std_rosen) else float("nan")
 
     if output_dir is not None:
         output_dir = Path(output_dir)
@@ -976,6 +1042,15 @@ def run_lyapunov_analysis(
             "is_chaotic": chaos_info["is_chaotic"],
             "near_chaos_edge": chaos_info["near_chaos_edge"],
             "interpretation": chaos_info["interpretation_zh"],
+            # Diversity diagnostics
+            "initial_trajectory_diversity": initial_diversity,
+            "final_trajectory_diversity": final_diversity,
+            "context_dominated": context_dominated,
+            "diversity_interpretation": (
+                "上下文主导（context_length >> 1 导致 x0 被稀释，轨迹几乎相同）"
+                if context_dominated else
+                "多样性正常（不同 x0 产生了可区分的轨迹）"
+            ),
         }
         if run_ftle or effective_method == "ftle":
             valid_f = ftle_values[np.isfinite(ftle_values)]
@@ -983,6 +1058,7 @@ def run_lyapunov_analysis(
         if run_rosenstein:
             valid_r2 = rosenstein_values[np.isfinite(rosenstein_values)]
             report["mean_rosenstein"] = float(np.mean(valid_r2)) if len(valid_r2) > 0 else float("nan")
+            report["std_rosenstein"] = float(std_rosen) if np.isfinite(std_rosen) else float("nan")
         with open(output_dir / "lyapunov_report.json", "w", encoding="utf-8") as fh:
             json.dump(report, fh, indent=2, ensure_ascii=False)
         logger.info("  → 已保存: %s/lyapunov_report.json", output_dir)
