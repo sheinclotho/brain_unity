@@ -14,7 +14,6 @@ Response Matrix Computation
 输出文件：outputs/response_matrix.npy
 """
 
-import copy
 import logging
 from pathlib import Path
 from typing import Optional
@@ -26,7 +25,11 @@ _HERE = Path(__file__).parent.parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from simulator.brain_dynamics_simulator import BrainDynamicsSimulator, SinStimulus
+from simulator.brain_dynamics_simulator import (
+    BrainDynamicsSimulator,
+    SinStimulus,
+    _clone_hetero_graph,
+)
 from experiments.virtual_stimulation import run_stimulation
 
 logger = logging.getLogger(__name__)
@@ -133,34 +136,31 @@ def compute_response_matrix(
             "  n_nodes=%d, delta=%.2f sigma (= stim_amplitude × %.1f)",
             n_nodes, stim_amplitude * _STIM_AMP_TO_LATENT_SIGMA, _STIM_AMP_TO_LATENT_SIGMA,
         )
-        try:
-            import torch
-            # Trim base_graph ONCE before the n_nodes loop.
-            # simulate_intervention() only READS from the context (it clones
-            # internally when building h_perturbed), so we can safely reuse
-            # the same trimmed context for all n_nodes rows.
-            context = simulator._trim_context(copy.deepcopy(simulator.base_graph))
-            modality = simulator.modality
-            delta = float(stim_amplitude) * _STIM_AMP_TO_LATENT_SIGMA
+        import torch
+        # Use _clone_hetero_graph (not copy.deepcopy) — the only safe way to
+        # clone a PyG HeteroData.  copy.deepcopy can produce NodeStorage objects
+        # where .x is absent (PyG's __deepcopy__ does not guarantee attribute
+        # preservation for all node types), which causes:
+        #   AttributeError: 'NodeStorage' object has no attribute 'x'
+        # _clone_hetero_graph is the tested helper used by all other simulator
+        # methods (_rollout_with_twin, _wolf_pair_twin, etc.) — it explicitly
+        # copies only the attributes that actually exist.
+        context = simulator._trim_context(_clone_hetero_graph(simulator.base_graph))
+        modality = simulator.modality
+        delta = float(stim_amplitude) * _STIM_AMP_TO_LATENT_SIGMA
 
-            for i in range(n_nodes):
-                result = simulator.model.simulate_intervention(
-                    baseline_data=context,
-                    interventions={modality: ([i], delta)},
-                )
-                effect = result["causal_effect"].get(modality)  # [N, steps, C]
-                if effect is not None:
-                    # Mean over prediction steps; squeeze last dim (C=1 for fMRI).
-                    R[i] = effect.detach().squeeze(-1).mean(dim=1).cpu().numpy()
-
-                if (i + 1) % max(1, n_nodes // 10) == 0:
-                    logger.info("  %d/%d 节点完成 (twin模式)", i + 1, n_nodes)
-        except Exception as exc:
-            logger.warning(
-                "TwinBrain 直接模式失败（%s: %s），回退到 rollout 模式。",
-                type(exc).__name__, exc,
+        for i in range(n_nodes):
+            result = simulator.model.simulate_intervention(
+                baseline_data=context,
+                interventions={modality: ([i], delta)},
             )
-            is_twin = False  # fall through to WC rollout path below
+            effect = result["causal_effect"].get(modality)  # [N, steps, C]
+            if effect is not None:
+                # Mean over prediction steps; squeeze last dim (C=1 for fMRI).
+                R[i] = effect.detach().squeeze(-1).mean(dim=1).cpu().numpy()
+
+            if (i + 1) % max(1, n_nodes // 10) == 0:
+                logger.info("  %d/%d 节点完成 (twin模式)", i + 1, n_nodes)
 
     # ── Branch: WC / fallback rollout mode ─────────────────────────────────────
     if not is_twin:

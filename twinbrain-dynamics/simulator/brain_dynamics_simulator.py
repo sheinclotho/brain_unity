@@ -1007,6 +1007,13 @@ class BrainDynamicsSimulator:
         # This is the key fix for EEG OOM: T_eeg can be orders of magnitude
         # larger than context_length (e.g. 98500 vs 200).
         for nt in list(context.node_types):
+            # Guard: skip node types that lack a temporal .x attribute.
+            # Auxiliary / metadata node types may appear in node_types without
+            # .x (e.g. when the graph has extra metadata nodes after deepcopy).
+            # Accessing .x on a NodeStorage without it raises:
+            #   AttributeError: 'NodeStorage' object has no attribute 'x'
+            if not hasattr(context[nt], "x"):
+                continue
             nt_x = context[nt].x  # [N, T, C]
             if nt_x.shape[1] > _ctx_len:
                 context[nt].x = nt_x[:, -_ctx_len:, :]

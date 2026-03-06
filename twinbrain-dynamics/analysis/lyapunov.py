@@ -410,40 +410,56 @@ def rosenstein_lyapunov(
     eff_min_sep = max(1, min_temporal_sep // step)
     eff_max_lag = min(max_lag, T_sub // 4)
 
-    # Compute pairwise distance matrix (only upper triangle needed)
-    # For large T_sub, use a vectorised approach
     log_div_sum = np.zeros(eff_max_lag, dtype=np.float64)
     log_div_count = np.zeros(eff_max_lag, dtype=np.int64)
 
-    # For each reference point t, find nearest neighbour t* with |t-t*| > min_sep
-    for t in range(T_sub - eff_max_lag):
-        x_t = traj_sub[t]
+    # ── Vectorised nearest-neighbour search ───────────────────────────────────
+    # Pre-compute the full pairwise squared-distance matrix D²[i,j] = ‖x(i)-x(j)‖²
+    # (shape T_sub×T_sub, float64).  For T_sub ≤ 2000 this is ≤ 30 MB, acceptable.
+    # Exclude temporal neighbours within eff_min_sep by setting their distance to ∞.
+    #
+    # Decomposition: ‖a - b‖² = ‖a‖² + ‖b‖² - 2·aᵀb
+    sq_norms = (traj_sub ** 2).sum(axis=1)                       # (T_sub,)
+    dist2 = (sq_norms[:, None] + sq_norms[None, :] -
+             2.0 * (traj_sub @ traj_sub.T))                      # (T_sub, T_sub)
+    # Ensure numerical non-negativity (floating-point rounding can give tiny <0)
+    np.clip(dist2, 0.0, None, out=dist2)
 
-        # Candidate neighbour range: exclude [t-eff_min_sep, t+eff_min_sep]
-        lo = max(0, t - eff_min_sep)
-        hi = min(T_sub, t + eff_min_sep + 1)
+    # Mask temporal neighbours and self-distances
+    rows = np.arange(T_sub, dtype=np.int32)
+    for d_off in range(-eff_min_sep, eff_min_sep + 1):
+        col_idx = rows + d_off
+        mask = (col_idx >= 0) & (col_idx < T_sub)
+        dist2[rows[mask], col_idx[mask]] = np.inf
 
-        # Build distance to all candidates
-        candidates = np.concatenate([traj_sub[:lo], traj_sub[hi:]])
-        if len(candidates) == 0:
-            continue
-        diffs = candidates - x_t
-        dists = np.sqrt((diffs ** 2).sum(axis=1))
-        nn_local_idx = int(np.argmin(dists))
+    # For each reference point t, find the nearest valid neighbour
+    nn_indices = np.argmin(dist2, axis=1)  # (T_sub,), one NN per reference point
 
-        # Convert local index back to global index
-        if nn_local_idx < lo:
-            nn_idx = nn_local_idx
-        else:
-            nn_idx = hi + (nn_local_idx - lo)
+    # ── Divergence accumulation ───────────────────────────────────────────────
+    # Iterate over reference points t; for each (t, nn_t) pair compute
+    # log separation at subsequent lags j=1..max_j using vectorised norms.
+    n_ref = T_sub - eff_max_lag
+    for t in range(n_ref):
+        nn_idx = int(nn_indices[t])
+        if not np.isfinite(dist2[t, nn_idx]):
+            continue  # no valid neighbour (can happen if T_sub is very small)
 
-        # Track separation for j = 0..eff_max_lag-1
         max_j = min(eff_max_lag, T_sub - max(t, nn_idx) - 1)
-        for j in range(1, max_j):
-            d_j = np.linalg.norm(traj_sub[t + j] - traj_sub[nn_idx + j])
-            if d_j > 0:
-                log_div_sum[j] += np.log(d_j)
-                log_div_count[j] += 1
+        if max_j < 2:
+            continue
+
+        # Vectorised lag loop: compute ‖x(t+j) - x(nn_idx+j)‖ for j=1..max_j-1
+        j_range = np.arange(1, max_j)                            # (max_j-1,)
+        diff_j = traj_sub[t + j_range] - traj_sub[nn_idx + j_range]  # (max_j-1, N)
+        d_j = np.sqrt((diff_j ** 2).sum(axis=1))                # (max_j-1,)
+
+        valid_j = d_j > 0
+        if not valid_j.any():
+            continue
+
+        log_d_j = np.where(valid_j, np.log(np.where(valid_j, d_j, 1.0)), 0.0)
+        np.add.at(log_div_sum,   j_range, log_d_j * valid_j)
+        np.add.at(log_div_count, j_range, valid_j.astype(np.int64))
 
     # Average log divergence curve
     valid = log_div_count > 0

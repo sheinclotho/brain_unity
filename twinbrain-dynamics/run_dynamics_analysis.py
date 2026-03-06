@@ -190,6 +190,25 @@ _DEFAULTS = {
         "spectral_radii": [0.9, 1.5, 2.0],  # tanh chaos boundary is ρ≈1.5 for n≈190 (not ρ=1)
         "n_seeds": 5,                           # independent W matrices per spectral radius
     },
+    # ── New analysis modules (added in critical review v2) ────────────────────
+    "information_flow": {
+        "enabled": True,
+        # Set to a small number by default for speed; increase to n_regions for
+        # full N×N TE matrix.  Full matrix (N=200) takes ~5 min on CPU.
+        "n_source_regions": 20,
+        "n_target_regions": 20,
+        "order": 1,        # Markov embedding order (1 = single-step, standard for fMRI)
+        "n_bins": 16,      # Histogram bins for discrete TE estimator
+    },
+    "controllability": {
+        "enabled": True,
+        "n_communities": 6,    # Number of functional communities (cortical lobes approx.)
+        "n_gramian_terms": 100, # Gramian series truncation
+    },
+    "critical_slowing_down": {
+        "enabled": True,
+        "window_fraction": 0.5,  # Rolling window as fraction of trajectory length
+    },
     "output": {
         "directory": "outputs",
         "save_trajectories": True,
@@ -360,7 +379,7 @@ def run(cfg: dict) -> dict:
 
     # ── Step 6: Response matrix ───────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 6/10  响应矩阵计算")
+    logger.info("步骤 6/13  响应矩阵计算")
     rm_cfg = cfg["response_matrix"]
     n_nodes_rm = min(
         rm_cfg.get("n_nodes", simulator.n_regions), simulator.n_regions
@@ -380,7 +399,7 @@ def run(cfg: dict) -> dict:
 
     # ── Step 7: Stability analysis ────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 7/10  稳定性分析")
+    logger.info("步骤 7/13  稳定性分析")
     sa_cfg = cfg["stability_analysis"]
     stability_summary = run_stability_analysis(
         trajectories=trajectories,
@@ -393,7 +412,7 @@ def run(cfg: dict) -> dict:
 
     # ── Step 8: Trajectory convergence ───────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 8/10  轨迹收敛分析")
+    logger.info("步骤 8/13  轨迹收敛分析")
     tc_cfg = cfg.get("trajectory_convergence", {})
     if tc_cfg.get("enabled", True):
         tc_results = run_trajectory_convergence(
@@ -408,7 +427,7 @@ def run(cfg: dict) -> dict:
 
     # ── Step 9: Lyapunov exponent ─────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 9/10  Lyapunov 指数估计（Wolf-Benettin 重归一化法）")
+    logger.info("步骤 9/13  Lyapunov 指数估计（Wolf-Benettin 重归一化法）")
     lya_cfg = cfg.get("lyapunov", {})
     if lya_cfg.get("enabled", True):
         try:
@@ -437,7 +456,7 @@ def run(cfg: dict) -> dict:
 
     # ── Step 10: Random model comparison ─────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 10/10  随机模型对照实验")
+    logger.info("步骤 10/13  随机模型对照实验")
     rc_cfg = cfg.get("random_comparison", {})
     if rc_cfg.get("enabled", True):
         try:
