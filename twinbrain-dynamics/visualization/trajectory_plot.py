@@ -167,3 +167,105 @@ def _save_or_show(fig: "plt.Figure", save_path: Optional[Path]) -> None:
     else:
         plt.show()
     plt.close(fig)
+
+
+def plot_trajectory_convergence(
+    mean_distances: np.ndarray,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    绘制轨迹对均值距离随时间的变化（收敛分析图）。
+
+    Args:
+        mean_distances: shape (steps,)，均值 L2 距离。
+        save_path:      保存路径；None → 显示。
+    """
+    if not _MPL_AVAILABLE:
+        return
+
+    steps = len(mean_distances)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(np.arange(steps), mean_distances, color="steelblue", linewidth=1.2)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Mean Pairwise Distance")
+    ax.set_title("Trajectory Convergence — Mean Pairwise Distance over Time\n"
+                 "(↓ converging, → no structure, ↑ diverging)")
+    ax.grid(True, alpha=0.3)
+    _save_or_show(fig, save_path)
+
+
+def plot_lyapunov_histogram(
+    lyapunov_values: np.ndarray,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    绘制 Lyapunov 指数分布直方图。
+
+    Args:
+        lyapunov_values: shape (n_init,)，每条轨迹的 Lyapunov 指数。
+        save_path:       保存路径；None → 显示。
+    """
+    if not _MPL_AVAILABLE:
+        return
+
+    mean_lam = float(np.mean(lyapunov_values))
+    median_lam = float(np.median(lyapunov_values))
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(lyapunov_values, bins=min(30, max(10, len(lyapunov_values) // 3)),
+            color="salmon", edgecolor="white", alpha=0.85)
+    ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0, label="λ=0")
+    ax.axvline(mean_lam, color="red", linestyle="-", linewidth=1.2,
+               label=f"mean={mean_lam:.4f}")
+    ax.axvline(median_lam, color="orange", linestyle=":", linewidth=1.2,
+               label=f"median={median_lam:.4f}")
+    ax.set_xlabel("Lyapunov Exponent λ (per step)")
+    ax.set_ylabel("Count")
+    ax.set_title("Lyapunov Exponent Distribution\n"
+                 "(λ<0: convergent, λ≈0: marginal, λ>0: chaotic)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    _save_or_show(fig, save_path)
+
+
+def plot_basin_sizes(
+    basin_distribution: dict,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    绘制吸引子 basin 大小分布条形图。
+
+    Args:
+        basin_distribution: {attractor_id: fraction} 字典（int 键或 str 键均可）。
+        save_path:          保存路径；None → 显示。
+    """
+    if not _MPL_AVAILABLE:
+        return
+
+    labels_abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    ids = sorted(basin_distribution.keys())
+    fractions = [basin_distribution[k] for k in ids]
+    bar_labels = [
+        (f"Attractor {labels_abc[k]}" if isinstance(k, int) and k < len(labels_abc)
+         else str(k))
+        for k in ids
+    ]
+
+    fig, ax = plt.subplots(figsize=(max(4, len(ids) * 1.5), 4))
+    cmap = plt.get_cmap("tab10", len(ids))
+    bars = ax.bar(bar_labels, fractions, color=[cmap(i) for i in range(len(ids))],
+                  edgecolor="white")
+    for bar, frac in zip(bars, fractions):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height() + 0.01,
+            f"{frac:.1%}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+    ax.set_ylim(0, min(1.15, max(fractions) + 0.15))
+    ax.set_ylabel("Basin Size (fraction of trajectories)")
+    ax.set_title("Attractor Basin Size Distribution")
+    ax.grid(True, axis="y", alpha=0.3)
+    _save_or_show(fig, save_path)

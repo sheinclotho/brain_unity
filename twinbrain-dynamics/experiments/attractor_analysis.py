@@ -159,6 +159,18 @@ def run_attractor_analysis(
         np.save(output_dir / "attractor_states.npy", kmeans_centers)
         logger.info("  → 已保存: %s/attractor_states.npy", output_dir)
 
+        # Save basin distribution as JSON with letter labels (A, B, C, …)
+        labels_abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        basin_json: Dict[str, float] = {}
+        for cid, frac in sorted(basin.items()):
+            label = f"attractor_{labels_abc[cid]}" if cid < len(labels_abc) else f"attractor_{cid}"
+            basin_json[label] = frac
+        basin_path = output_dir / "basin_distribution.json"
+        with open(basin_path, "w", encoding="utf-8") as fh:
+            import json
+            json.dump(basin_json, fh, indent=2, ensure_ascii=False)
+        logger.info("  → 已保存: %s", basin_path)
+
     return results
 
 

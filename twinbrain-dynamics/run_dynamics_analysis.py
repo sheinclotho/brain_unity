@@ -13,8 +13,10 @@ TwinBrain — Brain Network Dynamics Testbed
   4  run attractor analysis
   5  run stimulation experiments
   6  compute response matrix
-  7  run stability analysis
-  8  save results & plots
+  7  run stability analysis (improved: delay-distance method)
+  8  trajectory convergence analysis
+  9  Lyapunov exponent estimation
+  10 random model comparison
 
 用法::
 
@@ -150,6 +152,22 @@ _DEFAULTS = {
     "stability_analysis": {
         "convergence_tol": 1e-4,
         "period_max_lag": 100,
+        "delay_dt": 50,        # Delay lag for improved stability classification (method B)
+    },
+    "lyapunov": {
+        "enabled": True,
+        "epsilon": 1e-5,       # Initial perturbation magnitude
+        "skip_fraction": 0.1,  # Skip initial transient fraction when fitting
+    },
+    "trajectory_convergence": {
+        "enabled": True,
+        "n_pairs": 50,         # Number of random trajectory pairs
+    },
+    "random_comparison": {
+        "enabled": True,
+        "n_init": 200,
+        "steps": 1000,
+        "spectral_radius": 0.9,
     },
     "output": {
         "directory": "outputs",
@@ -189,6 +207,9 @@ def run(cfg: dict) -> dict:
     from experiments.virtual_stimulation import run_virtual_stimulation
     from analysis.response_matrix import compute_response_matrix
     from analysis.stability_analysis import run_stability_analysis
+    from analysis.lyapunov import run_lyapunov_analysis
+    from analysis.trajectory_convergence import run_trajectory_convergence
+    from analysis.random_comparison import run_random_model_comparison
 
     # ── Output directory ──────────────────────────────────────────────────────
     output_dir = Path(cfg["output"]["directory"])
@@ -259,7 +280,7 @@ def run(cfg: dict) -> dict:
 
     # ── Step 3: Free dynamics ─────────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 3/7  自由动力学实验")
+    logger.info("步骤 3/10  自由动力学实验")
     fd_cfg = cfg["free_dynamics"]
     # In model mode, each rollout() call ignores x0 and uses base_graph context.
     # n_init > 1 produces n_init independent rollout segments (identical context
@@ -276,7 +297,7 @@ def run(cfg: dict) -> dict:
 
     # ── Step 4: Attractor analysis ────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 4/7  吸引子分析")
+    logger.info("步骤 4/10  吸引子分析")
     att_cfg = cfg["attractor_analysis"]
     attractor_results = run_attractor_analysis(
         trajectories=trajectories,
@@ -291,7 +312,7 @@ def run(cfg: dict) -> dict:
 
     # ── Step 5: Virtual stimulation ───────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 5/7  虚拟刺激实验")
+    logger.info("步骤 5/10  虚拟刺激实验")
     vs_cfg = cfg["virtual_stimulation"]
     # Clamp target nodes to the actual number of fMRI regions
     all_target_nodes = vs_cfg.get("target_nodes", [0, 100])
@@ -318,7 +339,7 @@ def run(cfg: dict) -> dict:
 
     # ── Step 6: Response matrix ───────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 6/7  响应矩阵计算")
+    logger.info("步骤 6/10  响应矩阵计算")
     rm_cfg = cfg["response_matrix"]
     n_nodes_rm = min(
         rm_cfg.get("n_nodes", simulator.n_regions), simulator.n_regions
@@ -337,22 +358,80 @@ def run(cfg: dict) -> dict:
 
     # ── Step 7: Stability analysis ────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 7/7  稳定性分析")
+    logger.info("步骤 7/10  稳定性分析")
     sa_cfg = cfg["stability_analysis"]
     stability_summary = run_stability_analysis(
         trajectories=trajectories,
         convergence_tol=sa_cfg.get("convergence_tol", 1e-4),
         period_max_lag=sa_cfg.get("period_max_lag", 100),
+        delay_dt=sa_cfg.get("delay_dt", 50),
         output_dir=output_dir if cfg["output"].get("save_stability_metrics") else None,
     )
     results["stability_summary"] = stability_summary
+
+    # ── Step 8: Trajectory convergence ───────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 8/10  轨迹收敛分析")
+    tc_cfg = cfg.get("trajectory_convergence", {})
+    if tc_cfg.get("enabled", True):
+        tc_results = run_trajectory_convergence(
+            trajectories=trajectories,
+            n_pairs=tc_cfg.get("n_pairs", 50),
+            seed=cfg["free_dynamics"].get("seed", 42),
+            output_dir=output_dir if cfg["output"].get("save_trajectories") else None,
+        )
+        results["trajectory_convergence"] = tc_results
+    else:
+        logger.info("  轨迹收敛分析已禁用，跳过。")
+
+    # ── Step 9: Lyapunov exponent ─────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 9/10  Lyapunov 指数估计")
+    lya_cfg = cfg.get("lyapunov", {})
+    if lya_cfg.get("enabled", True):
+        try:
+            lyapunov_results = run_lyapunov_analysis(
+                trajectories=trajectories,
+                simulator=simulator,
+                epsilon=lya_cfg.get("epsilon", 1e-5),
+                skip_fraction=lya_cfg.get("skip_fraction", 0.1),
+                output_dir=output_dir,
+            )
+            results["lyapunov"] = lyapunov_results
+        except Exception as exc:
+            logger.warning("  Lyapunov 分析失败 (%s)，跳过。", exc)
+    else:
+        logger.info("  Lyapunov 分析已禁用，跳过。")
+
+    # ── Step 10: Random model comparison ─────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 10/10  随机模型对照实验")
+    rc_cfg = cfg.get("random_comparison", {})
+    if rc_cfg.get("enabled", True):
+        try:
+            comparison = run_random_model_comparison(
+                trajectories=trajectories,
+                attractor_results=attractor_results,
+                lyapunov_results=results.get("lyapunov"),
+                response_matrix=response_matrix,
+                random_n_init=rc_cfg.get("n_init", 200),
+                random_steps=rc_cfg.get("steps", 1000),
+                spectral_radius=rc_cfg.get("spectral_radius", 0.9),
+                seed=cfg["free_dynamics"].get("seed", 42),
+                output_dir=output_dir,
+            )
+            results["random_comparison"] = comparison
+        except Exception as exc:
+            logger.warning("  随机模型对照实验失败 (%s)，跳过。", exc)
+    else:
+        logger.info("  随机模型对照实验已禁用，跳过。")
 
     # ── Visualisations ────────────────────────────────────────────────────────
     if cfg["output"].get("save_plots"):
         _save_plots(results, output_dir, simulator)
 
     logger.info("=" * 60)
-    logger.info("✓ 动力系统分析全部完成！结果保存至: %s", output_dir.resolve())
+    logger.info("✓ 动力系统分析全部完成（10 步）！结果保存至: %s", output_dir.resolve())
     return results
 
 
@@ -366,6 +445,9 @@ def _save_plots(results: dict, output_dir: Path, simulator) -> None:
             plot_pca_trajectories,
             plot_region_heatmap,
             plot_trajectory_norms,
+            plot_trajectory_convergence,
+            plot_lyapunov_histogram,
+            plot_basin_sizes,
         )
         from visualization.response_plot import (
             plot_response_matrix,
@@ -408,6 +490,28 @@ def _save_plots(results: dict, output_dir: Path, simulator) -> None:
                 title=f"Stimulation Response ({pattern}) — Node {res.target_node}",
                 save_path=fname,
             )
+
+    # ── New plots ──────────────────────────────────────────────────────────────
+    tc_results = results.get("trajectory_convergence")
+    if tc_results is not None:
+        plot_trajectory_convergence(
+            tc_results["mean_distances"],
+            save_path=plots_dir / "trajectory_convergence.png",
+        )
+
+    lya_results = results.get("lyapunov")
+    if lya_results is not None:
+        plot_lyapunov_histogram(
+            lya_results["lyapunov_values"],
+            save_path=plots_dir / "lyapunov_histogram.png",
+        )
+
+    att_results = results.get("attractor_results")
+    if att_results is not None:
+        plot_basin_sizes(
+            att_results["basin_distribution"],
+            save_path=plots_dir / "basin_sizes.png",
+        )
 
     logger.info("  → 所有图表已保存至: %s", plots_dir)
 

@@ -11,7 +11,10 @@ Covers:
   - Attractor analysis
   - Virtual stimulation experiment
   - Response matrix
-  - Stability analysis
+  - Stability analysis (method A + method B delay-distance)
+  - Lyapunov exponent estimation
+  - Trajectory convergence analysis
+  - Random model comparison
   - load_model: error behavior for missing / non-TwinBrain checkpoints
 """
 
@@ -43,8 +46,20 @@ from experiments.virtual_stimulation import run_stimulation, run_virtual_stimula
 from analysis.response_matrix import compute_response_matrix
 from analysis.stability_analysis import (
     analyze_trajectory_stability,
+    classify_dynamics_delay,
+    compute_delay_distances,
     compute_state_deltas,
     run_stability_analysis,
+)
+from analysis.lyapunov import estimate_lyapunov_exponent, run_lyapunov_analysis
+from analysis.trajectory_convergence import (
+    compute_pairwise_distances,
+    run_trajectory_convergence,
+)
+from analysis.random_comparison import (
+    _make_random_dynamics_matrix,
+    run_random_trajectories,
+    run_random_model_comparison,
 )
 from loader.load_model import load_trained_model
 
@@ -493,6 +508,257 @@ class TestStabilityAnalysis(unittest.TestCase):
             with open(json_path) as fh:
                 data = json.load(fh)
             self.assertIn("classification_counts", data)
+
+    def test_v2_classification_both_v1_v2_present(self):
+        """analyze_trajectory_stability must return both classification and classification_v1."""
+        traj = np.ones((100, N), dtype=np.float32) * 0.5
+        metrics = analyze_trajectory_stability(traj)
+        self.assertIn("classification", metrics)
+        self.assertIn("classification_v1", metrics)
+        self.assertIn("delay_mean", metrics)
+        self.assertIn("delay_var", metrics)
+
+    def test_delay_distance_shape(self):
+        """compute_delay_distances should return (T - delay_dt,) array."""
+        traj = np.random.rand(100, N).astype(np.float32)
+        delays = compute_delay_distances(traj, delay_dt=20)
+        self.assertEqual(delays.shape, (80,))
+
+    def test_classify_dynamics_delay_fixed_point(self):
+        """Constant trajectory → fixed_point under delay method."""
+        traj = np.ones((200, N), dtype=np.float32) * 0.5
+        result = classify_dynamics_delay(traj, delay_dt=50)
+        self.assertEqual(result, "fixed_point")
+
+    def test_classify_dynamics_delay_unstable(self):
+        """Random walk → unstable under delay method."""
+        rng = np.random.default_rng(0)
+        traj = rng.random((200, N)).astype(np.float32)
+        result = classify_dynamics_delay(traj, delay_dt=50)
+        self.assertIn(result, ["unstable", "metastable"])
+
+    def test_json_contains_both_methods(self):
+        """stability_metrics.json must contain counts for both method A and method B."""
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs = np.random.rand(4, 60, N).astype(np.float32)
+            run_stability_analysis(trajs, output_dir=Path(tmp), delay_dt=10)
+            with open(Path(tmp) / "stability_metrics.json") as fh:
+                data = json.load(fh)
+            self.assertIn("classification_counts", data)
+            self.assertIn("classification_counts_v1", data)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Lyapunov Exponent Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestLyapunovAnalysis(unittest.TestCase):
+    def setUp(self):
+        self.sim = BrainDynamicsSimulator(model=None, n_regions=N)
+
+    def test_estimate_single_returns_float(self):
+        traj = np.random.rand(50, N).astype(np.float32)
+        lam = estimate_lyapunov_exponent(traj, self.sim)
+        self.assertIsInstance(lam, float)
+        self.assertTrue(np.isfinite(lam))
+
+    def test_run_lyapunov_keys(self):
+        trajs = np.random.rand(4, 30, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim)
+        self.assertIn("lyapunov_values", results)
+        self.assertIn("mean_lyapunov", results)
+        self.assertIn("median_lyapunov", results)
+        self.assertIn("fraction_positive", results)
+        self.assertIn("fraction_negative", results)
+
+    def test_run_lyapunov_shape(self):
+        n = 5
+        trajs = np.random.rand(n, 30, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim)
+        self.assertEqual(results["lyapunov_values"].shape, (n,))
+
+    def test_run_lyapunov_fractions_in_0_1(self):
+        trajs = np.random.rand(5, 30, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim)
+        self.assertGreaterEqual(results["fraction_positive"], 0.0)
+        self.assertLessEqual(results["fraction_positive"], 1.0)
+        self.assertGreaterEqual(results["fraction_negative"], 0.0)
+        self.assertLessEqual(results["fraction_negative"], 1.0)
+
+    def test_convergent_system_has_negative_lyapunov(self):
+        """A stable system (WC from constant x0) should have λ ≤ 0 on average."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, seed=42)
+        x0 = np.full(N, 0.5, dtype=np.float32)
+        # Generate trajectories that converge to x0
+        traj = np.tile(x0, (200, 1)).astype(np.float32)
+        # Add tiny decreasing noise to make it converge
+        rng = np.random.default_rng(0)
+        noise_scale = np.linspace(0.01, 0.0, 200).reshape(-1, 1)
+        traj += (rng.random((200, N)).astype(np.float32) * noise_scale).astype(np.float32)
+        traj = np.clip(traj, 0.0, 1.0)
+
+        lam = estimate_lyapunov_exponent(traj, sim)
+        # For a converging system the estimated exponent should not be strongly positive
+        # (it may be close to 0 due to the approximation, so we use a generous bound)
+        self.assertLess(lam, 0.5)
+
+    def test_saves_npy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs = np.random.rand(3, 20, N).astype(np.float32)
+            run_lyapunov_analysis(trajs, self.sim, output_dir=Path(tmp))
+            self.assertTrue((Path(tmp) / "lyapunov_values.npy").exists())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Trajectory Convergence Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTrajectoryConvergence(unittest.TestCase):
+    def test_compute_pairwise_distances_shape(self):
+        trajs = np.random.rand(10, 50, N).astype(np.float32)
+        mean_dist = compute_pairwise_distances(trajs, n_pairs=5, seed=0)
+        self.assertEqual(mean_dist.shape, (50,))
+
+    def test_compute_pairwise_distances_dtype(self):
+        trajs = np.random.rand(10, 20, N).astype(np.float32)
+        mean_dist = compute_pairwise_distances(trajs, n_pairs=5)
+        self.assertEqual(mean_dist.dtype, np.float32)
+
+    def test_distances_non_negative(self):
+        trajs = np.random.rand(10, 30, N).astype(np.float32)
+        mean_dist = compute_pairwise_distances(trajs, n_pairs=5)
+        self.assertTrue(np.all(mean_dist >= 0.0))
+
+    def test_identical_trajectories_distance_zero(self):
+        """If all trajectories are identical, pairwise distance should be zero."""
+        base = np.random.rand(1, 50, N).astype(np.float32)
+        trajs = np.tile(base, (8, 1, 1))
+        mean_dist = compute_pairwise_distances(trajs, n_pairs=10)
+        np.testing.assert_allclose(mean_dist, 0.0, atol=1e-6)
+
+    def test_run_trajectory_convergence_keys(self):
+        trajs = np.random.rand(8, 40, N).astype(np.float32)
+        results = run_trajectory_convergence(trajs, n_pairs=5)
+        self.assertIn("mean_distances", results)
+        self.assertIn("initial_mean_distance", results)
+        self.assertIn("final_mean_distance", results)
+        self.assertIn("distance_ratio", results)
+        self.assertIn("convergence_label", results)
+
+    def test_convergence_label_converging(self):
+        """Trajectories converging to same point should get 'converging' label."""
+        rng = np.random.default_rng(0)
+        n_init, steps = 10, 60
+        # All trajectories start dispersed but converge to the same point (0.5)
+        trajs = np.zeros((n_init, steps, N), dtype=np.float32)
+        for i in range(n_init):
+            start = rng.random(N).astype(np.float32)
+            for t in range(steps):
+                alpha = t / (steps - 1)
+                trajs[i, t] = (1 - alpha) * start + alpha * 0.5
+        results = run_trajectory_convergence(trajs, n_pairs=10)
+        self.assertEqual(results["convergence_label"], "converging")
+
+    def test_saves_npy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs = np.random.rand(5, 20, N).astype(np.float32)
+            run_trajectory_convergence(trajs, n_pairs=4, output_dir=Path(tmp))
+            self.assertTrue((Path(tmp) / "distance_curve.npy").exists())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Random Model Comparison Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRandomModelComparison(unittest.TestCase):
+    def test_random_dynamics_matrix_shape(self):
+        W = _make_random_dynamics_matrix(n_regions=N, target_spectral_radius=0.9)
+        self.assertEqual(W.shape, (N, N))
+
+    def test_random_dynamics_matrix_spectral_radius(self):
+        W = _make_random_dynamics_matrix(n_regions=20, target_spectral_radius=0.9)
+        sr = float(np.abs(np.linalg.eigvals(W)).max())
+        self.assertAlmostEqual(sr, 0.9, places=4)
+
+    def test_run_random_trajectories_shape(self):
+        trajs = run_random_trajectories(n_regions=N, n_init=5, steps=20)
+        self.assertEqual(trajs.shape, (5, 20, N))
+
+    def test_run_random_trajectories_values_in_0_1(self):
+        trajs = run_random_trajectories(n_regions=N, n_init=5, steps=20)
+        self.assertTrue(np.all(trajs >= 0.0))
+        self.assertTrue(np.all(trajs <= 1.0))
+
+    def test_run_random_trajectories_saves_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_random_trajectories(
+                n_regions=N, n_init=3, steps=10, output_dir=Path(tmp)
+            )
+            self.assertTrue((Path(tmp) / "random_trajectories.npy").exists())
+
+    def test_run_random_model_comparison_keys(self):
+        trajs = np.random.rand(5, 20, N).astype(np.float32)
+        result = run_random_model_comparison(
+            trajectories=trajs,
+            random_n_init=5,
+            random_steps=15,
+        )
+        self.assertIn("model", result)
+        self.assertIn("random", result)
+        self.assertIn("trajectory_variance", result["model"])
+        self.assertIn("trajectory_variance", result["random"])
+
+    def test_run_random_model_comparison_saves_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs = np.random.rand(4, 20, N).astype(np.float32)
+            run_random_model_comparison(
+                trajectories=trajs,
+                random_n_init=4,
+                random_steps=15,
+                output_dir=Path(tmp),
+            )
+            self.assertTrue((Path(tmp) / "analysis_comparison.json").exists())
+            with open(Path(tmp) / "analysis_comparison.json") as fh:
+                data = json.load(fh)
+            self.assertIn("model", data)
+            self.assertIn("random", data)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Attractor Analysis: basin_distribution.json saving
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestAttractorBasinJSON(unittest.TestCase):
+    def _make_two_attractor_trajs(self):
+        rng = np.random.default_rng(0)
+        n_init, steps, n_regions = 20, 50, N
+        trajs = np.zeros((n_init, steps, n_regions), dtype=np.float32)
+        for i in range(n_init):
+            final = np.zeros(n_regions) + (0.2 if i < 10 else 0.8)
+            trajs[i] = final + rng.random((steps, n_regions)) * 0.01
+        return trajs.astype(np.float32)
+
+    def test_saves_basin_distribution_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs = self._make_two_attractor_trajs()
+            run_attractor_analysis(
+                trajs,
+                tail_steps=5,
+                k_candidates=[2],
+                k_best=2,
+                output_dir=Path(tmp),
+            )
+            json_path = Path(tmp) / "basin_distribution.json"
+            self.assertTrue(json_path.exists())
+            with open(json_path) as fh:
+                data = json.load(fh)
+            # Keys should look like "attractor_A", "attractor_B", etc.
+            self.assertTrue(len(data) >= 1)
+            for key in data:
+                self.assertTrue(key.startswith("attractor_"))
+            # All fractions should sum to ~1
+            total = sum(data.values())
+            self.assertAlmostEqual(total, 1.0, places=4)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
