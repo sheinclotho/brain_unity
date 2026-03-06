@@ -5,7 +5,7 @@
 # Model configuration
 model:
   path: null          # Path to trained .pt checkpoint; null = no model (Wilson-Cowan fallback)
-  device: "cpu"       # "cpu" or "cuda"
+  device: "auto"      # "auto" → CUDA if available, else CPU; or "cpu" / "cuda"
 
 # Simulator configuration
 simulator:

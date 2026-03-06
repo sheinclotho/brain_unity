@@ -51,6 +51,42 @@ logger = logging.getLogger(__name__)
 # represents a physiologically strong but not extreme perturbation.
 _STIM_AMP_TO_LATENT_SIGMA: float = 2.0
 
+# Default GPU memory budget per chunk for batched rollout (in MB).
+# Tune down for GPUs with less VRAM (e.g. 256 for 4 GB cards).
+_DEFAULT_CHUNK_MEMORY_MiB: int = 512
+
+
+def _resolve_device(device: str) -> str:
+    """Resolve ``"auto"`` to the actual device string (``"cuda"`` or ``"cpu"``)."""
+    if device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device
+
+
+def _compute_chunk_steps(
+    n_batch: int,
+    n_regions: int,
+    max_memory_mib: int = _DEFAULT_CHUNK_MEMORY_MiB,
+) -> int:
+    """
+    Compute how many trajectory-steps fit within *max_memory_mib* of GPU memory.
+
+    The dominant allocation during a batched rollout chunk is the trajectory
+    storage tensor of shape ``(chunk_steps, n_batch, n_regions)`` in float32.
+    This helper keeps that tensor under the requested memory budget.
+
+    Args:
+        n_batch:        Number of parallel trajectories.
+        n_regions:      Number of brain regions.
+        max_memory_mib: Memory budget per chunk in MiB (default 512 MiB).
+
+    Returns:
+        chunk_steps: Maximum step count per chunk (≥ 1).
+    """
+    bytes_per_step = n_batch * n_regions * 4  # float32 = 4 bytes
+    chunk_steps = max(1, int(max_memory_mib * 1024 * 1024 // bytes_per_step))
+    return chunk_steps
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Stimulus base class & concrete implementations
@@ -253,6 +289,74 @@ class _WilsonCowanIntegrator:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Batched GPU-accelerated Wilson-Cowan integrator
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _WilsonCowanIntegratorBatched:
+    """
+    GPU-accelerated batched Wilson-Cowan integrator (PyTorch backend).
+
+    Processes **all trajectories in parallel** in a single matrix operation,
+    making GPU-accelerated free-dynamics experiments feasible even for large
+    ``n_init`` × ``steps`` configurations.
+
+    Dynamics are identical to ``_WilsonCowanIntegrator``::
+
+        dev   = state - x0          (deviation from per-trajectory equilibrium)
+        delta = tanh(stim·2 + W@dev·0.35) · 0.04
+        leak  = dev · 0.10
+        x(t+1) = clip(x(t) + delta − leak, 0, 1)
+
+    Shapes (n_batch = number of parallel trajectories, N = n_regions):
+        state  : ``(n_batch, N)``  — current brain state for every trajectory
+        stim   : ``(N,)``          — shared stimulus broadcast over the batch
+        output : ``(n_batch, N)``  — updated state for every trajectory
+    """
+
+    def __init__(
+        self,
+        n_regions: int,
+        x0_batch: np.ndarray,
+        seed: int = 0,
+        device: str = "cpu",
+    ):
+        """
+        Args:
+            n_regions:  Number of brain regions (N).
+            x0_batch:   Equilibrium states for each trajectory, shape ``(n_batch, N)``.
+            seed:       Random seed for the shared connectivity matrix.
+            device:     PyTorch device string (``"cpu"``, ``"cuda"``, ``"cuda:0"``…).
+        """
+        self._device = torch.device(_resolve_device(device))
+        W_np = _make_connectivity(n_regions, seed=seed)
+        self.W = torch.from_numpy(W_np).float().to(self._device)           # (N, N)
+        self.x0 = (
+            torch.from_numpy(x0_batch.astype(np.float32)).to(self._device)  # (n_batch, N)
+        )
+
+    def step(
+        self,
+        state: torch.Tensor,
+        stim: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Single parallel step for all trajectories.
+
+        Args:
+            state: ``(n_batch, N)`` current state tensor on the same device.
+            stim:  ``(N,)`` stimulus vector (broadcast over the batch).
+
+        Returns:
+            Updated state ``(n_batch, N)``.
+        """
+        dev_state = state - self.x0                          # (n_batch, N)
+        net_dev   = torch.matmul(dev_state, self.W.T)        # (n_batch, N)
+        delta     = torch.tanh(stim * 2.0 + net_dev * 0.35) * 0.04
+        leak      = dev_state * 0.10
+        return torch.clamp(state + delta - leak, 0.0, 1.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # BrainDynamicsSimulator
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -292,6 +396,7 @@ class BrainDynamicsSimulator:
         seed: int = 0,
         base_graph: Optional[HeteroData] = None,
         modality: str = "fmri",
+        device: str = "auto",
     ):
         """
         Args:
@@ -302,6 +407,9 @@ class BrainDynamicsSimulator:
             seed:           WC 模式下的随机种子。
             base_graph:    ``HeteroData`` 上下文图（模型模式下必须提供）。
             modality:      分析模态（``"fmri"`` 或 ``"eeg"``，模型模式下使用）。
+            device:        计算设备（``"cpu"``、``"cuda"``、``"auto"``）。
+                           ``"auto"`` 自动选择 CUDA（若可用）。
+                           WC 模式下用于 batched GPU rollout。
 
         Raises:
             ValueError:  模型模式下未提供 ``base_graph``，
@@ -312,6 +420,7 @@ class BrainDynamicsSimulator:
         self.fmri_subsample = fmri_subsample
         self.modality = modality
         self.base_graph = base_graph
+        self.device = _resolve_device(device)
 
         if model is not None:
             # Hard check: reject models that explicitly declare they cannot forward
@@ -352,8 +461,9 @@ class BrainDynamicsSimulator:
             self.n_regions = n_regions
             self.dt = dt
             logger.info(
-                "BrainDynamicsSimulator: Wilson-Cowan 独立模式 (n_regions=%d)",
+                "BrainDynamicsSimulator: Wilson-Cowan 独立模式 (n_regions=%d, device=%s)",
                 n_regions,
+                self.device,
             )
 
         self.model = model
@@ -472,6 +582,67 @@ class BrainDynamicsSimulator:
         x0 = np.asarray(x0, dtype=np.float32).flatten()
         return self._rollout_multi_stim_wc(x0, steps=steps, stimuli=stimuli)
 
+    def rollout_batched(
+        self,
+        X0: np.ndarray,
+        steps: int = 50,
+        stimulus: Optional[Stimulus] = None,
+        device: Optional[str] = None,
+        chunk_steps: Optional[int] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        GPU-accelerated batched rollout: run *all* trajectories in parallel.
+
+        **WC 模式专用**：此方法仅在 Wilson-Cowan 模式（``model=None``）下工作。
+        TwinBrainDigitalTwin 自回归模式不支持批量并行（需要 context-graph 链接），
+        请使用 ``rollout()`` 进行序列化预测。
+
+        每条轨迹使用自己的均衡点 x0，所有轨迹共享同一连接矩阵 W（相同 seed）。
+        计算通过 PyTorch 矩阵运算向量化，可在 GPU 上高效执行。
+
+        内存管理：轨迹张量按 ``chunk_steps`` 分块写入 CPU，避免 GPU OOM。
+        自动块大小基于 :func:`_compute_chunk_steps`（默认每块 ≤512 MiB）。
+
+        Args:
+            X0:          初始脑状态，shape ``(n_batch, n_regions)``。
+            steps:       模拟步数（WC 积分步数）。
+            stimulus:    Stimulus 对象（所有轨迹共享同一刺激节点/幅度）；
+                         ``None`` → 自由演化。
+            device:      计算设备（``"cpu"``、``"cuda"``、``"auto"``）；
+                         ``None`` → 使用 ``self.device``。
+            chunk_steps: GPU 内存分块大小（步数）；
+                         ``None`` → 由 :func:`_compute_chunk_steps` 自动推断。
+
+        Returns:
+            trajectories: shape ``(n_batch, steps, n_regions)``，每条轨迹的状态序列。
+            times:        shape ``(steps,)``，以秒为单位的时间轴。
+
+        Raises:
+            NotImplementedError: 在模型模式（TwinBrainDigitalTwin）下调用时。
+            ValueError:          ``X0`` 形状不符合期望。
+        """
+        if self._is_twin or self._use_model:
+            raise NotImplementedError(
+                "rollout_batched() 仅支持 Wilson-Cowan 独立模式（model=None）。\n"
+                "TwinBrainDigitalTwin 模式请使用 rollout() 逐条预测。"
+            )
+
+        X0 = np.asarray(X0, dtype=np.float32)
+        if X0.ndim != 2 or X0.shape[1] != self.n_regions:
+            raise ValueError(
+                f"X0 形状错误: 期望 (n_batch, {self.n_regions})，"
+                f"实际 {X0.shape}"
+            )
+
+        _device = _resolve_device(device if device is not None else self.device)
+        return self._rollout_wc_batched(
+            X0=X0,
+            steps=steps,
+            stimulus=stimulus,
+            device=_device,
+            chunk_steps=chunk_steps,
+        )
+
     # ── Private: WC rollout ────────────────────────────────────────────────────
 
     def _rollout_wc(
@@ -520,6 +691,81 @@ class BrainDynamicsSimulator:
             trajectory[t] = state
 
         return trajectory, times
+
+    def _rollout_wc_batched(
+        self,
+        X0: np.ndarray,
+        steps: int,
+        stimulus: Optional[Stimulus],
+        device: str,
+        chunk_steps: Optional[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Vectorised batched WC rollout on the given device.
+
+        All ``n_batch`` trajectories are processed in parallel using PyTorch
+        matrix operations.  GPU memory is managed by breaking the time axis
+        into ``chunk_steps``-step blocks: each block is computed on the
+        device and immediately transferred to CPU before the next block.
+
+        Args:
+            X0:          ``(n_batch, n_regions)`` initial states.
+            steps:       Total number of integration steps.
+            stimulus:    Shared stimulus for all trajectories (or None).
+            device:      Resolved PyTorch device string.
+            chunk_steps: Steps per GPU chunk; auto-computed if None.
+
+        Returns:
+            trajectories: ``(n_batch, steps, n_regions)`` float32 numpy array.
+            times:        ``(steps,)`` time axis in seconds.
+        """
+        n_batch = X0.shape[0]
+        _dev = torch.device(device)
+
+        # Shared batched integrator (one W, per-trajectory x0)
+        wc_batch = _WilsonCowanIntegratorBatched(
+            self.n_regions, x0_batch=X0, seed=self.seed, device=device
+        )
+        state = torch.from_numpy(X0).float().to(_dev)  # (n_batch, N)
+        times = np.arange(steps, dtype=np.float32) * self.dt
+
+        # Auto-size chunks to stay within GPU memory budget (default: 512 MiB).
+        # Tune _DEFAULT_CHUNK_MEMORY_MiB or pass chunk_steps explicitly for
+        # GPUs with less VRAM.
+        if chunk_steps is None:
+            chunk_steps = _compute_chunk_steps(n_batch, self.n_regions)
+
+        # Pre-compute stimulus values for all steps: (steps, N)
+        stim_all_np = np.zeros((steps, self.n_regions), dtype=np.float32)
+        if stimulus is not None:
+            for t in range(steps):
+                if stimulus.is_active(t) and 0 <= stimulus.node < self.n_regions:
+                    stim_all_np[t, stimulus.node] = stimulus.value(t)
+        stim_all = torch.from_numpy(stim_all_np).float().to(_dev)  # (steps, N)
+
+        all_chunks: List[np.ndarray] = []
+        t_offset = 0
+        while t_offset < steps:
+            actual_chunk = min(chunk_steps, steps - t_offset)
+
+            # Allocate trajectory buffer for this chunk on the device
+            chunk_traj = torch.empty(
+                (actual_chunk, n_batch, self.n_regions),
+                device=_dev,
+                dtype=torch.float32,
+            )
+
+            for k in range(actual_chunk):
+                u = stim_all[t_offset + k]  # (N,) — broadcast over batch
+                state = wc_batch.step(state, u)
+                chunk_traj[k] = state
+
+            # Permute to (n_batch, actual_chunk, N) and move to CPU
+            all_chunks.append(chunk_traj.permute(1, 0, 2).cpu().numpy())
+            t_offset += actual_chunk
+
+        trajectories = np.concatenate(all_chunks, axis=1)  # (n_batch, steps, N)
+        return trajectories, times
 
     # ── Private: TwinBrain twin-mode rollout ────────────────────────────────────
 

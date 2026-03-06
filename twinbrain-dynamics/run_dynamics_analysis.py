@@ -41,6 +41,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import numpy as np
+import torch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +49,34 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+# ── Device helpers ────────────────────────────────────────────────────────────
+
+def _resolve_device(device: str) -> str:
+    """Resolve ``"auto"`` to the actual device string (``"cuda"`` or ``"cpu"``)."""
+    if device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device
+
+
+def _log_device_info(device: str) -> None:
+    """Log compute device and available GPU memory (if CUDA)."""
+    if device.startswith("cuda") and torch.cuda.is_available():
+        # Normalise "cuda" to an integer device index for consistent property queries
+        dev_idx = torch.device(device).index or 0
+        props = torch.cuda.get_device_properties(dev_idx)
+        free_bytes, _ = torch.cuda.mem_get_info(dev_idx)
+        free_mib = free_bytes / (1024 * 1024)
+        total_mib = props.total_memory / (1024 * 1024)
+        logger.info(
+            "GPU: %s  |  VRAM 可用 %.0f MiB / 总计 %.0f MiB",
+            props.name,
+            free_mib,
+            total_mib,
+        )
+    else:
+        logger.info("计算设备: CPU")
 
 
 # ── Configuration loading ─────────────────────────────────────────────────────
@@ -84,7 +113,7 @@ _DEFAULTS = {
         "path": None,          # Required: path to best_model.pt
         "graph_path": None,    # Required: path to graph cache .pt file
         "config_path": None,   # Optional: training config.yaml (auto-detected if None)
-        "device": "cpu",
+        "device": "auto",      # "auto" → CUDA if available, else CPU
         "k_cross_modal": 5,    # Cross-modal edges per EEG electrode (API.md §2.5)
     },
     "simulator": {
@@ -167,7 +196,9 @@ def run(cfg: dict) -> dict:
     logger.info("步骤 1/7  加载训练模型")
     model_path = cfg["model"].get("path")
     graph_path = cfg["model"].get("graph_path")
-    device = cfg["model"].get("device", "cpu")
+    # Resolve "auto" → "cuda" / "cpu" once here; propagate to all components.
+    device = _resolve_device(cfg["model"].get("device", "auto"))
+    _log_device_info(device)
     # config_path: training config.yaml auto-detected from checkpoint directory,
     # but can be overridden via cfg["model"]["config_path"]
     config_path = cfg["model"].get("config_path")
@@ -211,6 +242,7 @@ def run(cfg: dict) -> dict:
         base_graph=base_graph,
         modality=modality,
         fmri_subsample=cfg["simulator"].get("fmri_subsample", 25),
+        device=device,
     )
     logger.info(
         "  模式=TwinBrainDigitalTwin, modality=%s, n_regions=%d, dt=%.4f s",
@@ -234,6 +266,7 @@ def run(cfg: dict) -> dict:
         steps=fd_cfg.get("steps", 50),
         seed=fd_cfg.get("seed", 42),
         output_dir=output_dir if cfg["output"].get("save_trajectories") else None,
+        device=device,
     )
     results["trajectories"] = trajectories
 

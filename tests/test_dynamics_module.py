@@ -594,5 +594,220 @@ class TestEndToEnd(unittest.TestCase):
         self.assertAlmostEqual(total_frac, 1.0, places=4)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Batched GPU rollout tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+import unittest.mock
+
+_CUDA_AVAILABLE = torch.cuda.is_available()
+
+
+class TestBatchedRollout(unittest.TestCase):
+    """Tests for BrainDynamicsSimulator.rollout_batched() (GPU/CPU vectorised WC)."""
+
+    def setUp(self):
+        self.sim = BrainDynamicsSimulator(model=None, n_regions=N, device="cpu")
+
+    # ── Shape / dtype ──────────────────────────────────────────────────────────
+
+    def test_output_shape(self):
+        n_batch = 8
+        steps = 30
+        X0 = np.random.rand(n_batch, N).astype(np.float32)
+        trajs, times = self.sim.rollout_batched(X0, steps=steps)
+        self.assertEqual(trajs.shape, (n_batch, steps, N))
+        self.assertEqual(times.shape, (steps,))
+
+    def test_output_dtype(self):
+        X0 = np.random.rand(4, N).astype(np.float32)
+        trajs, _ = self.sim.rollout_batched(X0, steps=10)
+        self.assertEqual(trajs.dtype, np.float32)
+
+    def test_values_in_0_1(self):
+        X0 = np.random.rand(6, N).astype(np.float32)
+        trajs, _ = self.sim.rollout_batched(X0, steps=50)
+        self.assertTrue(np.all(trajs >= 0.0))
+        self.assertTrue(np.all(trajs <= 1.0))
+
+    # ── Bad inputs ─────────────────────────────────────────────────────────────
+
+    def test_wrong_shape_raises(self):
+        X0 = np.random.rand(4, N + 1).astype(np.float32)  # wrong n_regions
+        with self.assertRaises(ValueError):
+            self.sim.rollout_batched(X0, steps=10)
+
+    def test_1d_X0_raises(self):
+        X0 = np.random.rand(N).astype(np.float32)  # 1-D instead of 2-D
+        with self.assertRaises(ValueError):
+            self.sim.rollout_batched(X0, steps=10)
+
+    def test_model_mode_raises(self):
+        """rollout_batched must raise NotImplementedError in model mode."""
+        # Plain nn.Module without predict_future → _use_model=True, _is_twin=False
+        class _PlainModel(torch.nn.Module):
+            can_forward = True
+            def forward(self, x):
+                return x
+
+        sim_model = BrainDynamicsSimulator(model=_PlainModel(), n_regions=N, device="cpu")
+        X0 = np.random.rand(4, N).astype(np.float32)
+        with self.assertRaises(NotImplementedError):
+            sim_model.rollout_batched(X0, steps=5)
+
+    # ── Numerical consistency ──────────────────────────────────────────────────
+
+    def test_batched_matches_sequential(self):
+        """
+        A single-trajectory batched rollout must match sequential rollout.
+
+        Uses the same initial state, seed, and stimulus to verify numerical
+        equivalence between rollout_batched (n_batch=1) and rollout.
+        """
+        rng = np.random.default_rng(42)
+        x0 = rng.random(N).astype(np.float32)
+        steps = 40
+
+        # Sequential rollout
+        sim_seq = BrainDynamicsSimulator(model=None, n_regions=N, seed=0, device="cpu")
+        traj_seq, _ = sim_seq.rollout(x0=x0, steps=steps)
+
+        # Batched rollout with n_batch=1
+        sim_bat = BrainDynamicsSimulator(model=None, n_regions=N, seed=0, device="cpu")
+        X0 = x0[np.newaxis, :]  # (1, N)
+        traj_bat, _ = sim_bat.rollout_batched(X0, steps=steps, device="cpu")
+
+        np.testing.assert_allclose(
+            traj_seq,
+            traj_bat[0],
+            atol=1e-5,
+            err_msg="Batched rollout (n=1) diverges from sequential rollout",
+        )
+
+    def test_chunked_matches_full(self):
+        """Chunked batched rollout must match a full (unchunked) rollout."""
+        n_batch = 6
+        steps = 50
+        X0 = np.random.default_rng(7).random((n_batch, N)).astype(np.float32)
+
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, seed=0, device="cpu")
+        full, _ = sim.rollout_batched(X0, steps=steps)
+        chunked, _ = sim.rollout_batched(X0, steps=steps, chunk_steps=15)
+
+        np.testing.assert_allclose(
+            full,
+            chunked,
+            atol=1e-5,
+            err_msg="Chunked rollout diverges from full rollout",
+        )
+
+    # ── Stimulus ───────────────────────────────────────────────────────────────
+
+    def test_batched_with_stimulus(self):
+        """Stimulus should affect the targeted node across all batch elements."""
+        n_batch = 5
+        x0_const = np.full(N, 0.5, dtype=np.float32)
+        X0 = np.tile(x0_const, (n_batch, 1))
+
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, seed=0, device="cpu")
+        stim = SinStimulus(node=0, freq=5.0, amp=0.5, duration=30, onset=10)
+        trajs, _ = sim.rollout_batched(X0, steps=50, stimulus=stim)
+
+        # All batch elements have the same x0 → all should have the same trajectory
+        for b in range(1, n_batch):
+            np.testing.assert_allclose(trajs[0], trajs[b], atol=1e-5)
+
+        # Node 0 during stim should differ from node 1 (unstimulated)
+        baseline_node0 = trajs[0, :10, 0].mean()
+        during_node0 = trajs[0, 10:40, 0].mean()
+        self.assertNotAlmostEqual(baseline_node0, during_node0, places=3)
+
+    # ── GPU tests (skipped when CUDA unavailable) ──────────────────────────────
+
+    @unittest.skipUnless(_CUDA_AVAILABLE, "CUDA not available")
+    def test_gpu_output_shape(self):
+        """Basic GPU batched rollout returns correct shape."""
+        n_batch = 16
+        X0 = np.random.rand(n_batch, N).astype(np.float32)
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, device="cuda")
+        trajs, times = sim.rollout_batched(X0, steps=50)
+        self.assertEqual(trajs.shape, (n_batch, 50, N))
+        self.assertTrue(np.all(trajs >= 0.0))
+        self.assertTrue(np.all(trajs <= 1.0))
+
+    @unittest.skipUnless(_CUDA_AVAILABLE, "CUDA not available")
+    def test_gpu_matches_cpu(self):
+        """GPU and CPU batched rollouts must produce numerically equal results."""
+        n_batch = 4
+        X0 = np.random.default_rng(99).random((n_batch, N)).astype(np.float32)
+
+        sim_cpu = BrainDynamicsSimulator(model=None, n_regions=N, seed=3, device="cpu")
+        trajs_cpu, _ = sim_cpu.rollout_batched(X0, steps=30, device="cpu")
+
+        sim_gpu = BrainDynamicsSimulator(model=None, n_regions=N, seed=3, device="cuda")
+        trajs_gpu, _ = sim_gpu.rollout_batched(X0, steps=30, device="cuda")
+
+        np.testing.assert_allclose(
+            trajs_cpu,
+            trajs_gpu,
+            atol=1e-4,
+            err_msg="GPU rollout diverges from CPU rollout",
+        )
+
+    @unittest.skipUnless(_CUDA_AVAILABLE, "CUDA not available")
+    def test_gpu_chunked(self):
+        """GPU chunked rollout must match GPU full rollout."""
+        n_batch = 8
+        X0 = np.random.rand(n_batch, N).astype(np.float32)
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, device="cuda")
+        full, _ = sim.rollout_batched(X0, steps=40)
+        chunked, _ = sim.rollout_batched(X0, steps=40, chunk_steps=12)
+        np.testing.assert_allclose(full, chunked, atol=1e-4)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GPU-aware free dynamics tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestFreeDynamicsGPU(unittest.TestCase):
+    """Tests for the device-aware run_free_dynamics() path."""
+
+    def test_free_dynamics_cpu_batched(self):
+        """run_free_dynamics uses batched rollout in WC mode on CPU."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, device="cpu")
+        trajs = run_free_dynamics(sim, n_init=6, steps=20, seed=0, device="cpu")
+        self.assertEqual(trajs.shape, (6, 20, N))
+        self.assertTrue(np.all(trajs >= 0.0))
+        self.assertTrue(np.all(trajs <= 1.0))
+
+    def test_free_dynamics_cpu_chunked(self):
+        """run_free_dynamics with chunk_size processes correct number of trajectories."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, device="cpu")
+        # chunk_size=2 with n_init=7 → 4 chunks (2+2+2+1)
+        trajs = run_free_dynamics(
+            sim, n_init=7, steps=15, seed=1, device="cpu", chunk_size=2
+        )
+        self.assertEqual(trajs.shape, (7, 15, N))
+
+    @unittest.skipUnless(_CUDA_AVAILABLE, "CUDA not available")
+    def test_free_dynamics_gpu(self):
+        """run_free_dynamics uses GPU batched rollout when CUDA available."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, device="cuda")
+        trajs = run_free_dynamics(sim, n_init=8, steps=25, seed=2, device="cuda")
+        self.assertEqual(trajs.shape, (8, 25, N))
+        self.assertTrue(np.all(trajs >= 0.0))
+        self.assertTrue(np.all(trajs <= 1.0))
+
+    def test_free_dynamics_device_stored_on_simulator(self):
+        """device attribute of BrainDynamicsSimulator is accessible."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, device="cpu")
+        self.assertEqual(sim.device, "cpu")
+
+    def test_auto_device_resolves(self):
+        """device='auto' resolves to 'cuda' or 'cpu' (not left as 'auto')."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, device="auto")
+        self.assertIn(sim.device, ("cpu", "cuda"))
+
+
 if __name__ == "__main__":
     unittest.main()
