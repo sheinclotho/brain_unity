@@ -417,4 +417,19 @@ r ≈ 0 的两个神经生物学合理原因：
   - 单步处理，无循环/分块/合并
 - **规则**: 任何从图缓存提取时序的代码**只能**使用 `data['fmri'].x` / `data['eeg'].x`，形状 `[N, T, 1]`。N_fmri ≈ 190，通过 `_frames_from_fmri` 中的 `np.interp` 插值到 200 槽位。**不允许再为旧格式添加任何回退路径。**
 
-*Last updated: 2026-02-27*
+### [2026-03-06] 稳定性分析绝对阈值失效 & Wolf 上下文稀释偏差
+
+#### 稳定性分析 100% "不稳定" — 绝对阈值维数依赖问题
+- **问题**: 方法 B 使用绝对阈值 `delay_mean < 0.1` 等。但 delay_mean = ||x(t+dt) - x(t)||₂ 随 sqrt(n_regions) 缩放。n_regions=190 时，即使接近稳定的轨迹 delay_mean ≈ 0.1–0.3，超过阈值 → 100% 误判"不稳定"。
+- **修复**: 新增方法 C (`classify_dynamics_adaptive`)，使用无量纲 `delta_ratio = delay_mean / traj_rms` 作为主分类特征，辅以谱周期评分（区分极限环）和变异系数（区分混沌与规则）。JSON 输出新增 `classification_counts_v2`（方法B）和 `delta_ratio_stats`（分布统计）。
+- **规则**: 任何跨不同 n_regions 规模模型的稳定性分类必须使用方法 C（相对阈值）。方法 A/B 保留作历史参考，但不作为主分类。
+
+#### Lyapunov Wolf 上下文稀释偏差（TwinBrainDigitalTwin 模式）
+- **诊断标志**: Wolf LLE 的跨轨迹标准差 std ≈ 0.00006（接近零）。所有 200 条不同 x0 的轨迹产生几乎相同的 LLE 估计 —— 这在物理上不可能是真实结果。
+- **根因**: `_wolf_pair_twin` 仅在上下文窗口**最后一步**注入扰动 ε=1e-6。TwinBrainDigitalTwin 编码器对全部 L 步上下文做注意力加权，单步扰动被 L-1 个相同历史步稀释，有效扰动 ≪ ε。所有轨迹共享同一 base_graph 上下文 → 相同稀释因子 → 相同 LLE。
+- **FTLE 为何更好**: FTLE 测量 x0 扰动在 T=1000 步演化后的长期分离，上下文历史在演化过程中自然分叉，不存在稀释问题。FTLE = -0.005（近临界）vs Wolf = -0.057（偏负 12×）。
+- **修复**: 新增 `rosenstein_lyapunov`（Rosenstein et al. 1993）方法：直接从轨迹数据工作，无上下文稀释偏差。自动偏差检测：std < 1e-3 且 n_traj > 10 时触发 `wolf_bias_warning`。方法 "both" 同时运行 Wolf + FTLE + Rosenstein 并报告差异。
+- **规则**: twin mode 下优先使用 `method="rosenstein"` 或 `"both"`；若 Wolf std < 1e-3 且 FTLE/Rosenstein 差异 > 0.03，以 Rosenstein 估计为混沌评估主指标。
+- **规则**: 新增 `n_segments`（多段采样，默认 3）：从轨迹不同位置采样 LLE，探索吸引子不同区域，减少瞬态偏差。
+
+*Last updated: 2026-03-06*

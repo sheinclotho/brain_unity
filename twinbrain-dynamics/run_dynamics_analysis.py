@@ -169,11 +169,14 @@ _DEFAULTS = {
     },
     "lyapunov": {
         "enabled": True,
-        "method": "both",          # "wolf", "ftle", or "both" (cross-validation)
-        "epsilon": 1e-6,           # Nominal perturbation magnitude (reduced from 1e-5)
-        "renorm_steps": 50,        # Steps per Wolf period (increased from 20)
+        "method": "both",          # "wolf", "ftle", "rosenstein", or "both"
+        "epsilon": 1e-6,           # Nominal perturbation magnitude
+        "renorm_steps": 50,        # Steps per Wolf period
         "skip_fraction": 0.1,      # Skip initial transient fraction when fitting (FTLE)
         "convergence_threshold": 0.01,  # Skip Wolf if distance_ratio < this
+        "n_segments": 3,           # Multi-segment sampling (1 = single x0, 3+ = better coverage)
+        "rosenstein_max_lag": 50,  # Rosenstein method: max tracking lag
+        "rosenstein_min_sep": 20,  # Rosenstein method: min temporal separation for NN search
     },
     "trajectory_convergence": {
         "enabled": True,
@@ -415,6 +418,9 @@ def run(cfg: dict) -> dict:
                 method=lya_cfg.get("method", "both"),
                 convergence_result=results.get("trajectory_convergence"),
                 convergence_threshold=lya_cfg.get("convergence_threshold", 0.01),
+                n_segments=lya_cfg.get("n_segments", 3),
+                rosenstein_max_lag=lya_cfg.get("rosenstein_max_lag", 50),
+                rosenstein_min_sep=lya_cfg.get("rosenstein_min_sep", 20),
                 output_dir=output_dir,
             )
             results["lyapunov"] = lyapunov_results

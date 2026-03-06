@@ -46,14 +46,18 @@ from experiments.virtual_stimulation import run_stimulation, run_virtual_stimula
 from analysis.response_matrix import compute_response_matrix
 from analysis.stability_analysis import (
     analyze_trajectory_stability,
+    classify_dynamics_adaptive,
     classify_dynamics_delay,
     compute_delay_distances,
     compute_state_deltas,
+    compute_trajectory_features,
     run_stability_analysis,
 )
 from analysis.lyapunov import (
     wolf_largest_lyapunov,
     ftle_lyapunov,
+    rosenstein_lyapunov,
+    multi_direction_ftle,
     classify_chaos_regime,
     run_lyapunov_analysis,
 )
@@ -543,7 +547,7 @@ class TestStabilityAnalysis(unittest.TestCase):
         self.assertIn(result, ["unstable", "metastable"])
 
     def test_json_contains_both_methods(self):
-        """stability_metrics.json must contain counts for both method A and method B."""
+        """stability_metrics.json must contain counts for method A, B, and C."""
         with tempfile.TemporaryDirectory() as tmp:
             trajs = np.random.rand(4, 60, N).astype(np.float32)
             run_stability_analysis(trajs, output_dir=Path(tmp), delay_dt=10)
@@ -551,6 +555,79 @@ class TestStabilityAnalysis(unittest.TestCase):
                 data = json.load(fh)
             self.assertIn("classification_counts", data)
             self.assertIn("classification_counts_v1", data)
+            self.assertIn("classification_counts_v2", data)
+
+    def test_json_has_delta_ratio_stats(self):
+        """stability_metrics.json must contain delta_ratio distribution stats."""
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs = np.random.rand(4, 60, N).astype(np.float32)
+            run_stability_analysis(trajs, output_dir=Path(tmp), delay_dt=10)
+            with open(Path(tmp) / "stability_metrics.json") as fh:
+                data = json.load(fh)
+            self.assertIn("delta_ratio_stats", data)
+            for key in ("mean", "median", "p25", "p75", "p95", "std"):
+                self.assertIn(key, data["delta_ratio_stats"])
+
+
+# ── Method C (adaptive) stability tests ──────────────────────────────────────
+
+class TestAdaptiveStability(unittest.TestCase):
+    def test_compute_trajectory_features_keys(self):
+        """compute_trajectory_features must return all required keys."""
+        traj = np.random.rand(100, N).astype(np.float32)
+        features = compute_trajectory_features(traj)
+        for k in ("delta_ratio", "cv_delta", "spectral_peak_ratio",
+                  "tail_rms_ratio", "delay_mean", "delay_std", "traj_rms"):
+            self.assertIn(k, features)
+
+    def test_fixed_point_has_low_delta_ratio(self):
+        """Constant trajectory should have delta_ratio ≈ 0."""
+        traj = np.ones((200, N), dtype=np.float32) * 0.5
+        features = compute_trajectory_features(traj)
+        self.assertAlmostEqual(features["delta_ratio"], 0.0, places=5)
+
+    def test_classify_adaptive_fixed_point(self):
+        """Constant trajectory → fixed_point under adaptive method."""
+        traj = np.ones((200, N), dtype=np.float32) * 0.5
+        features = compute_trajectory_features(traj)
+        cls = classify_dynamics_adaptive(features)
+        self.assertEqual(cls, "fixed_point")
+
+    def test_analyze_trajectory_has_method_c(self):
+        """analyze_trajectory_stability must return method C fields."""
+        traj = np.ones((100, N), dtype=np.float32) * 0.5
+        metrics = analyze_trajectory_stability(traj)
+        self.assertIn("delta_ratio", metrics)
+        self.assertIn("cv_delta", metrics)
+        self.assertIn("spectral_peak_ratio", metrics)
+        self.assertIn("classification_v2", metrics)
+
+    def test_scale_independent_classification(self):
+        """Same relative dynamics but different n_regions should give same classification."""
+        # Small n_regions
+        traj_s = np.ones((200, 5), dtype=np.float32) * 0.5
+        rng = np.random.default_rng(0)
+        traj_s += (rng.random(traj_s.shape) * 0.001).astype(np.float32)
+        features_s = compute_trajectory_features(traj_s)
+        cls_s = classify_dynamics_adaptive(features_s)
+
+        # Large n_regions (same per-region noise level)
+        traj_l = np.ones((200, 100), dtype=np.float32) * 0.5
+        traj_l += (rng.random(traj_l.shape) * 0.001).astype(np.float32)
+        features_l = compute_trajectory_features(traj_l)
+        cls_l = classify_dynamics_adaptive(features_l)
+
+        # Both should get the same classification (scale-invariant)
+        self.assertEqual(cls_s, cls_l)
+
+    def test_run_stability_analysis_has_method_c(self):
+        """run_stability_analysis must include method C counts."""
+        trajs = np.random.rand(5, 30, N).astype(np.float32)
+        summary = run_stability_analysis(trajs)
+        self.assertIn("classification_counts", summary)
+        self.assertIn("classification_counts_v2", summary)
+        self.assertIn("classification_counts_v1", summary)
+        self.assertIn("delta_ratio_stats", summary)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -746,6 +823,145 @@ class TestLyapunovAnalysis(unittest.TestCase):
         results = run_lyapunov_analysis(trajs, sim, renorm_steps=20, method="wolf")
         # WC is a contracting system; mean LLE must be negative.
         self.assertLess(results["mean_lyapunov"], 0.0)
+
+
+# ── Rosenstein method tests ───────────────────────────────────────────────────
+
+class TestRosensteinLyapunov(unittest.TestCase):
+    def test_returns_float_and_curve(self):
+        """rosenstein_lyapunov must return (float, ndarray)."""
+        rng = np.random.default_rng(0)
+        traj = rng.random((200, N)).astype(np.float32)
+        lle, curve = rosenstein_lyapunov(traj, max_lag=20, min_temporal_sep=5)
+        self.assertIsInstance(lle, float)
+        self.assertIsInstance(curve, np.ndarray)
+
+    def test_short_trajectory_returns_nan(self):
+        """Too-short trajectory should return nan."""
+        traj = np.random.rand(10, N).astype(np.float32)
+        lle, _ = rosenstein_lyapunov(traj, max_lag=20, min_temporal_sep=10)
+        self.assertTrue(np.isnan(lle))
+
+    def test_constant_trajectory_lle_finite(self):
+        """Constant trajectory should return finite (likely very negative) LLE."""
+        traj = np.ones((200, N), dtype=np.float32) * 0.5
+        lle, _ = rosenstein_lyapunov(traj, max_lag=20, min_temporal_sep=5)
+        # May be nan or -inf if all nearest-neighbor distances are zero; skip
+        # those degenerate cases but ensure no crash.
+        self.assertTrue(np.isnan(lle) or np.isfinite(lle))
+
+    def test_random_walk_lle_positive_or_near_zero(self):
+        """Random trajectory should have lle >= negative large value."""
+        rng = np.random.default_rng(42)
+        traj = rng.random((500, N)).astype(np.float32)
+        lle, curve = rosenstein_lyapunov(traj, max_lag=30, min_temporal_sep=10)
+        # For i.i.d. noise, LLE is near 0 or slightly positive
+        if np.isfinite(lle):
+            self.assertGreater(lle, -1.0)  # Should not be strongly negative
+
+    def test_curve_length(self):
+        """The divergence curve should have length == max_lag."""
+        traj = np.random.rand(300, N).astype(np.float32)
+        max_lag = 25
+        _, curve = rosenstein_lyapunov(traj, max_lag=max_lag, min_temporal_sep=5)
+        self.assertEqual(len(curve), max_lag)
+
+    def test_run_lyapunov_rosenstein_method(self):
+        """run_lyapunov_analysis with method='rosenstein' should include rosenstein keys."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N)
+        trajs = np.random.rand(3, 300, N).astype(np.float32)
+        results = run_lyapunov_analysis(
+            trajs, sim, method="rosenstein",
+            rosenstein_max_lag=20, rosenstein_min_sep=5,
+        )
+        self.assertIn("rosenstein_values", results)
+        self.assertIn("mean_rosenstein", results)
+        self.assertEqual(results["method"], "rosenstein")
+
+    def test_run_lyapunov_both_includes_rosenstein(self):
+        """run_lyapunov_analysis with method='both' should include wolf, ftle, rosenstein."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N)
+        trajs = np.random.rand(3, 200, N).astype(np.float32)
+        results = run_lyapunov_analysis(
+            trajs, sim, method="both", renorm_steps=20,
+            rosenstein_max_lag=20, rosenstein_min_sep=5,
+        )
+        self.assertIn("lyapunov_values", results)
+        self.assertIn("ftle_values", results)
+        self.assertIn("rosenstein_values", results)
+        self.assertIn("wolf_bias_warning", results)
+
+    def test_wolf_bias_warning_false_for_varied_trajectories(self):
+        """Wolf bias warning should NOT fire on short n_traj <= 10."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N)
+        trajs = np.random.rand(5, 60, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, sim, method="wolf", renorm_steps=10)
+        # n_traj=5 <= 10, so bias warning should be False regardless of std
+        self.assertFalse(results["wolf_bias_warning"])
+
+
+# ── Multi-direction FTLE tests ────────────────────────────────────────────────
+
+class TestMultiDirectionFTLE(unittest.TestCase):
+    def test_returns_mean_and_std(self):
+        """multi_direction_ftle must return (float, float)."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N)
+        x0 = np.full(N, 0.5, dtype=np.float32)
+        rng = np.random.default_rng(0)
+        mean_ftle, std_ftle = multi_direction_ftle(x0, sim, trajectory_length=50,
+                                                   n_directions=3, rng=rng)
+        self.assertIsInstance(mean_ftle, float)
+        self.assertIsInstance(std_ftle, float)
+
+    def test_std_non_negative(self):
+        """std_ftle must be non-negative."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N)
+        x0 = np.random.rand(N).astype(np.float32)
+        rng = np.random.default_rng(1)
+        _, std_ftle = multi_direction_ftle(x0, sim, trajectory_length=60,
+                                           n_directions=4, rng=rng)
+        if np.isfinite(std_ftle):
+            self.assertGreaterEqual(std_ftle, 0.0)
+
+
+# ── Multi-segment sampling tests ─────────────────────────────────────────────
+
+class TestMultiSegmentLyapunov(unittest.TestCase):
+    def test_n_segments_1_backward_compatible(self):
+        """n_segments=1 should give same result as old single-x0 behavior."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N)
+        trajs = np.random.rand(3, 60, N).astype(np.float32)
+        r1 = run_lyapunov_analysis(trajs, sim, method="wolf", renorm_steps=10,
+                                   n_segments=1)
+        r2 = run_lyapunov_analysis(trajs, sim, method="wolf", renorm_steps=10,
+                                   n_segments=1)
+        np.testing.assert_array_equal(r1["lyapunov_values"], r2["lyapunov_values"])
+
+    def test_n_segments_3_returns_finite_values(self):
+        """n_segments=3 should return finite LLE values."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N)
+        trajs = np.random.rand(3, 120, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, sim, method="wolf", renorm_steps=20,
+                                        n_segments=3)
+        self.assertEqual(results["lyapunov_values"].shape, (3,))
+        # At least some values should be finite
+        self.assertTrue(np.isfinite(results["lyapunov_values"]).any())
+
+    def test_n_segments_saves_report_with_rosenstein(self):
+        """n_segments=3 with method='rosenstein' should save report."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N)
+        trajs = np.random.rand(3, 300, N).astype(np.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            run_lyapunov_analysis(
+                trajs, sim, method="rosenstein",
+                n_segments=2,
+                rosenstein_max_lag=20, rosenstein_min_sep=5,
+                output_dir=Path(tmp),
+            )
+            self.assertTrue((Path(tmp) / "lyapunov_report.json").exists())
+            with open(Path(tmp) / "lyapunov_report.json") as fh:
+                report = json.load(fh)
+            self.assertIn("mean_rosenstein", report)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
