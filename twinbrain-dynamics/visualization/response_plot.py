@@ -32,9 +32,18 @@ def plot_response_matrix(
     save_path: Optional[Path] = None,
 ) -> None:
     """
-    绘制响应矩阵热图。
+    绘制响应矩阵热图（双面板）。
 
+    **面板 A — 原始响应 R[i,j]**
     R[i,j] = response of node j when node i is stimulated.
+    Shows absolute response; diagonal should be brightest for a selective model.
+
+    **面板 B — 行归一化响应 R[i,j] − mean_j(R[i,j])**
+    移除每行的"全局偏置"（即无论刺激哪个节点，全局平均活动变化）。
+    保留刺激特异性：哪些节点 j 对刺激节点 i 有超出全局平均的选择性响应。
+    对于具有社区结构的真实脑网络，这个面板应呈现 **块状结构**。
+    如果仍是竖条纹，说明响应完全由连接矩阵列结构决定（与刺激位置无关），
+    模型可能过度全局耦合或暂态测量窗口太短。
 
     关闭 matplotlib 默认的双线性插值（interpolation='none'），
     确保每个像素对应矩阵中的单个条目，避免插值模糊产生虚假竖条/横条。
@@ -47,22 +56,66 @@ def plot_response_matrix(
     if not _MPL_AVAILABLE:
         return
 
-    fig, ax = plt.subplots(figsize=(9, 8))
-    vmax = float(np.abs(R).max()) or 1.0
-    im = ax.imshow(
-        R,
-        aspect="auto",
-        cmap="RdBu_r",
-        origin="lower",
-        vmin=-vmax,
-        vmax=vmax,
-        interpolation="none",   # disable bilinear interp; every pixel = one matrix entry
-    )
-    plt.colorbar(im, ax=ax, label="Response (stim − baseline)")
-    ax.set_xlabel("Target region j")
-    ax.set_ylabel("Stimulated region i")
-    ax.set_title(title)
+    n_nodes, n_regions = R.shape
 
+    # Row-normalized: remove per-row global bias to reveal selectivity
+    R_norm = R - R.mean(axis=1, keepdims=True)
+
+    # Compute a per-panel aspect ratio so pixels are approximately square.
+    # For non-square matrices (e.g., 10×190), aspect="auto" makes rows too
+    # tall and columns too thin → vertical stripes appear even when the data
+    # has row structure.  Using aspect="equal" keeps pixels square but may
+    # make the figure very elongated; instead we set the axes aspect to the
+    # matrix shape ratio to keep the figure compact and readable.
+    px_aspect = n_nodes / n_regions  # height / width of matrix
+    # Clamp to a readable range: not too narrow or too tall.
+    px_aspect = max(0.08, min(px_aspect, 4.0))
+
+    fig, axes = plt.subplots(
+        1, 2,
+        figsize=(16, max(4, 16 * px_aspect)),
+    )
+
+    for ax, data, panel_title, note in [
+        (axes[0], R,      "Raw Response R[i,j]",
+         "Diagonal dominant → stimulus-specific propagation"),
+        (axes[1], R_norm, "Row-Normalized R[i,j] − mean_j",
+         "Block structure → community-specific propagation"),
+    ]:
+        vmax_panel = float(np.abs(data).max()) or 1.0
+        im = ax.imshow(
+            data,
+            aspect="auto",
+            cmap="RdBu_r",
+            origin="lower",
+            vmin=-vmax_panel,
+            vmax=vmax_panel,
+            interpolation="nearest",   # one pixel per matrix cell
+        )
+        plt.colorbar(im, ax=ax, label="Δ activity")
+        ax.set_xlabel("Target region j")
+        ax.set_ylabel("Stimulated region i")
+        ax.set_title(f"{panel_title}\n{note}", fontsize=9)
+
+        # Mark the diagonal entries (stimulated node = target) if matrix is
+        # not too large and the diagonal is within range.
+        diag_len = min(n_nodes, n_regions)
+        ax.plot(
+            np.arange(diag_len),
+            np.arange(diag_len),
+            "k+",
+            markersize=4,
+            alpha=0.5,
+            label="diagonal (i=j)",
+        )
+        ax.legend(fontsize=7, loc="upper right")
+
+    fig.suptitle(
+        f"{title}  |  shape={n_nodes}×{n_regions}  "
+        f"(rows=stimulated, cols=responding)",
+        fontsize=10,
+    )
+    plt.tight_layout()
     _save_or_show(fig, save_path)
 
 
@@ -187,7 +240,7 @@ def plot_response_column_stats(
     # ── Subplot 1: column mean bar chart ──────────────────────────────────────
     ax = axes[0]
     colors = ["tomato" if i in top_hubs else "steelblue" for i in range(n_regions)]
-    ax.bar(np.arange(n_regions), col_mean, color=colors, width=1.0, edgecolor="none")
+    ax.bar(np.arange(n_regions), col_mean, color=colors, width=0.8, edgecolor="none")
     ax.axhline(col_mean.mean(), color="black", linewidth=1.0, linestyle="--",
                label=f"mean={col_mean.mean():.4f}")
     ax.axhline(col_mean.mean() + 2 * col_mean.std(), color="red", linewidth=0.8,
@@ -202,7 +255,7 @@ def plot_response_column_stats(
     ax = axes[1]
     low_spec = stim_specificity < stim_specificity.mean() * 0.5
     spec_colors = ["orange" if low_spec[i] else "steelblue" for i in range(n_nodes)]
-    ax.bar(np.arange(n_nodes), stim_specificity, color=spec_colors, width=1.0, edgecolor="none")
+    ax.bar(np.arange(n_nodes), stim_specificity, color=spec_colors, width=0.8, edgecolor="none")
     ax.axhline(stim_specificity.mean(), color="black", linewidth=1.0, linestyle="--",
                label=f"mean={stim_specificity.mean():.4f}")
     ax.set_xlabel("Stimulated region i")
@@ -210,6 +263,16 @@ def plot_response_column_stats(
     ax.set_title("Stimulus Specificity\n(orange = low specificity / diffuse)")
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3, axis="y")
+    # If all bars are nearly identical, add a note explaining the pattern.
+    specificity_cv = stim_specificity.std() / (stim_specificity.mean() + 1e-12)
+    if specificity_cv < 0.05:
+        ax.text(
+            0.5, 0.85,
+            "⚠ 各节点特异性高度一致\n可能原因：测量窗口仍处于暂态，\n或模型响应高度全局耦合",
+            transform=ax.transAxes, fontsize=7, ha="center", va="top",
+            color="darkred",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8),
+        )
 
     # ── Subplot 3: distribution of column means ───────────────────────────────
     ax = axes[2]
