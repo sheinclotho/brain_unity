@@ -883,11 +883,12 @@ class TestPredictFutureErrorSurfacing(unittest.TestCase):
 
 class TestContextTrimming(unittest.TestCase):
     """
-    Tests that _rollout_with_twin trims context to context_length.
+    Tests that _rollout_with_twin trims ALL modalities to context_length.
 
-    This is the key 8-GB-GPU memory optimisation: the encoder always receives
-    [N, context_length, C] instead of [N, T_base, C], reducing peak activation
-    memory by T_base / context_length (≈1.9× for T_base=384, context_length=200).
+    Key fix (计划书 §四/§十三): The graph cache is used only as the initial
+    state.  ALL modalities are trimmed to context_length so that the encoder
+    always receives [N, context_length, C] per node type — eliminating OOM
+    from large EEG sequences (e.g. T_eeg=98500 → T_eeg=200, 6.34 GB → 12.9 MB).
     """
 
     def setUp(self):
@@ -895,17 +896,23 @@ class TestContextTrimming(unittest.TestCase):
         if str(_models_dir.parent) not in sys.path:
             sys.path.insert(0, str(_models_dir.parent))
 
-    def _make_sim(self, T_base: int, context_length: int, pred_steps: int = 3):
+    def _make_sim(self, T_base: int, context_length: int, pred_steps: int = 3,
+                  with_eeg: bool = False, T_eeg: int = 0):
         """Create a BrainDynamicsSimulator whose base_graph has T_base timesteps."""
         from models.graph_native_system import GraphNativeBrainModel
         from models.digital_twin_inference import TwinBrainDigitalTwin
         from torch_geometric.data import HeteroData
 
         H = 16
+        node_types = ["fmri", "eeg"] if with_eeg else ["fmri"]
+        edge_types = [("fmri", "connects", "fmri")]
+        if with_eeg:
+            edge_types.append(("eeg", "connects", "eeg"))
+
         model = GraphNativeBrainModel(
-            node_types=["fmri"],
-            edge_types=[("fmri", "connects", "fmri")],
-            in_channels_dict={"fmri": 1},
+            node_types=node_types,
+            edge_types=edge_types,
+            in_channels_dict={nt: 1 for nt in node_types},
             hidden_channels=H,
             prediction_steps=pred_steps,
             predictor_config={"context_length": context_length},
@@ -917,6 +924,11 @@ class TestContextTrimming(unittest.TestCase):
         # T_base > context_length to trigger the trimming path
         g["fmri"].x = torch.randn(N, T_base, 1)
         g["fmri", "connects", "fmri"].edge_index = torch.zeros(2, 0, dtype=torch.long)
+
+        if with_eeg and T_eeg > 0:
+            N_eeg = 8
+            g["eeg"].x = torch.randn(N_eeg, T_eeg, 1)
+            g["eeg", "connects", "eeg"].edge_index = torch.zeros(2, 0, dtype=torch.long)
 
         sim = BrainDynamicsSimulator(model=twin, base_graph=g, modality="fmri", device="cpu")
         return sim, twin, model
@@ -983,6 +995,80 @@ class TestContextTrimming(unittest.TestCase):
         # All calls should use the full T_BASE (no trimming should occur)
         self.assertTrue(all(t == T_BASE for t in observed_T),
                         f"Expected context length == {T_BASE} (no trim), got {observed_T}")
+
+    def test_eeg_also_trimmed_to_context_length(self):
+        """
+        EEG (and all non-primary modalities) must also be trimmed to context_length.
+
+        This is the key OOM fix: T_eeg=98500 → T_eeg=context_length (e.g. 200),
+        reducing peak encoder activation from 6.34 GB to ~12.9 MB.
+        """
+        import unittest.mock
+        T_BASE_FMRI = 20
+        T_BASE_EEG = 500   # much larger than context_length
+        CTX_LEN = 10
+
+        sim, twin, _ = self._make_sim(
+            T_base=T_BASE_FMRI, context_length=CTX_LEN, pred_steps=3,
+            with_eeg=True, T_eeg=T_BASE_EEG,
+        )
+
+        observed_eeg_T = []
+        original_predict = twin.predict_future
+
+        def recording_predict(data, num_steps=None):
+            if "eeg" in data.node_types:
+                observed_eeg_T.append(data["eeg"].x.shape[1])
+            return original_predict(data, num_steps=num_steps)
+
+        with unittest.mock.patch.object(twin, "predict_future", side_effect=recording_predict):
+            sim.rollout(steps=6)
+
+        self.assertTrue(
+            len(observed_eeg_T) > 0,
+            "predict_future was never called with EEG data",
+        )
+        self.assertTrue(
+            all(t == CTX_LEN for t in observed_eeg_T),
+            f"EEG context not trimmed: expected T={CTX_LEN}, got {observed_eeg_T}",
+        )
+        # base_graph EEG must remain untouched
+        self.assertEqual(
+            sim.base_graph["eeg"].x.shape[1], T_BASE_EEG,
+            "base_graph EEG was mutated by rollout",
+        )
+
+    def test_x0_injection_produces_diverse_trajectories(self):
+        """
+        Different x0 values must produce different trajectories.
+
+        计划书 §五: run_free_dynamics samples x0 = sample_random_state() for
+        each of the 200 rollouts.  Before this fix, x0 was silently ignored in
+        twin mode, making all 200 trajectories identical.
+        """
+        T_BASE = 20
+        CTX_LEN = 10
+        sim, _, _ = self._make_sim(T_base=T_BASE, context_length=CTX_LEN, pred_steps=3)
+
+        rng = np.random.default_rng(0)
+        x0_a = rng.random(N).astype(np.float32)
+        x0_b = rng.random(N).astype(np.float32)
+
+        traj_a, _ = sim.rollout(steps=3, x0=x0_a)
+        traj_b, _ = sim.rollout(steps=3, x0=x0_b)
+
+        # Trajectories from different x0 must differ
+        self.assertFalse(
+            np.allclose(traj_a, traj_b, atol=1e-6),
+            "rollout() with different x0 produced identical trajectories — "
+            "x0 injection is not working",
+        )
+
+    def test_x0_none_does_not_crash(self):
+        """rollout(x0=None) in twin mode must use base_graph without error."""
+        sim, _, _ = self._make_sim(T_base=20, context_length=10, pred_steps=3)
+        traj, times = sim.rollout(steps=3, x0=None)
+        self.assertEqual(traj.shape, (3, N))
 
 
 if __name__ == "__main__":
