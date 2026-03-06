@@ -61,8 +61,10 @@ stability_analysis:
 # Lyapunov exponent estimation
 lyapunov:
   enabled: true
-  epsilon: 1.0e-5         # Initial perturbation magnitude
-  skip_fraction: 0.1      # Fraction of trajectory to skip (transient)
+  method: "wolf"         # "wolf" (recommended, renormalized) or "ftle" (fast)
+  epsilon: 1.0e-5        # Initial perturbation magnitude
+  renorm_steps: 20       # Steps between Wolf renormalization periods
+  skip_fraction: 0.1     # Fraction of trajectory to skip (transient, ftle only)
 
 # Trajectory convergence analysis
 trajectory_convergence:

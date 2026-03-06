@@ -56,6 +56,8 @@ def compute_delay_distances(
         delays: shape (T - delay_dt,)，延迟 L2 范数。
     """
     T = trajectory.shape[0]
+    # Clamp delay to at most T-1 so indexing is valid.  Note: T must be ≥ 2 for
+    # any lag pairs to exist; for T=1 the function returns an empty array.
     effective_dt = min(delay_dt, max(1, T - 1))
     diff = trajectory[effective_dt:] - trajectory[: T - effective_dt]
     return np.linalg.norm(diff, axis=1).astype(np.float32)

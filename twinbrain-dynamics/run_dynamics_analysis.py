@@ -386,7 +386,7 @@ def run(cfg: dict) -> dict:
 
     # ── Step 9: Lyapunov exponent ─────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 9/10  Lyapunov 指数估计")
+    logger.info("步骤 9/10  Lyapunov 指数估计（Wolf-Benettin 重归一化法）")
     lya_cfg = cfg.get("lyapunov", {})
     if lya_cfg.get("enabled", True):
         try:
@@ -394,10 +394,15 @@ def run(cfg: dict) -> dict:
                 trajectories=trajectories,
                 simulator=simulator,
                 epsilon=lya_cfg.get("epsilon", 1e-5),
+                renorm_steps=lya_cfg.get("renorm_steps", 20),
                 skip_fraction=lya_cfg.get("skip_fraction", 0.1),
+                method=lya_cfg.get("method", "wolf"),
                 output_dir=output_dir,
             )
             results["lyapunov"] = lyapunov_results
+            regime = lyapunov_results["chaos_regime"]["regime"]
+            interp = lyapunov_results["chaos_regime"]["interpretation_zh"]
+            logger.info("  混沌评估: [%s] %s", regime.upper(), interp)
         except Exception as exc:
             logger.warning("  Lyapunov 分析失败 (%s)，跳过。", exc)
     else:
@@ -447,11 +452,13 @@ def _save_plots(results: dict, output_dir: Path, simulator) -> None:
             plot_trajectory_norms,
             plot_trajectory_convergence,
             plot_lyapunov_histogram,
+            plot_lyapunov_growth,
             plot_basin_sizes,
         )
         from visualization.response_plot import (
             plot_response_matrix,
             plot_stimulation_response,
+            plot_response_column_stats,
         )
     except Exception as exc:
         logger.warning("可视化模块加载失败 (%s)，跳过绘图。", exc)
@@ -476,6 +483,7 @@ def _save_plots(results: dict, output_dir: Path, simulator) -> None:
     R = results.get("response_matrix")
     if R is not None:
         plot_response_matrix(R, save_path=plots_dir / "response_matrix.png")
+        plot_response_column_stats(R, save_path=plots_dir / "response_column_stats.png")
 
     stim_res = results.get("stimulation_results", {})
     for pattern, res_list in stim_res.items():
@@ -505,6 +513,14 @@ def _save_plots(results: dict, output_dir: Path, simulator) -> None:
             lya_results["lyapunov_values"],
             save_path=plots_dir / "lyapunov_histogram.png",
         )
+        if len(lya_results.get("log_growth_curve", [])) > 0:
+            plot_lyapunov_growth(
+                lya_results["log_growth_curve"],
+                renorm_steps=cfg.get("lyapunov", {}).get("renorm_steps", 20),
+                mean_lle=lya_results["mean_lyapunov"],
+                chaos_regime=lya_results["chaos_regime"]["regime"],
+                save_path=plots_dir / "lyapunov_growth.png",
+            )
 
     att_results = results.get("attractor_results")
     if att_results is not None:

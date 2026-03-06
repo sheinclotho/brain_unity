@@ -194,6 +194,80 @@ def plot_trajectory_convergence(
     _save_or_show(fig, save_path)
 
 
+def plot_lyapunov_growth(
+    log_growth_curve: np.ndarray,
+    renorm_steps: int = 20,
+    mean_lle: Optional[float] = None,
+    chaos_regime: Optional[str] = None,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    绘制 Wolf 方法的累积对数增长曲线（log-growth curve）。
+
+    曲线斜率即为最大 Lyapunov 指数（LLE）：
+      - 正斜率 → 轨迹指数发散（混沌）
+      - 负斜率 → 轨迹指数收敛（稳定）
+      - 水平    → 边缘稳定
+
+    Args:
+        log_growth_curve: shape (n_periods,)，每个重归一化周期的 log(r/ε) 值。
+        renorm_steps:     每个周期的步数（用于计算累积步轴）。
+        mean_lle:         平均 LLE（显示在标题中）。
+        chaos_regime:     混沌分类标签。
+        save_path:        保存路径；None → 显示。
+    """
+    if not _MPL_AVAILABLE:
+        return
+
+    n_periods = len(log_growth_curve)
+    if n_periods == 0:
+        return
+
+    # Cumulative sum = running total of log-growth, proportional to LLE × time
+    cumulative = np.cumsum(log_growth_curve)
+    steps_axis = np.arange(1, n_periods + 1) * renorm_steps
+
+    # Fit a line to the cumulative sum; slope = LLE per step
+    coeffs = np.polyfit(steps_axis, cumulative, deg=1)
+    fit_line = np.polyval(coeffs, steps_axis)
+    fit_slope = coeffs[0]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    # Left: per-period log-growth
+    axes[0].bar(np.arange(n_periods), log_growth_curve,
+                color=["tomato" if v > 0 else "steelblue" for v in log_growth_curve],
+                alpha=0.75, edgecolor="white")
+    axes[0].axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+    axes[0].axhline(float(np.mean(log_growth_curve)), color="red", linewidth=1.2,
+                    linestyle="-", label=f"mean={np.mean(log_growth_curve):.4f}")
+    axes[0].set_xlabel("Renormalization Period")
+    axes[0].set_ylabel("log(r/ε) per period")
+    axes[0].set_title("Per-Period Log Growth\n(red=chaotic, blue=convergent)")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(True, alpha=0.3)
+
+    # Right: cumulative sum with linear fit
+    axes[1].plot(steps_axis, cumulative, color="navy", linewidth=1.5, label="Cumulative log-growth")
+    axes[1].plot(steps_axis, fit_line, color="red", linewidth=1.2, linestyle="--",
+                 label=f"Fit slope (LLE) = {fit_slope:.5f}/step")
+    axes[1].axhline(0.0, color="black", linewidth=0.8)
+    axes[1].set_xlabel("Step")
+    axes[1].set_ylabel("Cumulative log-growth S(t)")
+    lbl_parts = []
+    if mean_lle is not None:
+        lbl_parts.append(f"LLE = {mean_lle:.5f}")
+    if chaos_regime:
+        lbl_parts.append(chaos_regime.upper())
+    axes[1].set_title("Cumulative Log-Growth (Wolf method)\n" +
+                       ("  |  ".join(lbl_parts) if lbl_parts else ""))
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    _save_or_show(fig, save_path)
+
+
 def plot_lyapunov_histogram(
     lyapunov_values: np.ndarray,
     save_path: Optional[Path] = None,

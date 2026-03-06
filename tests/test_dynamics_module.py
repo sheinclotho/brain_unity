@@ -51,7 +51,12 @@ from analysis.stability_analysis import (
     compute_state_deltas,
     run_stability_analysis,
 )
-from analysis.lyapunov import estimate_lyapunov_exponent, run_lyapunov_analysis
+from analysis.lyapunov import (
+    wolf_largest_lyapunov,
+    ftle_lyapunov,
+    classify_chaos_regime,
+    run_lyapunov_analysis,
+)
 from analysis.trajectory_convergence import (
     compute_pairwise_distances,
     run_trajectory_convergence,
@@ -549,64 +554,183 @@ class TestStabilityAnalysis(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Lyapunov Exponent Tests
+# Lyapunov Exponent Tests (Wolf-Benettin method + FTLE + classification)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestLyapunovAnalysis(unittest.TestCase):
     def setUp(self):
         self.sim = BrainDynamicsSimulator(model=None, n_regions=N)
+        self.rng = np.random.default_rng(0)
 
-    def test_estimate_single_returns_float(self):
+    # ── wolf_largest_lyapunov ─────────────────────────────────────────────────
+
+    def test_wolf_returns_float_and_log_growth(self):
+        x0 = np.random.rand(N).astype(np.float32)
+        lle, lg = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=60, renorm_steps=10, rng=self.rng
+        )
+        self.assertIsInstance(lle, float)
+        self.assertTrue(np.isfinite(lle))
+        self.assertIsInstance(lg, np.ndarray)
+        self.assertEqual(lg.shape, (6,))   # total_steps // renorm_steps
+
+    def test_wolf_log_growth_finite(self):
+        x0 = np.full(N, 0.5, dtype=np.float32)
+        _, lg = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=80, renorm_steps=20, rng=self.rng
+        )
+        self.assertTrue(np.all(np.isfinite(lg)))
+
+    def test_wolf_stable_system_negative_lle(self):
+        """WC at equilibrium x0=0.5 should have LLE ≤ 0 (stable system)."""
+        x0 = np.full(N, 0.5, dtype=np.float32)
+        lle, _ = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=200, renorm_steps=20, rng=self.rng
+        )
+        # WC with no stimulus is stable around x0; LLE should not be strongly positive
+        self.assertLess(lle, 0.2)
+
+    def test_wolf_reproducible_with_same_rng(self):
+        """Same seed → same LLE."""
+        x0 = np.random.rand(N).astype(np.float32)
+        lle1, _ = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=60, renorm_steps=10,
+            rng=np.random.default_rng(7),
+        )
+        lle2, _ = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=60, renorm_steps=10,
+            rng=np.random.default_rng(7),
+        )
+        self.assertAlmostEqual(lle1, lle2, places=8)
+
+    def test_wolf_single_period(self):
+        """total_steps == renorm_steps → one period, still returns a scalar LLE."""
+        x0 = np.random.rand(N).astype(np.float32)
+        lle, lg = wolf_largest_lyapunov(
+            self.sim, x0=x0, total_steps=10, renorm_steps=10, rng=self.rng
+        )
+        self.assertEqual(len(lg), 1)
+        self.assertTrue(np.isfinite(lle))
+
+    # ── ftle_lyapunov ─────────────────────────────────────────────────────────
+
+    def test_ftle_returns_finite_float(self):
         traj = np.random.rand(50, N).astype(np.float32)
-        lam = estimate_lyapunov_exponent(traj, self.sim)
+        lam = ftle_lyapunov(traj, self.sim, rng=self.rng)
         self.assertIsInstance(lam, float)
         self.assertTrue(np.isfinite(lam))
 
-    def test_run_lyapunov_keys(self):
-        trajs = np.random.rand(4, 30, N).astype(np.float32)
-        results = run_lyapunov_analysis(trajs, self.sim)
+    def test_ftle_too_short_returns_zero(self):
+        """Only 1 usable point after skip → slope undefined → 0.0."""
+        traj = np.random.rand(2, N).astype(np.float32)
+        lam = ftle_lyapunov(traj, self.sim, skip_fraction=0.9, rng=self.rng)
+        self.assertEqual(lam, 0.0)
+
+    # ── classify_chaos_regime ─────────────────────────────────────────────────
+
+    def test_classify_strongly_stable(self):
+        r = classify_chaos_regime(-0.05)
+        self.assertEqual(r["regime"], "stable")
+        self.assertFalse(r["is_chaotic"])
+        self.assertFalse(r["near_chaos_edge"])
+
+    def test_classify_marginal(self):
+        r = classify_chaos_regime(-0.005)
+        self.assertEqual(r["regime"], "marginal_stable")
+        self.assertFalse(r["is_chaotic"])
+
+    def test_classify_edge_of_chaos(self):
+        r = classify_chaos_regime(0.005)
+        self.assertEqual(r["regime"], "edge_of_chaos")
+        self.assertFalse(r["is_chaotic"])
+        self.assertTrue(r["near_chaos_edge"])
+
+    def test_classify_weakly_chaotic(self):
+        r = classify_chaos_regime(0.05)
+        self.assertEqual(r["regime"], "weakly_chaotic")
+        self.assertTrue(r["is_chaotic"])
+
+    def test_classify_strongly_chaotic(self):
+        r = classify_chaos_regime(0.5)
+        self.assertEqual(r["regime"], "strongly_chaotic")
+        self.assertTrue(r["is_chaotic"])
+        self.assertFalse(r["near_chaos_edge"])
+
+    def test_classify_interpretation_not_empty(self):
+        for lam in [-0.1, -0.005, 0.005, 0.05, 0.5]:
+            r = classify_chaos_regime(lam)
+            self.assertTrue(len(r["interpretation_zh"]) > 10)
+
+    # ── run_lyapunov_analysis ─────────────────────────────────────────────────
+
+    def test_run_wolf_keys(self):
+        trajs = np.random.rand(4, 60, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, renorm_steps=10, method="wolf")
+        for key in ("lyapunov_values", "mean_lyapunov", "median_lyapunov",
+                    "std_lyapunov", "fraction_positive", "fraction_negative",
+                    "log_growth_curve", "chaos_regime", "method"):
+            self.assertIn(key, results)
+
+    def test_run_ftle_keys(self):
+        trajs = np.random.rand(3, 50, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, method="ftle")
         self.assertIn("lyapunov_values", results)
-        self.assertIn("mean_lyapunov", results)
-        self.assertIn("median_lyapunov", results)
-        self.assertIn("fraction_positive", results)
-        self.assertIn("fraction_negative", results)
+        self.assertEqual(results["method"], "ftle")
 
     def test_run_lyapunov_shape(self):
         n = 5
-        trajs = np.random.rand(n, 30, N).astype(np.float32)
-        results = run_lyapunov_analysis(trajs, self.sim)
+        trajs = np.random.rand(n, 60, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, renorm_steps=10, method="wolf")
         self.assertEqual(results["lyapunov_values"].shape, (n,))
 
-    def test_run_lyapunov_fractions_in_0_1(self):
-        trajs = np.random.rand(5, 30, N).astype(np.float32)
-        results = run_lyapunov_analysis(trajs, self.sim)
+    def test_log_growth_curve_shape(self):
+        trajs = np.random.rand(3, 60, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, renorm_steps=20, method="wolf")
+        n_periods = 60 // 20
+        self.assertEqual(len(results["log_growth_curve"]), n_periods)
+
+    def test_chaos_regime_in_results(self):
+        trajs = np.random.rand(3, 60, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, renorm_steps=10, method="wolf")
+        self.assertIn("regime", results["chaos_regime"])
+        self.assertIn(results["chaos_regime"]["regime"],
+                      ["stable", "marginal_stable", "edge_of_chaos",
+                       "weakly_chaotic", "strongly_chaotic"])
+
+    def test_fractions_in_0_1(self):
+        trajs = np.random.rand(5, 60, N).astype(np.float32)
+        results = run_lyapunov_analysis(trajs, self.sim, renorm_steps=10, method="wolf")
         self.assertGreaterEqual(results["fraction_positive"], 0.0)
         self.assertLessEqual(results["fraction_positive"], 1.0)
-        self.assertGreaterEqual(results["fraction_negative"], 0.0)
-        self.assertLessEqual(results["fraction_negative"], 1.0)
 
-    def test_convergent_system_has_negative_lyapunov(self):
-        """A stable system (WC from constant x0) should have λ ≤ 0 on average."""
-        sim = BrainDynamicsSimulator(model=None, n_regions=N, seed=42)
-        x0 = np.full(N, 0.5, dtype=np.float32)
-        # Generate trajectories that converge to x0
-        traj = np.tile(x0, (200, 1)).astype(np.float32)
-        # Add tiny decreasing noise to make it converge
-        rng = np.random.default_rng(0)
-        noise_scale = np.linspace(0.01, 0.0, 200).reshape(-1, 1)
-        traj += (rng.random((200, N)).astype(np.float32) * noise_scale).astype(np.float32)
-        traj = np.clip(traj, 0.0, 1.0)
-
-        lam = estimate_lyapunov_exponent(traj, sim)
-        # For a converging system the estimated exponent should not be strongly positive
-        # (it may be close to 0 due to the approximation, so we use a generous bound)
-        self.assertLess(lam, 0.5)
-
-    def test_saves_npy(self):
+    def test_saves_npy_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:
-            trajs = np.random.rand(3, 20, N).astype(np.float32)
-            run_lyapunov_analysis(trajs, self.sim, output_dir=Path(tmp))
+            trajs = np.random.rand(3, 40, N).astype(np.float32)
+            run_lyapunov_analysis(trajs, self.sim, renorm_steps=10,
+                                  method="wolf", output_dir=Path(tmp))
             self.assertTrue((Path(tmp) / "lyapunov_values.npy").exists())
+            self.assertTrue((Path(tmp) / "log_growth_curve.npy").exists())
+            self.assertTrue((Path(tmp) / "lyapunov_report.json").exists())
+            with open(Path(tmp) / "lyapunov_report.json") as fh:
+                report = json.load(fh)
+            self.assertIn("chaos_regime", report)
+            self.assertIn("mean_lyapunov", report)
+            self.assertIn("is_chaotic", report)
+
+    def test_wc_stable_system_lle_not_strongly_positive(self):
+        """WC system at equilibrium should have non-positive or small-positive LLE."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, seed=42)
+        trajs = np.tile(
+            np.full((1, 100, N), 0.5, dtype=np.float32),
+            (4, 1, 1)
+        )
+        # Add small perturbations so trajectories differ
+        rng = np.random.default_rng(0)
+        trajs += (rng.random(trajs.shape) * 0.02).astype(np.float32)
+        trajs = np.clip(trajs, 0, 1)
+        results = run_lyapunov_analysis(trajs, sim, renorm_steps=20, method="wolf")
+        # WC is stable so LLE should not be strongly positive
+        self.assertLess(results["mean_lyapunov"], 0.3)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -727,6 +851,72 @@ class TestRandomModelComparison(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════════
 # Attractor Analysis: basin_distribution.json saving
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Response Matrix — shared-x0 fix
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestResponseMatrixSharedX0(unittest.TestCase):
+    """
+    Verify that compute_response_matrix uses a shared x0 for all rows so that
+    R[i,j] reflects stimulus-propagation structure, not equilibrium-state noise.
+    """
+
+    def _compute_R(self, seed=42):
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, seed=0)
+        from analysis.response_matrix import compute_response_matrix
+        return compute_response_matrix(
+            sim,
+            n_nodes=N,
+            stim_duration=30,
+            pre_steps=30,
+            measure_window=15,
+            stim_amplitude=0.5,
+            seed=seed,
+        )
+
+    def test_row_norms_are_comparable(self):
+        """All row norms should be within the same order of magnitude."""
+        R = self._compute_R()
+        norms = np.linalg.norm(R, axis=1)
+        self.assertGreater(norms.min(), 0.0)
+        ratio = norms.max() / (norms.min() + 1e-10)
+        # With shared x0, the ratio should be modest (< 10×).
+        # Previously, with different x0 per row, ratios > 100× were possible.
+        self.assertLess(ratio, 10.0,
+                        msg=f"Row norm ratio {ratio:.2f} too large — "
+                            "likely still using different x0 per row")
+
+    def test_zero_amplitude_gives_near_zero_response(self):
+        """With amplitude=0 every row of R should be essentially zero."""
+        sim = BrainDynamicsSimulator(model=None, n_regions=N, seed=0)
+        from analysis.response_matrix import compute_response_matrix
+        R = compute_response_matrix(
+            sim, n_nodes=N, stim_duration=30, pre_steps=30,
+            measure_window=15, stim_amplitude=0.0, seed=42,
+        )
+        self.assertAlmostEqual(float(np.abs(R).max()), 0.0, places=4)
+
+    def test_response_matrix_shape(self):
+        R = self._compute_R()
+        self.assertEqual(R.shape, (N, N))
+
+    def test_different_seeds_give_different_R(self):
+        """Different seeds → different x0 → different R matrices."""
+        R1 = self._compute_R(seed=1)
+        R2 = self._compute_R(seed=99)
+        self.assertFalse(np.allclose(R1, R2))
+
+    def test_column_stats_attributes(self):
+        """column_mean and stim_specificity can be computed from R."""
+        R = self._compute_R()
+        col_mean = np.abs(R).mean(axis=0)
+        stim_specificity = R.std(axis=1)
+        self.assertEqual(col_mean.shape, (N,))
+        self.assertEqual(stim_specificity.shape, (N,))
+        self.assertTrue(np.all(col_mean >= 0))
+        self.assertTrue(np.all(stim_specificity >= 0))
+
 
 class TestAttractorBasinJSON(unittest.TestCase):
     def _make_two_attractor_trajs(self):

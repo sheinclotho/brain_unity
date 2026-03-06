@@ -69,6 +69,15 @@ def compute_response_matrix(
     R = np.zeros((n_nodes, simulator.n_regions), dtype=np.float32)
     rng = np.random.default_rng(seed)
 
+    # Sample ONE shared initial state for all rows.
+    # Using the same x0 (hence the same equilibrium) for every row ensures that
+    # R[i,j] reflects only the stimulus-propagation structure (W column i), not
+    # the interaction between different random equilibria and stimulation.
+    # Previously each row used a fresh x0, which caused row norms to vary
+    # dramatically whenever the stimulated node's equilibrium sat near the [0,1]
+    # boundary (tanh saturation), making the matrix non-comparable across rows.
+    x0 = rng.random(simulator.n_regions).astype(np.float32)
+
     logger.info(
         "响应矩阵计算: n_nodes=%d, stim_duration=%d, pattern=%s",
         n_nodes,
@@ -77,8 +86,6 @@ def compute_response_matrix(
     )
 
     for i in range(n_nodes):
-        x0 = rng.random(simulator.n_regions).astype(np.float32)
-
         result = run_stimulation(
             simulator=simulator,
             node=i,
@@ -89,7 +96,6 @@ def compute_response_matrix(
             post_steps=0,
             pattern=stim_pattern,
             x0=x0,
-            rng=rng,
         )
 
         # Baseline: mean across pre-stimulation phase
@@ -104,10 +110,21 @@ def compute_response_matrix(
         if (i + 1) % max(1, n_nodes // 10) == 0:
             logger.info("  %d/%d 节点完成", i + 1, n_nodes)
 
+    col_mean = np.abs(R).mean(axis=0)
+    stim_specificity = R.std(axis=1)
+
     logger.info(
-        "✓ 响应矩阵完成。全局均值=%.4f, 最大绝对值=%.4f",
+        "✓ 响应矩阵完成。  全局均值=%.4f  最大绝对值=%.4f\n"
+        "     列均值 mean=%.4f std=%.4f  (hub节点 ±2σ: %d个)\n"
+        "     刺激特异性 mean=%.4f std=%.4f  (低特异性节点: %d个)",
         float(R.mean()),
         float(np.abs(R).max()),
+        float(col_mean.mean()),
+        float(col_mean.std()),
+        int((col_mean > col_mean.mean() + 2 * col_mean.std()).sum()),
+        float(stim_specificity.mean()),
+        float(stim_specificity.std()),
+        int((stim_specificity < stim_specificity.mean() * 0.5).sum()),
     )
 
     if output_dir is not None:

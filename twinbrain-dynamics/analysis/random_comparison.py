@@ -225,15 +225,26 @@ def run_random_model_comparison(
     except Exception as exc:
         logger.debug("  随机模型吸引子分析跳过: %s", exc)
 
-    # Run stability analysis on random trajectories
+    # Run stability analysis on random trajectories and use fraction_unstable
+    # as a *proxy* for the Lyapunov sign.  This is a coarse heuristic:
+    #   fraction_unstable − fraction_converged maps to (−1, +1) and qualitatively
+    # indicates whether trajectories tend to diverge (positive) or converge
+    # (negative).  It is NOT numerically comparable to a true Lyapunov exponent;
+    # it is included only so the comparison JSON has a "lyapunov-like" field for
+    # directional comparison.  The proxy is stored as `mean_lyapunov` in
+    # rand_lyapunov_results and forwarded to `analysis_comparison.json` under
+    # `random.mean_lyapunov`.  Run actual Wolf-method lyapunov estimation on the
+    # random trajectories when a true numerical comparison is needed.
     rand_lyapunov_results = None
     try:
         from analysis.stability_analysis import run_stability_analysis
         rand_stab = run_stability_analysis(rand_trajs)
-        # Approximate "lyapunov" from stability: fraction_unstable maps to λ > 0
-        rand_lyapunov_results = {
-            "mean_lyapunov": rand_stab["fraction_unstable"] - rand_stab["fraction_converged"]
-        }
+        proxy = rand_stab["fraction_unstable"] - rand_stab["fraction_converged"]
+        rand_lyapunov_results = {"mean_lyapunov": proxy}
+        logger.info(
+            "  随机模型稳定性代理 λ=%.4f（非真实 Lyapunov 指数，仅用于对比方向）",
+            proxy,
+        )
     except Exception as exc:
         logger.debug("  随机模型稳定性分析跳过: %s", exc)
 

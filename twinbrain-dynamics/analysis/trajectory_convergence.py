@@ -25,7 +25,7 @@ Trajectory Convergence Analysis
 
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -59,16 +59,33 @@ def compute_pairwise_distances(
         logger.warning("轨迹对不足（n_init=%d），跳过收敛分析。", n_init)
         return np.zeros(steps, dtype=np.float32)
 
-    # Sample unique pairs
-    pairs_a = rng.integers(0, n_init, size=n_pairs * 3)
-    pairs_b = rng.integers(0, n_init, size=n_pairs * 3)
-    valid = pairs_a != pairs_b
-    pairs_a = pairs_a[valid][:n_pairs]
-    pairs_b = pairs_b[valid][:n_pairs]
+    # Collect exactly n_pairs unique (a, b) pairs with a ≠ b.
+    # We use a while-loop with a 20× attempt budget to guarantee the exact count
+    # regardless of n_init (the old 3× oversampling heuristic was not guaranteed
+    # to produce enough valid pairs when n_init is small).
+    pairs_a: List[int] = []
+    pairs_b: List[int] = []
+    seen = set()
+    attempts = 0
+    max_attempts = n_pairs * 20
+    while len(pairs_a) < n_pairs and attempts < max_attempts:
+        a = int(rng.integers(0, n_init))
+        b = int(rng.integers(0, n_init))
+        if a != b and (a, b) not in seen:
+            pairs_a.append(a)
+            pairs_b.append(b)
+            seen.add((a, b))
+        attempts += 1
 
-    # Compute pairwise distances: shape (n_pairs, steps)
-    diff = trajectories[pairs_a] - trajectories[pairs_b]  # (n_pairs, steps, n_regions)
-    distances = np.linalg.norm(diff, axis=2)               # (n_pairs, steps)
+    if not pairs_a:
+        return np.zeros(steps, dtype=np.float32)
+
+    pa = np.array(pairs_a)
+    pb = np.array(pairs_b)
+
+    # Compute pairwise distances: shape (n_pairs_actual, steps)
+    diff = trajectories[pa] - trajectories[pb]  # (n_pairs_actual, steps, n_regions)
+    distances = np.linalg.norm(diff, axis=2)     # (n_pairs_actual, steps)
 
     return distances.mean(axis=0).astype(np.float32)
 
