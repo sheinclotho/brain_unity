@@ -1011,7 +1011,7 @@ class GraphNativeBrainModel(nn.Module):
         h_baseline: Dict[str, torch.Tensor] = {
             nt: encoded_data[nt].x.clone()
             for nt in self.node_types
-            if nt in encoded_data.node_types
+            if nt in encoded_data.node_types and hasattr(encoded_data[nt], "x")
         }
 
         # 2. Build perturbed latents
@@ -1154,7 +1154,7 @@ class GraphNativeBrainModel(nn.Module):
         h_baseline: Dict[str, torch.Tensor] = {
             nt: encoded_data[nt].x.clone()
             for nt in self.node_types
-            if nt in encoded_data.node_types
+            if nt in encoded_data.node_types and hasattr(encoded_data[nt], "x")
         }
 
         # Predict baseline future
