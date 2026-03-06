@@ -229,6 +229,23 @@ class TwinBrainDigitalTwin:
             f"num_subjects={num_subjects}, num_runs={num_runs}"
         )
 
+        # ── Extract hyperparameters from config (if available) ─────────────
+        # config.yaml is saved alongside each training checkpoint and records
+        # the exact architecture hyperparameters used during training.  Using
+        # these avoids defaulting to prediction_steps=10 when the model was
+        # trained with a different value (e.g. 50), which would cause the
+        # predictor submodule weights to be randomly initialized instead of
+        # loaded from the checkpoint (state dict keys exist but shapes differ
+        # under strict=False → those tensors are silently skipped).
+        model_cfg = (config or {}).get("model", {})
+        prediction_steps: int = model_cfg.get("prediction_steps", 10)
+        predictor_config: Optional[Dict] = model_cfg.get("predictor_config", None)
+        use_prediction: bool = bool(model_cfg.get("use_prediction", True))
+        num_decoder_layers: int = model_cfg.get("num_decoder_layers", 3)
+        dropout: float = float(model_cfg.get("dropout", 0.1))
+        if prediction_steps != 10:
+            logger.info("  从 config.yaml 读取 prediction_steps=%d", prediction_steps)
+
         model = GraphNativeBrainModel(
             node_types=node_types_list,
             edge_types=edge_types_list,
@@ -236,6 +253,11 @@ class TwinBrainDigitalTwin:
             hidden_channels=H,
             num_subjects=num_subjects,
             num_runs=num_runs,
+            prediction_steps=prediction_steps,
+            predictor_config=predictor_config,
+            use_prediction=use_prediction,
+            num_decoder_layers=num_decoder_layers,
+            dropout=dropout,
         )
         model.load_state_dict(state, strict=False)
         model.eval()
@@ -277,6 +299,9 @@ class TwinBrainDigitalTwin:
 
         Returns:
             Dict ``{node_type: [N, steps, C]}`` of predicted signal trajectories.
+
+        Raises:
+            RuntimeError: If the predictor or decoder raise an unexpected error.
         """
         data = data.to(self.device)
         combined_embed = self._get_combined_embed(data)
@@ -291,8 +316,13 @@ class TwinBrainDigitalTwin:
             if nt in encoded_data.node_types:
                 h = encoded_data[nt].x
                 if h.shape[1] < self.model._PRED_MIN_SEQ_LEN:
+                    logger.debug(
+                        "predict_future: skipping node type '%s' — "
+                        "encoded sequence length %d < _PRED_MIN_SEQ_LEN %d.",
+                        nt, h.shape[1], self.model._PRED_MIN_SEQ_LEN,
+                    )
                     continue
-                pred_dict[nt] = self.model.predictor.predict_next(h)
+                pred_dict[nt] = self.model.predictor.predict_next(h, num_steps=num_steps)
 
         if pred_dict:
             pred_dict = self.model.prediction_propagator(pred_dict, data)
@@ -304,8 +334,13 @@ class TwinBrainDigitalTwin:
         try:
             return self.model.decoder(hd)
         except Exception as e:
-            logger.debug(f"predict_future decoder failed: {e}")
-            return {}
+            # Surface the real error so callers (e.g. _rollout_with_twin) see the
+            # root cause rather than a confusing downstream "modality not in pred_dict".
+            shapes = {k: tuple(v.shape) for k, v in pred_dict.items()}
+            raise RuntimeError(
+                f"predict_future decoder failed: {e}\n"
+                f"pred_dict keys={list(pred_dict.keys())}, shapes={shapes}"
+            ) from e
 
     @torch.no_grad()
     def simulate_intervention(

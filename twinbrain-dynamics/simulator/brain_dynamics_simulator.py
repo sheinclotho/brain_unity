@@ -820,9 +820,18 @@ class BrainDynamicsSimulator:
             else:
                 pred_dict = self.model.predict_future(context, num_steps=req_steps)
                 if self.modality not in pred_dict:
+                    # predict_future now raises RuntimeError directly on decoder
+                    # failures, so reaching here means prediction was simply
+                    # unavailable (use_prediction=False or all node type sequences
+                    # were shorter than _PRED_MIN_SEQ_LEN).
                     raise RuntimeError(
                         f"模型未返回模态 '{self.modality}' 的预测。\n"
-                        f"可用模态: {list(pred_dict.keys())}"
+                        f"可用模态: {list(pred_dict.keys())}\n"
+                        "可能原因:\n"
+                        "  1. 模型以 use_prediction=False 训练（不支持自由动力学预测）。\n"
+                        "  2. 上下文序列长度 < _PRED_MIN_SEQ_LEN (4)，无法进行预测。\n"
+                        "  3. 加载检查点时缺少 config.yaml，导致 prediction_steps 不匹配。\n"
+                        f"  n_regions={self.n_regions}, modality={self.modality}"
                     )
                 pred = pred_dict[self.modality]  # [N, req_steps, 1]
 
@@ -885,7 +894,8 @@ class BrainDynamicsSimulator:
                 if self.modality not in pred_dict:
                     raise RuntimeError(
                         f"模型未返回模态 '{self.modality}' 的预测。\n"
-                        f"可用模态: {list(pred_dict.keys())}"
+                        f"可用模态: {list(pred_dict.keys())}\n"
+                        "可能原因: 模型以 use_prediction=False 训练，或上下文序列过短。"
                     )
                 pred = pred_dict[self.modality]
 

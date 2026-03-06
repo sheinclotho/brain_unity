@@ -108,6 +108,12 @@ def _merge_config(defaults: dict, overrides: dict) -> dict:
 
 # ── Default configuration ─────────────────────────────────────────────────────
 
+# Threshold above which model-mode n_init × steps triggers a performance
+# warning.  At ~50 steps/second per forward pass, 5000 total steps ≈ 100 s,
+# which is the upper limit for an interactive experiment.  Large-scale
+# experiments (n_init=200, steps=1000) should use Wilson-Cowan mode instead.
+_MODEL_MODE_STEP_WARN_THRESHOLD = 5_000
+
 _DEFAULTS = {
     "model": {
         "path": None,          # Required: path to best_model.pt
@@ -168,6 +174,17 @@ def run(cfg: dict) -> dict:
     """
     Run the full dynamics analysis pipeline.
 
+    Two operating modes are supported:
+
+    **Model mode** (requires ``--model`` and ``--graph``):
+        Uses a trained ``TwinBrainDigitalTwin`` for autoregressive inference.
+        Recommended n_init ≤ 20 and steps ≤ 200 to keep runtimes manageable.
+
+    **Wilson-Cowan mode** (``model.path`` is null / ``--model`` not given):
+        Standalone biophysical simulation without a trained model.
+        Suitable for large-scale experiments (n_init=200, steps=1000).
+        GPU-accelerated via ``BrainDynamicsSimulator.rollout_batched()``.
+
     Args:
         cfg: Merged configuration dictionary.
 
@@ -178,7 +195,6 @@ def run(cfg: dict) -> dict:
         RuntimeError: If the model path is provided but loading fails.
         ValueError:   If model mode is enabled but graph_path is not specified.
     """
-    from loader.load_model import load_trained_model, load_graph_for_inference
     from simulator.brain_dynamics_simulator import BrainDynamicsSimulator
     from experiments.free_dynamics import run_free_dynamics
     from experiments.attractor_analysis import run_attractor_analysis
@@ -191,7 +207,7 @@ def run(cfg: dict) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info("输出目录: %s", output_dir.resolve())
 
-    # ── Step 1: Load trained model ────────────────────────────────────────────
+    # ── Step 1: Load trained model (or fall back to Wilson-Cowan mode) ─────────
     logger.info("=" * 60)
     logger.info("步骤 1/7  加载训练模型")
     model_path = cfg["model"].get("path")
@@ -203,53 +219,85 @@ def run(cfg: dict) -> dict:
     # but can be overridden via cfg["model"]["config_path"]
     config_path = cfg["model"].get("config_path")
 
-    if not model_path:
-        raise ValueError(
-            "必须通过 --model 或配置文件 model.path 指定训练好的模型路径。\n"
-            "示例: python run_dynamics_analysis.py "
-            "--model outputs/twinbrain_v5_xxx/best_model.pt "
-            "--graph outputs/graph_cache/sub-01_notask_xx.pt"
+    twin = None
+    base_graph = None
+
+    if model_path:
+        from loader.load_model import load_trained_model, load_graph_for_inference
+
+        twin = load_trained_model(
+            checkpoint_path=model_path,
+            device=device,
+            config_path=config_path,
         )
 
-    twin = load_trained_model(
-        checkpoint_path=model_path,
-        device=device,
-        config_path=config_path,
-    )
+        # ── Step 1b: Load graph cache ─────────────────────────────────────────
+        if not graph_path:
+            raise ValueError(
+                "使用训练模型时必须通过 --graph 或配置文件 model.graph_path 指定图缓存路径。\n"
+                "图缓存位于 outputs/graph_cache/<subject_id>_<task>_<hash>.pt\n"
+                "示例: --graph outputs/graph_cache/sub-01_notask_ff12ab34.pt"
+            )
 
-    # ── Step 1b: Load graph cache ─────────────────────────────────────────────
-    if not graph_path:
-        raise ValueError(
-            "使用训练模型时必须通过 --graph 或配置文件 model.graph_path 指定图缓存路径。\n"
-            "图缓存位于 outputs/graph_cache/<subject_id>_<task>_<hash>.pt\n"
-            "示例: --graph outputs/graph_cache/sub-01_notask_ff12ab34.pt"
+        k_cross_modal = cfg["model"].get("k_cross_modal", 5)
+        base_graph = load_graph_for_inference(
+            graph_path=graph_path,
+            device=device,
+            k_cross_modal=k_cross_modal,
         )
-
-    k_cross_modal = cfg["model"].get("k_cross_modal", 5)
-    base_graph = load_graph_for_inference(
-        graph_path=graph_path,
-        device=device,
-        k_cross_modal=k_cross_modal,
-    )
+    else:
+        logger.info(
+            "  model.path 未设置 → 使用 Wilson-Cowan 独立模式（无需训练模型）。\n"
+            "  如需使用数字孪生模型，请通过 --model 指定检查点路径。"
+        )
 
     # ── Step 2: Create simulator ──────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("步骤 2/7  创建动力学模拟器")
     modality = cfg["simulator"].get("modality", "fmri")
+    # n_regions from config is only used in WC mode; model mode infers it from base_graph.
+    wc_n_regions = cfg["simulator"].get("n_regions", 200)
 
-    simulator = BrainDynamicsSimulator(
-        model=twin,
-        base_graph=base_graph,
-        modality=modality,
-        fmri_subsample=cfg["simulator"].get("fmri_subsample", 25),
-        device=device,
-    )
-    logger.info(
-        "  模式=TwinBrainDigitalTwin, modality=%s, n_regions=%d, dt=%.4f s",
-        simulator.modality,
-        simulator.n_regions,
-        simulator.dt,
-    )
+    if twin is not None:
+        simulator = BrainDynamicsSimulator(
+            model=twin,
+            base_graph=base_graph,
+            modality=modality,
+            fmri_subsample=cfg["simulator"].get("fmri_subsample", 25),
+            device=device,
+        )
+        logger.info(
+            "  模式=TwinBrainDigitalTwin, modality=%s, n_regions=%d, dt=%.4f s",
+            simulator.modality,
+            simulator.n_regions,
+            simulator.dt,
+        )
+        # Warn when model mode is used with parameters designed for WC mode
+        fd_cfg = cfg["free_dynamics"]
+        n_init = fd_cfg.get("n_init", 10)
+        steps = fd_cfg.get("steps", 50)
+        if n_init * steps > _MODEL_MODE_STEP_WARN_THRESHOLD:
+            logger.warning(
+                "  ⚠ 模型模式下 n_init=%d × steps=%d = %d 步，运行时间可能很长。\n"
+                "  建议模型模式下使用 n_init ≤ 20, steps ≤ 200。\n"
+                "  若需大规模仿真（n_init=200, steps=1000），请在无模型的 Wilson-Cowan 模式下运行\n"
+                "  （省略 --model 参数，或在配置文件中设置 model.path: null）。",
+                n_init,
+                steps,
+                n_init * steps,
+            )
+    else:
+        simulator = BrainDynamicsSimulator(
+            model=None,
+            n_regions=wc_n_regions,
+            dt=cfg["simulator"].get("dt", 0.004),
+            device=device,
+        )
+        logger.info(
+            "  模式=Wilson-Cowan, n_regions=%d, dt=%.4f s",
+            simulator.n_regions,
+            simulator.dt,
+        )
 
     results: dict = {}
 
@@ -424,18 +472,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        required=True,
+        default=None,
         help=(
             "训练好的模型检查点路径（best_model.pt）。\n"
+            "省略此参数则使用 Wilson-Cowan 独立模式（无需训练模型）。\n"
             "示例: outputs/<experiment_name>/best_model.pt"
         ),
     )
     parser.add_argument(
         "--graph",
         type=str,
-        required=True,
+        default=None,
         help=(
             "图缓存文件路径（outputs/graph_cache/*.pt）。\n"
+            "使用 --model 时必须同时提供此参数。\n"
             "示例: outputs/graph_cache/<subject_id>_<task>_<hash>.pt"
         ),
     )
@@ -497,9 +547,11 @@ def main() -> None:
     file_cfg = _load_config(args.config)
     cfg = _merge_config(_DEFAULTS, file_cfg)
 
-    # Apply CLI overrides
-    cfg["model"]["path"] = args.model
-    cfg["model"]["graph_path"] = args.graph
+    # Apply CLI overrides (only override when provided; None means use config value)
+    if args.model is not None:
+        cfg["model"]["path"] = args.model
+    if args.graph is not None:
+        cfg["model"]["graph_path"] = args.graph
     if args.training_config:
         cfg["model"]["config_path"] = args.training_config
     if args.output:
