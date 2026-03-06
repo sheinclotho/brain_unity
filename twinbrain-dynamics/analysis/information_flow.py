@@ -78,6 +78,12 @@ _DEFAULT_ORDER: int = 1
 # Minimum entropy value for numerical stability (avoid log(0)).
 _EPS: float = 1e-12
 
+# Epsilon added to the last bin edge in _discretize so that the maximum value
+# (exactly 1.0 in normalised [0,1] data) falls into the last bin rather than
+# creating a spurious extra bin.  Must be < floating-point noise (≈ 1e-7) but
+# large enough not to be optimised away: 1e-9 satisfies both.
+_BIN_EDGE_EPSILON: float = 1e-9
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Core TE estimator (discrete / histogram method)
@@ -86,7 +92,7 @@ _EPS: float = 1e-12
 def _discretize(x: np.ndarray, n_bins: int) -> np.ndarray:
     """Bin a continuous time series in [0, 1] to integer indices [0, n_bins)."""
     bins = np.linspace(0.0, 1.0, n_bins + 1)
-    bins[-1] += 1e-9  # ensure max value falls in last bin
+    bins[-1] += _BIN_EDGE_EPSILON  # ensure max value falls in last bin
     return np.digitize(x, bins) - 1  # → [0, n_bins-1]
 
 
@@ -316,18 +322,18 @@ def compute_information_flow_centrality(te_matrix: np.ndarray) -> Dict:
     hub_score = np.maximum(out_te, in_te)
 
     k = min(5, N)
-    top_sources = int(np.argsort(out_te)[-k:][::-1][0])
-    top_sinks   = int(np.argsort(in_te)[-k:][::-1][0])
-    top_drivers = int(np.argsort(net_te)[-k:][::-1][0])
+    top_source_region = int(np.argsort(out_te)[-1])
+    top_sink_region   = int(np.argsort(in_te)[-1])
+    top_driver_region = int(np.argsort(net_te)[-1])
 
     return {
         "out_te":           out_te.tolist(),
         "in_te":            in_te.tolist(),
         "net_te":           net_te.tolist(),
         "hub_score":        hub_score.tolist(),
-        "top_source_region":   top_sources,
-        "top_sink_region":     top_sinks,
-        "top_net_driver_region": top_drivers,
+        "top_source_region":   top_source_region,
+        "top_sink_region":     top_sink_region,
+        "top_net_driver_region": top_driver_region,
         "mean_te":          float(te_off.mean()),
         "max_te":           float(te_off.max()),
         "te_asymmetry":     float(np.abs(te_off - te_off.T).mean()),

@@ -80,6 +80,15 @@ _KENDALL_TAU_THRESHOLD: float = 0.25
 # DFA box sizes (as fractions of trajectory length)
 _DFA_N_SCALES: int = 12   # number of box sizes for the log-log regression
 
+# DFA minimum and maximum box (scale) sizes, as *divisors* of T:
+#   min scale = max(4, T // _DFA_MIN_SCALE_DIVISOR)   → at least 4 points per box
+#   max scale = max(min+1, T // _DFA_MAX_SCALE_DIVISOR) → at most T//4, per Peng (1994)
+# Peng et al. (1994) Phys Rev E 49:1685 recommend scales from T//100 to T//4
+# to ensure both adequate box statistics and long-range trend visibility.
+_DFA_MIN_SCALE_DIVISOR: int = 100  # min scale = T // 100 (many small boxes)
+_DFA_MAX_SCALE_DIVISOR: int = 4    # max scale = T //  4  (few large boxes)
+_DFA_ABSOLUTE_MIN_SCALE: int = 4   # hard lower bound (need ≥ 4 points per box)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Rolling statistics
@@ -224,9 +233,11 @@ def detrended_fluctuation_analysis(
     # Step 1: cumulative sum (profile)
     y = np.cumsum(x - x.mean()).astype(np.float64)
 
-    # Step 2: box sizes on a log scale from 4 to T//4
-    min_scale = max(4, T // 100)
-    max_scale = max(min_scale + 1, T // 4)
+    # Step 2: box sizes on a log scale.
+    # Peng et al. (1994) recommend scales from T//100 (min) to T//4 (max).
+    # _DFA_ABSOLUTE_MIN_SCALE=4 is a hard lower bound (need ≥ 4 points per box).
+    min_scale = max(_DFA_ABSOLUTE_MIN_SCALE, T // _DFA_MIN_SCALE_DIVISOR)
+    max_scale = max(min_scale + 1, T // _DFA_MAX_SCALE_DIVISOR)
     scales = np.unique(np.logspace(
         np.log10(min_scale), np.log10(max_scale), n_scales
     ).astype(int))

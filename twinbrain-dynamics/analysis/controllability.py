@@ -363,7 +363,7 @@ def run_controllability_analysis(
         "interpretation_zh": (
             f"网络可控性分析完成（N={N} 脑区，{n_communities} 个社区）。"
             f"AC-MC 相关性 = {ac_mc_corr:.3f}"
-            f"{'（预期负相关，与 Gu 2015 一致）' if ac_mc_corr < 0 else '（正相关，不典型）'}。"
+            f"{'（预期负相关，与 Gu 2015 一致）' if (np.isfinite(ac_mc_corr) and ac_mc_corr < 0) else '（无效值 (NaN)，数据不足）' if not np.isfinite(ac_mc_corr) else '（正相关，不典型）'}。"
             f"平均可控性最高脑区（易于广泛驱动）：{top_ac[:3]}；"
             f"模态可控性最高脑区（能量-efficient 状态切换）：{top_mc[:3]}；"
             f"边界可控性最高脑区（社区间协调）：{top_bc[:3]}。"

@@ -425,12 +425,17 @@ def rosenstein_lyapunov(
     # Ensure numerical non-negativity (floating-point rounding can give tiny <0)
     np.clip(dist2, 0.0, None, out=dist2)
 
-    # Mask temporal neighbours and self-distances
-    rows = np.arange(T_sub, dtype=np.int32)
-    for d_off in range(-eff_min_sep, eff_min_sep + 1):
-        col_idx = rows + d_off
-        mask = (col_idx >= 0) & (col_idx < T_sub)
-        dist2[rows[mask], col_idx[mask]] = np.inf
+    # Mask temporal neighbours and self-distances.
+    # Vectorised band fill: for |i-j| <= eff_min_sep set dist2[i,j] = inf.
+    # Uses row/col indices of the diagonal band rather than a Python loop.
+    _r = np.arange(T_sub, dtype=np.intp)
+    for d_off in range(1, eff_min_sep + 1):
+        # Upper band: (i, i+d_off)
+        dist2[_r[:-d_off], _r[d_off:]] = np.inf
+        # Lower band: (i+d_off, i)
+        dist2[_r[d_off:], _r[:-d_off]] = np.inf
+    # Self-diagonal (d_off=0)
+    dist2[_r, _r] = np.inf
 
     # For each reference point t, find the nearest valid neighbour
     nn_indices = np.argmin(dist2, axis=1)  # (T_sub,), one NN per reference point
