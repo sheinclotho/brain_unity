@@ -518,16 +518,22 @@ class BrainDynamicsSimulator:
         """
         连续动力学模拟。
 
-        在**模型模式**下，使用 ``TwinBrainDigitalTwin`` 进行自回归滑窗预测：
-        每次调用 ``predict_future()`` 或 ``simulate_intervention()`` 获取
-        ``prediction_steps`` 步的预测，然后将上下文窗口滑动 ``prediction_steps`` 步，
-        重复直到累计 ``steps`` 步。``x0`` 在模型模式下被忽略（上下文由 ``base_graph``
-        提供）。
+        在**模型模式**下，使用 ``TwinBrainDigitalTwin`` 进行自回归滑窗预测。
+        图缓存（``base_graph``）仅用于 **初始化**：其最后 ``context_length`` 步
+        被截取为初始上下文窗口（见 ``_trim_context``），之后模型完全依赖自身预测
+        自迭代（计划书 §四）。
+
+        ``x0`` 注入机制：
+            若提供 ``x0``，它将被写入初始上下文的最后一个时间步，覆盖图缓存中
+            对应模态的原始数值。这样不同的 ``x0`` 会产生不同的初始脑状态，使
+            ``run_free_dynamics`` 中的 200 条轨迹真正从不同位置出发（计划书 §五）。
 
         在 **WC 模式**下，逐步积分：``x0`` 为必须参数。
 
         Args:
-            x0:       WC 模式的初始脑状态，shape (n_regions,)；模型模式下忽略。
+            x0:       初始脑状态，shape (n_regions,)。
+                      模型模式下：注入为初始上下文最后一步（可选，默认保留图缓存数据）。
+                      WC 模式下：必须提供，用作积分起点。
             steps:    模拟步数（模型模式：fMRI TR 数；WC 模式：积分步数）。
             stimulus: 刺激对象（实现 Stimulus.value(t)）；None → 自由演化。
 
@@ -536,7 +542,7 @@ class BrainDynamicsSimulator:
             times:      shape (steps,)，以秒为单位的时间轴。
         """
         if self._is_twin:
-            return self._rollout_with_twin(steps=steps, stimulus=stimulus)
+            return self._rollout_with_twin(steps=steps, stimulus=stimulus, x0=x0)
 
         # WC / plain nn.Module mode
         if x0 is None:
@@ -563,7 +569,8 @@ class BrainDynamicsSimulator:
         在 **WC 模式**下，逐步积分并叠加各刺激。
 
         Args:
-            x0:       WC 模式的初始脑状态；模型模式下忽略。
+            x0:       初始脑状态；模型模式下注入为初始上下文最后一步（见 rollout）；
+                      WC 模式下为积分起点。
             steps:    模拟步数。
             stimuli:  多个 ``Stimulus`` 对象的列表（None → 自由演化，等同于 rollout）。
 
@@ -575,7 +582,7 @@ class BrainDynamicsSimulator:
             stimuli = []
 
         if self._is_twin:
-            return self._rollout_multi_stim_with_twin(steps=steps, stimuli=stimuli)
+            return self._rollout_multi_stim_with_twin(steps=steps, stimuli=stimuli, x0=x0)
 
         if x0 is None:
             x0 = self.sample_random_state()
@@ -771,20 +778,36 @@ class BrainDynamicsSimulator:
 
     def _trim_context(self, context: HeteroData) -> HeteroData:
         """
-        Trim ``context[modality].x`` to ``predictor.context_length`` timesteps.
+        Trim **all** modalities in ``context`` to ``predictor.context_length`` timesteps.
 
-        The encoder processes all T timesteps, producing ``[N, T, H]`` activation
-        tensors.  The predictor only reads the last ``context_length`` of those T
-        steps, so sending more than ``context_length`` timesteps wastes VRAM.
-        Trimming to ``context_length`` reduces peak encoder activation memory by
-        ``T_base / context_length`` (≈1.9× for T_base=384, context_length=200),
-        enabling n_init=200, steps=1000 experiments to fit on an 8 GB GPU.
+        Design rationale (计划书 §四/§十三):
+            The graph cache serves as the **initial state** for the simulator.
+            After initialization, the model self-iterates using its own predictions.
+            Only the last ``context_length`` timesteps per modality are needed to
+            seed the predictor — any older history is wasted encoder compute.
+
+        Memory impact:
+            For a typical graph where fMRI has T=200 and EEG has T=98 500:
+            - Old behaviour (trim only fMRI): EEG still encoded at T=98 500.
+              Peak encoder activation: [63, 98500, 128] × 2 (fast+slow Conv1d)
+              = 6.34 GB → CUDA OOM on 8 GB GPU.
+            - New behaviour (trim ALL modalities to context_length=200):
+              EEG encoded at T=200.
+              Peak activation: [63, 200, 128] × 2 = 12.9 MB → trivial.
+
+        Scientific validity:
+            ``EnhancedMultiStepPredictor.predict_next()`` uses the last
+            ``context_length`` *encoded* timesteps.  The encoder's Conv1d
+            (kernel_size=3, padding=same) preserves T, so trimming raw input to
+            ``context_length`` steps produces exactly ``context_length`` encoded
+            steps — a perfect match.  The most recent ``context_length`` raw
+            steps carry the relevant brain-state history for the predictor.
 
         The original ``self.base_graph`` is never mutated — this operates on a
         clone returned by ``_clone_hetero_graph``.
 
         Returns:
-            The same ``context`` object with ``context[modality].x`` replaced by
+            The same ``context`` object with every node type's ``.x`` replaced by
             its last ``context_length`` (or fewer) timesteps.
         """
         _predictor = getattr(getattr(self.model, "model", None), "predictor", None)
@@ -797,10 +820,56 @@ class BrainDynamicsSimulator:
                 type(self.model).__name__,
                 type(getattr(self.model, "model", None)).__name__,
             )
-        ctx_x = context[self.modality].x  # [N, T_base, C]
-        if ctx_x.shape[1] > _ctx_len:
-            context[self.modality].x = ctx_x[:, -_ctx_len:, :]
+        # Trim ALL node types, not just the primary modality.
+        # This is the key fix for EEG OOM: T_eeg can be orders of magnitude
+        # larger than context_length (e.g. 98500 vs 200).
+        for nt in list(context.node_types):
+            nt_x = context[nt].x  # [N, T, C]
+            if nt_x.shape[1] > _ctx_len:
+                context[nt].x = nt_x[:, -_ctx_len:, :]
+                logger.debug(
+                    "_trim_context: trimmed '%s' from T=%d to T=%d",
+                    nt, nt_x.shape[1], _ctx_len,
+                )
         return context
+
+    def _inject_x0_into_context(
+        self,
+        context: HeteroData,
+        x0: Optional[np.ndarray],
+    ) -> None:
+        """
+        Inject ``x0`` into the **last time step** of the primary modality's context.
+
+        This gives each free-dynamics rollout a distinct starting point
+        (计划书 §五: ``x0 = sample_random_state()``).  Without this injection,
+        all n_init rollouts would start from identical graph-cache values and
+        produce identical trajectories.
+
+        The injection is in-place on ``context[self.modality].x``.  The caller
+        owns this tensor (it is a clone of ``base_graph``), so mutation is safe.
+
+        Args:
+            context: Trimmed HeteroData clone (already detached from base_graph).
+            x0:      Initial brain state, shape ``(n_regions,)``.  Silently
+                     ignored when ``None`` or shape does not match ``n_regions``.
+        """
+        if x0 is None:
+            return
+        x0_np = np.asarray(x0, dtype=np.float32).flatten()
+        if x0_np.shape[0] != self.n_regions:
+            logger.warning(
+                "_inject_x0_into_context: x0 shape %s does not match "
+                "n_regions=%d; injection skipped.",
+                x0_np.shape, self.n_regions,
+            )
+            return
+        x0_t = torch.from_numpy(x0_np)
+        ctx_x = context[self.modality].x  # [N, T_ctx, C], owned by clone
+        if x0_t.shape[0] == ctx_x.shape[0]:
+            # Replace the last time step with x0 so that the encoder sees the
+            # desired initial brain state at t = T_ctx - 1.
+            ctx_x[:, -1, 0] = x0_t
 
     # ── Private: TwinBrain twin-mode rollout ────────────────────────────────────
 
@@ -808,33 +877,48 @@ class BrainDynamicsSimulator:
         self,
         steps: int,
         stimulus: Optional[Stimulus],
+        x0: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Autoregressive rollout using TwinBrainDigitalTwin.
 
-        For each chunk of ``chunk_size`` steps:
-          - If any stimulus is active in that chunk, call ``simulate_intervention()``
-            with the peak stimulus amplitude × 2σ scaling, and use the
-            ``perturbed`` prediction as the new context.
-          - Otherwise, call ``predict_future()`` and use the prediction as context.
+        Initialization (计划书 §四/§十三):
+            The base_graph is used **once** as the initial context.  All modalities
+            are trimmed to ``context_length`` timesteps (see ``_trim_context``),
+            capping peak encoder activation memory at O(context_length × N × H)
+            regardless of the original EEG sequence length.
 
-        The context window is advanced by ``chunk_size`` steps at each iteration
-        (sliding window: drop the oldest chunk, append the new prediction).
+            If ``x0`` is provided, it is injected into the last time step of the
+            primary modality's context, overriding the graph-cache values.  This
+            lets ``run_free_dynamics`` start 200 trajectories from 200 genuinely
+            different brain states (计划书 §五: ``x0 = sample_random_state()``).
 
-        Memory optimisation (8 GB GPU support):
-            ``_trim_context`` is called once at rollout start to trim the history
-            from T_base (e.g. 384) down to ``predictor.context_length`` (≤200).
-            The ``_advance_context`` sliding window then maintains this shorter
-            length throughout, so the encoder always receives
-            ``[N, context_length, C]`` rather than ``[N, T_base, C]``.
-            This reduces peak encoder activation memory by T_base / context_length
-            (≈1.9× for T_base=384, context_length=200).
+        Self-iteration:
+            After each ``predict_future()`` call, **all** modalities present in
+            ``pred_dict`` are advanced together via ``_advance_context``.  This
+            keeps every modality's context window temporally aligned and ensures
+            the EEG context does not fall behind the fMRI context over long rollouts.
+
+        Stimulus handling:
+            When a stimulus is active in a chunk, ``simulate_intervention()`` is
+            called; its ``perturbed`` dict is used both for trajectory recording
+            and context advancement.
+
+        Memory (8 GB GPU):
+            After ``_trim_context``, every ``predict_future`` call encodes
+            context of shape ``[N, context_length, C]`` per modality.
+            Example: context_length=200, N_eeg=63, H=128 →
+            peak EEG activation ≈ 12.9 MB (vs 6.34 GB before the fix).
         """
         chunk_size: int = getattr(getattr(self.model, "model", None), "prediction_steps", 50)
 
-        # Clone base_graph and trim context to predictor.context_length steps
-        # to reduce encoder activation memory (see _trim_context for details).
+        # Clone base_graph and trim ALL modalities to context_length.
+        # This is the key memory fix: EEG goes from T=98500 to T=context_length.
         context = self._trim_context(_clone_hetero_graph(self.base_graph))
+
+        # Inject x0 as the "current brain state" (last time step override).
+        # This ensures 200 rollouts start from 200 different initial conditions.
+        self._inject_x0_into_context(context, x0)
 
         trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
         times = np.arange(steps, dtype=np.float32) * self.dt
@@ -862,7 +946,7 @@ class BrainDynamicsSimulator:
                     interventions={self.modality: ([stimulus.node], delta)},
                     num_prediction_steps=req_steps,
                 )
-                pred = result["perturbed"][self.modality]  # [N, req_steps, 1]
+                pred_dict = result["perturbed"]  # {nt: [N, req_steps, 1]}
             else:
                 pred_dict = self.model.predict_future(context, num_steps=req_steps)
                 if self.modality not in pred_dict:
@@ -879,16 +963,18 @@ class BrainDynamicsSimulator:
                         "  3. 加载检查点时缺少 config.yaml，导致 prediction_steps 不匹配。\n"
                         f"  n_regions={self.n_regions}, modality={self.modality}"
                     )
-                pred = pred_dict[self.modality]  # [N, req_steps, 1]
+
+            pred = pred_dict[self.modality]  # [N, req_steps, 1]
 
             # Detach and move to CPU; shape: [req_steps, N]
             chunk_np = pred.squeeze(-1).detach().cpu().numpy().T
             trajectory[t_offset: t_offset + req_steps] = chunk_np[:req_steps]
             t_offset += req_steps
 
-            # Roll the context window forward: drop oldest chunk, append prediction
+            # Roll ALL modality context windows forward using the full pred_dict.
+            # This keeps every modality temporally aligned (EEG no longer lags fMRI).
             if t_offset < steps:
-                context = _advance_context(context, pred, self.modality)
+                context = _advance_context(context, pred_dict)
 
         return trajectory, times
 
@@ -896,17 +982,21 @@ class BrainDynamicsSimulator:
         self,
         steps: int,
         stimuli: List[Stimulus],
+        x0: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Autoregressive rollout with multiple simultaneous stimuli using TwinBrainDigitalTwin.
 
         All active stimuli in a chunk are packed into the ``interventions`` dict.
-        Context trimming (same as ``_rollout_with_twin``) is applied to reduce
-        encoder activation memory on small GPUs.
+        Context trimming (same as ``_rollout_with_twin``) and x0 injection are
+        applied to reduce encoder activation memory and support varied initial states.
+        All modalities are advanced together after each prediction step.
         """
         chunk_size: int = getattr(getattr(self.model, "model", None), "prediction_steps", 50)
 
         context = self._trim_context(_clone_hetero_graph(self.base_graph))
+        self._inject_x0_into_context(context, x0)
+
         trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
         times = np.arange(steps, dtype=np.float32) * self.dt
 
@@ -936,7 +1026,7 @@ class BrainDynamicsSimulator:
                     interventions={self.modality: (node_list, mean_delta)},
                     num_prediction_steps=req_steps,
                 )
-                pred = result["perturbed"][self.modality]  # [N, req_steps, 1]
+                pred_dict = result["perturbed"]  # {nt: [N, req_steps, 1]}
             else:
                 pred_dict = self.model.predict_future(context, num_steps=req_steps)
                 if self.modality not in pred_dict:
@@ -945,14 +1035,16 @@ class BrainDynamicsSimulator:
                         f"可用模态: {list(pred_dict.keys())}\n"
                         "可能原因: 模型以 use_prediction=False 训练，或上下文序列过短。"
                     )
-                pred = pred_dict[self.modality]
+
+            pred = pred_dict[self.modality]
 
             chunk_np = pred.squeeze(-1).detach().cpu().numpy().T
             trajectory[t_offset: t_offset + req_steps] = chunk_np[:req_steps]
             t_offset += req_steps
 
+            # Advance ALL modality context windows together.
             if t_offset < steps:
-                context = _advance_context(context, pred, self.modality)
+                context = _advance_context(context, pred_dict)
 
         return trajectory, times
 
@@ -1073,36 +1165,48 @@ def _clone_hetero_graph(graph: HeteroData) -> HeteroData:
 
 def _advance_context(
     context: HeteroData,
-    pred: torch.Tensor,
-    modality: str,
+    pred_dict: Dict[str, torch.Tensor],
 ) -> HeteroData:
     """
-    Advance the context window by appending new predictions and dropping the
-    oldest time steps.
+    Advance the context window for ALL modalities present in ``pred_dict``.
 
-    The context window length ``T_ctx`` is kept constant:
-      new_x[:, :, :] = concat(old_x[:, chunk:, :], pred[:, :, :], dim=1)
+    For each modality, the oldest ``chunk`` timesteps are dropped and the new
+    predictions are appended, keeping the window length constant:
+
+        new_x = concat(old_x[:, chunk:, :], pred[:, :, :], dim=1)
+
+    Advancing all modalities together (not just the primary one) is required
+    for temporal consistency: without it, e.g. EEG stays at initialization
+    time while fMRI advances, creating an ever-growing temporal mismatch that
+    degrades encoder representations over long rollouts.
 
     Args:
-        context:  Current context HeteroData with x shape [N, T_ctx, 1].
-        pred:     New predictions from the model, shape [N, chunk, 1].
-        modality: Node type to update (``'fmri'`` or ``'eeg'``).
+        context:   Current context HeteroData with ``x`` shape ``[N, T_ctx, 1]``
+                   per node type.
+        pred_dict: Dict mapping node-type name → prediction tensor
+                   ``[N, chunk, 1]``.  Only modalities present in both
+                   ``context.node_types`` and ``pred_dict`` are updated;
+                   others are left unchanged.
 
     Returns:
-        New context HeteroData with the same T_ctx but shifted by ``chunk`` steps.
+        New context HeteroData with updated node features for all available
+        modalities.
     """
     new_ctx = _clone_hetero_graph(context)
-    old_x = context[modality].x  # [N, T_ctx, 1]
-    chunk = pred.shape[1]
-    pred_clean = pred.detach().to(old_x.device)
+    for modality, pred in pred_dict.items():
+        if modality not in context.node_types:
+            continue
+        old_x = context[modality].x  # [N, T_ctx, 1]
+        chunk = pred.shape[1]
+        pred_clean = pred.detach().to(old_x.device)
 
-    # Sliding window: drop oldest chunk steps, append prediction
-    if chunk >= old_x.shape[1]:
-        # Prediction is as long as or longer than the context → replace entirely
-        new_ctx[modality].x = pred_clean[:, -old_x.shape[1]:, :]
-    else:
-        new_ctx[modality].x = torch.cat(
-            [old_x[:, chunk:, :], pred_clean], dim=1
-        )
+        # Sliding window: drop oldest chunk steps, append prediction
+        if chunk >= old_x.shape[1]:
+            # Prediction is as long as or longer than the context → replace entirely
+            new_ctx[modality].x = pred_clean[:, -old_x.shape[1]:, :]
+        else:
+            new_ctx[modality].x = torch.cat(
+                [old_x[:, chunk:, :], pred_clean], dim=1
+            )
 
     return new_ctx
