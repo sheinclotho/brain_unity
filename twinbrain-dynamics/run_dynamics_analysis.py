@@ -132,7 +132,10 @@ _DEFAULTS = {
         "k_cross_modal": 5,    # Cross-modal edges per EEG electrode (API.md §2.5)
     },
     "simulator": {
-        "modality": "fmri",    # Which modality to simulate ('fmri' or 'eeg')
+        # Which modality to simulate: 'fmri', 'eeg', or 'both'.
+        # 'both' runs the full pipeline twice (once per modality) and writes
+        # results to output_dir/fmri/ and output_dir/eeg/ respectively.
+        "modality": "fmri",
         "fmri_subsample": 25,  # Kept for compatibility; model infers dt from graph
     },
     # Steps here mean fMRI prediction steps (not EEG samples).
@@ -204,6 +207,24 @@ _DEFAULTS = {
         "enabled": True,
         "window_fraction": 0.5,  # Rolling window as fraction of trajectory length
     },
+    # ── GPT-review validation modules (steps 11–12) ───────────────────────────
+    "surrogate_test": {
+        "enabled": True,
+        "n_surrogates": 19,          # 19 surrogates → p < 0.05 (rank test)
+        "surrogate_types": ["phase_randomize", "shuffle", "ar"],
+        "ar_order": 1,               # AR(p) order for ar_surrogate
+        "rosenstein_max_lag": 30,
+        "rosenstein_min_sep": 10,
+        "n_traj_sample": 5,          # trajectories used (speed vs. precision)
+    },
+    "embedding_dimension": {
+        "enabled": True,
+        "fnn_max_dim": 8,            # max embedding dimension to test via FNN
+        "fnn_tau": 1,                # delay lag for FNN (steps)
+        "corr_dim": True,            # compute Grassberger-Procaccia D₂
+        "check_leakage": True,       # run normalisation + PCA leakage checks
+        "train_fraction": 0.7,       # fraction of trajectories treated as "train"
+    },
     "output": {
         "directory": "outputs",
         "save_trajectories": True,
@@ -217,25 +238,41 @@ _DEFAULTS = {
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
-def run(cfg: dict) -> dict:
+def _run_single_modality(
+    cfg: dict,
+    twin,
+    base_graph,
+    modality: str,
+    output_dir: Path,
+    device: str,
+) -> dict:
     """
-    Run the full dynamics analysis pipeline.
+    Run the full 12-step dynamics-analysis pipeline for *one* modality.
 
-    Loads a trained TwinBrainDigitalTwin model and drives the complete
-    dynamics-analysis workflow (free dynamics → attractor analysis →
-    virtual stimulation → response matrix → stability analysis).
+    Steps:
+      2  Create simulator
+      3  Free dynamics
+      4  Attractor analysis
+      5  Virtual stimulation
+      6  Response matrix
+      7  Stability analysis
+      8  Trajectory convergence
+      9  Lyapunov exponent
+      10 Random model comparison
+      11 Surrogate test          (GPT-review validation)
+      12 Embedding dimension     (GPT-review validation)
 
     Args:
-        cfg: Merged configuration dictionary.
+        cfg:        Merged configuration dict.
+        twin:       Loaded TwinBrainDigitalTwin model.
+        base_graph: HeteroData graph cache.
+        modality:   ``"fmri"`` or ``"eeg"``.
+        output_dir: Per-modality output directory.
+        device:     Compute device string.
 
     Returns:
-        results: Dictionary containing all computed artefacts.
-
-    Raises:
-        ValueError:   If model_path or graph_path is not specified.
-        RuntimeError: If the model fails to load or run inference.
+        results dict containing all computed artefacts for this modality.
     """
-    from loader.load_model import load_trained_model, load_graph_for_inference
     from simulator.brain_dynamics_simulator import BrainDynamicsSimulator
     from experiments.free_dynamics import run_free_dynamics
     from experiments.attractor_analysis import run_attractor_analysis
@@ -245,6 +282,273 @@ def run(cfg: dict) -> dict:
     from analysis.lyapunov import run_lyapunov_analysis
     from analysis.trajectory_convergence import run_trajectory_convergence
     from analysis.random_comparison import run_random_model_comparison
+    from analysis.surrogate_test import run_surrogate_test
+    from analysis.embedding_dimension import run_embedding_dimension_analysis
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    n_total_steps = 12
+
+    # ── Step 2: Create simulator ──────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 2/%d  创建动力学模拟器 [modality=%s]", n_total_steps, modality)
+
+    simulator = BrainDynamicsSimulator(
+        model=twin,
+        base_graph=base_graph,
+        modality=modality,
+        fmri_subsample=cfg["simulator"].get("fmri_subsample", 25),
+        device=device,
+    )
+    logger.info(
+        "  模式=TwinBrainDigitalTwin, modality=%s, n_regions=%d, dt=%.4f s",
+        simulator.modality,
+        simulator.n_regions,
+        simulator.dt,
+    )
+
+    results: dict = {}
+
+    # ── Step 3: Free dynamics ─────────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 3/%d  自由动力学实验", n_total_steps)
+    fd_cfg = cfg["free_dynamics"]
+    trajectories = run_free_dynamics(
+        simulator=simulator,
+        n_init=fd_cfg.get("n_init", 10),
+        steps=fd_cfg.get("steps", 50),
+        seed=fd_cfg.get("seed", 42),
+        output_dir=output_dir if cfg["output"].get("save_trajectories") else None,
+        device=device,
+        n_temporal_windows=fd_cfg.get("n_temporal_windows", None),
+    )
+    results["trajectories"] = trajectories
+
+    # ── Step 4: Attractor analysis ────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 4/%d  吸引子分析", n_total_steps)
+    att_cfg = cfg["attractor_analysis"]
+    attractor_results = run_attractor_analysis(
+        trajectories=trajectories,
+        tail_steps=att_cfg.get("tail_steps", 100),
+        k_candidates=att_cfg.get("k_candidates", [2, 3, 4, 5, 6]),
+        k_best=att_cfg.get("k_best", 3),
+        dbscan_eps=att_cfg.get("dbscan_eps", 0.5),
+        dbscan_min_samples=att_cfg.get("dbscan_min_samples", 5),
+        output_dir=output_dir if cfg["output"].get("save_attractors") else None,
+    )
+    results["attractor_results"] = attractor_results
+
+    # ── Step 5: Virtual stimulation ───────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 5/%d  虚拟刺激实验", n_total_steps)
+    vs_cfg = cfg["virtual_stimulation"]
+    all_target_nodes = vs_cfg.get("target_nodes", [0, 100])
+    target_nodes = [n for n in all_target_nodes if n < simulator.n_regions]
+    if not target_nodes:
+        logger.warning(
+            "所有目标节点索引超出范围（n_regions=%d），使用节点 0。",
+            simulator.n_regions,
+        )
+        target_nodes = [0]
+
+    stim_results = run_virtual_stimulation(
+        simulator=simulator,
+        target_nodes=target_nodes,
+        amplitude=vs_cfg.get("amplitude", 0.5),
+        frequency=vs_cfg.get("frequency", 10.0),
+        stim_steps=vs_cfg.get("duration", 30),
+        pre_steps=vs_cfg.get("pre_steps", 10),
+        post_steps=vs_cfg.get("post_steps", 20),
+        patterns=vs_cfg.get("patterns", ["sine"]),
+        output_dir=output_dir,
+    )
+    results["stimulation_results"] = stim_results
+
+    # ── Step 6: Response matrix ───────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 6/%d  响应矩阵计算", n_total_steps)
+    rm_cfg = cfg["response_matrix"]
+    n_nodes_rm = min(
+        rm_cfg.get("n_nodes", simulator.n_regions), simulator.n_regions
+    )
+    response_matrix = compute_response_matrix(
+        simulator=simulator,
+        n_nodes=n_nodes_rm,
+        stim_amplitude=rm_cfg.get("stim_amplitude", 0.5),
+        output_dir=output_dir if cfg["output"].get("save_response_matrix") else None,
+    )
+    results["response_matrix"] = response_matrix
+
+    # ── Step 7: Stability analysis ────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 7/%d  稳定性分析", n_total_steps)
+    sa_cfg = cfg["stability_analysis"]
+    stability_summary = run_stability_analysis(
+        trajectories=trajectories,
+        convergence_tol=sa_cfg.get("convergence_tol", 1e-4),
+        period_max_lag=sa_cfg.get("period_max_lag", 100),
+        delay_dt=sa_cfg.get("delay_dt", 50),
+        output_dir=output_dir if cfg["output"].get("save_stability_metrics") else None,
+    )
+    results["stability_summary"] = stability_summary
+
+    # ── Step 8: Trajectory convergence ───────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 8/%d  轨迹收敛分析", n_total_steps)
+    tc_cfg = cfg.get("trajectory_convergence", {})
+    if tc_cfg.get("enabled", True):
+        tc_results = run_trajectory_convergence(
+            trajectories=trajectories,
+            n_pairs=tc_cfg.get("n_pairs", 50),
+            seed=fd_cfg.get("seed", 42),
+            output_dir=output_dir if cfg["output"].get("save_trajectories") else None,
+        )
+        results["trajectory_convergence"] = tc_results
+    else:
+        logger.info("  轨迹收敛分析已禁用，跳过。")
+
+    # ── Step 9: Lyapunov exponent ─────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 9/%d  Lyapunov 指数估计", n_total_steps)
+    lya_cfg = cfg.get("lyapunov", {})
+    if lya_cfg.get("enabled", True):
+        try:
+            lyapunov_results = run_lyapunov_analysis(
+                trajectories=trajectories,
+                simulator=simulator,
+                epsilon=lya_cfg.get("epsilon", 1e-6),
+                renorm_steps=lya_cfg.get("renorm_steps", 50),
+                skip_fraction=lya_cfg.get("skip_fraction", 0.1),
+                method=lya_cfg.get("method", "both"),
+                convergence_result=results.get("trajectory_convergence"),
+                convergence_threshold=lya_cfg.get("convergence_threshold", 0.01),
+                n_segments=lya_cfg.get("n_segments", 3),
+                rosenstein_max_lag=lya_cfg.get("rosenstein_max_lag", 50),
+                rosenstein_min_sep=lya_cfg.get("rosenstein_min_sep", 20),
+                output_dir=output_dir,
+            )
+            results["lyapunov"] = lyapunov_results
+            regime = lyapunov_results["chaos_regime"]["regime"]
+            interp = lyapunov_results["chaos_regime"]["interpretation_zh"]
+            logger.info("  混沌评估: [%s] %s", regime.upper(), interp)
+        except Exception as exc:
+            logger.warning("  Lyapunov 分析失败 (%s)，跳过。", exc)
+    else:
+        logger.info("  Lyapunov 分析已禁用，跳过。")
+
+    # ── Step 10: Random model comparison ─────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 10/%d  随机模型对照实验", n_total_steps)
+    rc_cfg = cfg.get("random_comparison", {})
+    if rc_cfg.get("enabled", True):
+        try:
+            comparison = run_random_model_comparison(
+                trajectories=trajectories,
+                attractor_results=attractor_results,
+                lyapunov_results=results.get("lyapunov"),
+                response_matrix=response_matrix,
+                random_n_init=rc_cfg.get("n_init", 200),
+                random_steps=rc_cfg.get("steps", 1000),
+                spectral_radius=rc_cfg.get("spectral_radius", 0.9),
+                spectral_radii=rc_cfg.get("spectral_radii", None),
+                n_seeds=rc_cfg.get("n_seeds", 5),
+                seed=fd_cfg.get("seed", 42),
+                output_dir=output_dir,
+            )
+            results["random_comparison"] = comparison
+        except Exception as exc:
+            logger.warning("  随机模型对照实验失败 (%s)，跳过。", exc)
+    else:
+        logger.info("  随机模型对照实验已禁用，跳过。")
+
+    # ── Step 11: Surrogate test ───────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 11/%d  代替数据检验（Surrogate Test）", n_total_steps)
+    st_cfg = cfg.get("surrogate_test", {})
+    if st_cfg.get("enabled", True):
+        try:
+            surrogate_results = run_surrogate_test(
+                trajectories=trajectories,
+                n_surrogates=st_cfg.get("n_surrogates", 19),
+                surrogate_types=st_cfg.get("surrogate_types", None),
+                ar_order=st_cfg.get("ar_order", 1),
+                rosenstein_max_lag=st_cfg.get("rosenstein_max_lag", 30),
+                rosenstein_min_sep=st_cfg.get("rosenstein_min_sep", 10),
+                n_traj_sample=st_cfg.get("n_traj_sample", 5),
+                seed=fd_cfg.get("seed", 42),
+                output_dir=output_dir,
+            )
+            results["surrogate_test"] = surrogate_results
+        except Exception as exc:
+            logger.warning("  代替数据检验失败 (%s)，跳过。", exc)
+    else:
+        logger.info("  代替数据检验已禁用，跳过。")
+
+    # ── Step 12: Embedding dimension & leakage check ──────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 12/%d  嵌入维度验证 & 数据泄漏检查", n_total_steps)
+    ed_cfg = cfg.get("embedding_dimension", {})
+    if ed_cfg.get("enabled", True):
+        try:
+            embed_results = run_embedding_dimension_analysis(
+                trajectories=trajectories,
+                fnn_max_dim=ed_cfg.get("fnn_max_dim", 8),
+                fnn_tau=ed_cfg.get("fnn_tau", 1),
+                corr_dim=ed_cfg.get("corr_dim", True),
+                check_leakage=ed_cfg.get("check_leakage", True),
+                train_fraction=ed_cfg.get("train_fraction", 0.7),
+                output_dir=output_dir,
+            )
+            results["embedding_dimension"] = embed_results
+        except Exception as exc:
+            logger.warning("  嵌入维度分析失败 (%s)，跳过。", exc)
+    else:
+        logger.info("  嵌入维度分析已禁用，跳过。")
+
+    # ── Visualisations ────────────────────────────────────────────────────────
+    if cfg["output"].get("save_plots"):
+        _save_plots(results, output_dir, simulator)
+
+    logger.info("=" * 60)
+    logger.info(
+        "✓ [%s] 动力系统分析全部完成（%d 步）！结果保存至: %s",
+        modality.upper(), n_total_steps, output_dir.resolve(),
+    )
+    return results
+
+
+def run(cfg: dict) -> dict:
+    """
+    Run the full dynamics analysis pipeline.
+
+    Loads a trained TwinBrainDigitalTwin model and drives the complete
+    dynamics-analysis workflow for one or both modalities.
+
+    When ``cfg["simulator"]["modality"]`` is ``"both"``, the pipeline runs
+    twice (once per modality available in the graph cache) and results are
+    stored in per-modality subdirectories::
+
+        output_dir/fmri/   ← fMRI results
+        output_dir/eeg/    ← EEG results
+
+    The returned dict has the same shape in all three cases:
+
+    * ``modality="fmri"`` → ``{"trajectories": ..., "lyapunov": ..., ...}``
+    * ``modality="eeg"``  → same flat dict for EEG
+    * ``modality="both"`` → ``{"fmri": {...}, "eeg": {...}}``
+
+    Args:
+        cfg: Merged configuration dictionary.
+
+    Returns:
+        results: Dictionary containing all computed artefacts.
+
+    Raises:
+        ValueError:   If model_path or graph_path is not specified, or if
+                      no requested modality is present in the graph cache.
+        RuntimeError: If the model fails to load or run inference.
+    """
+    from loader.load_model import load_trained_model, load_graph_for_inference
 
     # ── Output directory ──────────────────────────────────────────────────────
     output_dir = Path(cfg["output"]["directory"])
@@ -253,14 +557,12 @@ def run(cfg: dict) -> dict:
 
     # ── Step 1: Load trained model ────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("步骤 1/7  加载训练模型")
+    logger.info("步骤 1/12  加载训练模型")
     model_path = cfg["model"].get("path")
     graph_path = cfg["model"].get("graph_path")
     # Resolve "auto" → "cuda" / "cpu" once here; propagate to all components.
     device = _resolve_device(cfg["model"].get("device", "auto"))
     _log_device_info(device)
-    # config_path: training config.yaml auto-detected from checkpoint directory,
-    # but can be overridden via cfg["model"]["config_path"]
     config_path = cfg["model"].get("config_path")
 
     if not model_path:
@@ -292,192 +594,69 @@ def run(cfg: dict) -> dict:
         k_cross_modal=k_cross_modal,
     )
 
-    # ── Step 2: Create simulator ──────────────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info("步骤 2/7  创建动力学模拟器")
-    modality = cfg["simulator"].get("modality", "fmri")
+    # ── Determine which modalities to run ─────────────────────────────────────
+    modality_cfg = cfg["simulator"].get("modality", "fmri")
+    available_modalities = list(base_graph.node_types)
 
-    simulator = BrainDynamicsSimulator(
-        model=twin,
-        base_graph=base_graph,
-        modality=modality,
-        fmri_subsample=cfg["simulator"].get("fmri_subsample", 25),
-        device=device,
-    )
+    if modality_cfg == "both":
+        modalities_to_run = [m for m in ["fmri", "eeg"] if m in available_modalities]
+        if not modalities_to_run:
+            raise ValueError(
+                f"modality='both' 指定，但图缓存中不含 fmri 或 eeg 节点。\n"
+                f"图缓存节点类型: {available_modalities}"
+            )
+        logger.info(
+            "modality='both'：将依次运行 %s（各自输出至 output_dir/<modality>/）",
+            modalities_to_run,
+        )
+    else:
+        if modality_cfg not in available_modalities:
+            raise ValueError(
+                f"请求的 modality='{modality_cfg}' 不在图缓存节点类型中。\n"
+                f"图缓存节点类型: {available_modalities}\n"
+                f"请检查 --graph 文件，或将 modality 改为 'both' 自动选择可用模态。"
+            )
+        modalities_to_run = [modality_cfg]
+
+    # ── Dispatch: single modality → flat result dict; both → nested dict ──────
+    if len(modalities_to_run) == 1:
+        # Backward-compatible: single flat results dict (no modality wrapper)
+        return _run_single_modality(
+            cfg=cfg,
+            twin=twin,
+            base_graph=base_graph,
+            modality=modalities_to_run[0],
+            output_dir=output_dir,
+            device=device,
+        )
+
+    # Both modalities: run sequentially, store under output_dir/{modality}/
+    all_results: dict = {}
+    for modality in modalities_to_run:
+        logger.info("=" * 60)
+        logger.info("◆ 开始 [%s] 模态完整分析", modality.upper())
+        mod_output_dir = output_dir / modality
+        mod_output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            all_results[modality] = _run_single_modality(
+                cfg=cfg,
+                twin=twin,
+                base_graph=base_graph,
+                modality=modality,
+                output_dir=mod_output_dir,
+                device=device,
+            )
+        except Exception as exc:
+            logger.error("  [%s] 模态分析异常终止: %s", modality.upper(), exc)
+            all_results[modality] = {"error": str(exc)}
+
+    logger.info("=" * 60)
     logger.info(
-        "  模式=TwinBrainDigitalTwin, modality=%s, n_regions=%d, dt=%.4f s",
-        simulator.modality,
-        simulator.n_regions,
-        simulator.dt,
+        "✓ 双模态分析全部完成！结果保存至: %s/{%s}",
+        output_dir.resolve(),
+        ", ".join(modalities_to_run),
     )
-
-    results: dict = {}
-
-    # ── Step 3: Free dynamics ─────────────────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info("步骤 3/10  自由动力学实验")
-    fd_cfg = cfg["free_dynamics"]
-    # Each rollout() injects a different random x0 into the LAST time step of the
-    # selected context window.  When base_graph has T > context_length, different
-    # historical windows are automatically used for different trajectories
-    # (trajectory i → window i % n_windows), giving truly diverse starting contexts.
-    trajectories = run_free_dynamics(
-        simulator=simulator,
-        n_init=fd_cfg.get("n_init", 10),
-        steps=fd_cfg.get("steps", 50),
-        seed=fd_cfg.get("seed", 42),
-        output_dir=output_dir if cfg["output"].get("save_trajectories") else None,
-        device=device,
-        n_temporal_windows=fd_cfg.get("n_temporal_windows", None),
-    )
-    results["trajectories"] = trajectories
-
-    # ── Step 4: Attractor analysis ────────────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info("步骤 4/10  吸引子分析")
-    att_cfg = cfg["attractor_analysis"]
-    attractor_results = run_attractor_analysis(
-        trajectories=trajectories,
-        tail_steps=att_cfg.get("tail_steps", 100),
-        k_candidates=att_cfg.get("k_candidates", [2, 3, 4, 5, 6]),
-        k_best=att_cfg.get("k_best", 3),
-        dbscan_eps=att_cfg.get("dbscan_eps", 0.5),
-        dbscan_min_samples=att_cfg.get("dbscan_min_samples", 5),
-        output_dir=output_dir if cfg["output"].get("save_attractors") else None,
-    )
-    results["attractor_results"] = attractor_results
-
-    # ── Step 5: Virtual stimulation ───────────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info("步骤 5/10  虚拟刺激实验")
-    vs_cfg = cfg["virtual_stimulation"]
-    # Clamp target nodes to the actual number of fMRI regions
-    all_target_nodes = vs_cfg.get("target_nodes", [0, 100])
-    target_nodes = [n for n in all_target_nodes if n < simulator.n_regions]
-    if not target_nodes:
-        logger.warning(
-            "所有目标节点索引超出范围（n_regions=%d），使用节点 0。",
-            simulator.n_regions,
-        )
-        target_nodes = [0]
-
-    stim_results = run_virtual_stimulation(
-        simulator=simulator,
-        target_nodes=target_nodes,
-        amplitude=vs_cfg.get("amplitude", 0.5),
-        frequency=vs_cfg.get("frequency", 10.0),
-        stim_steps=vs_cfg.get("duration", 30),
-        pre_steps=vs_cfg.get("pre_steps", 10),
-        post_steps=vs_cfg.get("post_steps", 20),
-        patterns=vs_cfg.get("patterns", ["sine"]),
-        output_dir=output_dir,
-    )
-    results["stimulation_results"] = stim_results
-
-    # ── Step 6: Response matrix ───────────────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info("步骤 6/13  响应矩阵计算")
-    rm_cfg = cfg["response_matrix"]
-    n_nodes_rm = min(
-        rm_cfg.get("n_nodes", simulator.n_regions), simulator.n_regions
-    )
-    response_matrix = compute_response_matrix(
-        simulator=simulator,
-        n_nodes=n_nodes_rm,
-        stim_amplitude=rm_cfg.get("stim_amplitude", 0.5),
-        output_dir=output_dir if cfg["output"].get("save_response_matrix") else None,
-    )
-    results["response_matrix"] = response_matrix
-
-    # ── Step 7: Stability analysis ────────────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info("步骤 7/13  稳定性分析")
-    sa_cfg = cfg["stability_analysis"]
-    stability_summary = run_stability_analysis(
-        trajectories=trajectories,
-        convergence_tol=sa_cfg.get("convergence_tol", 1e-4),
-        period_max_lag=sa_cfg.get("period_max_lag", 100),
-        delay_dt=sa_cfg.get("delay_dt", 50),
-        output_dir=output_dir if cfg["output"].get("save_stability_metrics") else None,
-    )
-    results["stability_summary"] = stability_summary
-
-    # ── Step 8: Trajectory convergence ───────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info("步骤 8/13  轨迹收敛分析")
-    tc_cfg = cfg.get("trajectory_convergence", {})
-    if tc_cfg.get("enabled", True):
-        tc_results = run_trajectory_convergence(
-            trajectories=trajectories,
-            n_pairs=tc_cfg.get("n_pairs", 50),
-            seed=cfg["free_dynamics"].get("seed", 42),
-            output_dir=output_dir if cfg["output"].get("save_trajectories") else None,
-        )
-        results["trajectory_convergence"] = tc_results
-    else:
-        logger.info("  轨迹收敛分析已禁用，跳过。")
-
-    # ── Step 9: Lyapunov exponent ─────────────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info("步骤 9/13  Lyapunov 指数估计（Wolf-Benettin 重归一化法）")
-    lya_cfg = cfg.get("lyapunov", {})
-    if lya_cfg.get("enabled", True):
-        try:
-            lyapunov_results = run_lyapunov_analysis(
-                trajectories=trajectories,
-                simulator=simulator,
-                epsilon=lya_cfg.get("epsilon", 1e-6),
-                renorm_steps=lya_cfg.get("renorm_steps", 50),
-                skip_fraction=lya_cfg.get("skip_fraction", 0.1),
-                method=lya_cfg.get("method", "both"),
-                convergence_result=results.get("trajectory_convergence"),
-                convergence_threshold=lya_cfg.get("convergence_threshold", 0.01),
-                n_segments=lya_cfg.get("n_segments", 3),
-                rosenstein_max_lag=lya_cfg.get("rosenstein_max_lag", 50),
-                rosenstein_min_sep=lya_cfg.get("rosenstein_min_sep", 20),
-                output_dir=output_dir,
-            )
-            results["lyapunov"] = lyapunov_results
-            regime = lyapunov_results["chaos_regime"]["regime"]
-            interp = lyapunov_results["chaos_regime"]["interpretation_zh"]
-            logger.info("  混沌评估: [%s] %s", regime.upper(), interp)
-        except Exception as exc:
-            logger.warning("  Lyapunov 分析失败 (%s)，跳过。", exc)
-    else:
-        logger.info("  Lyapunov 分析已禁用，跳过。")
-
-    # ── Step 10: Random model comparison ─────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info("步骤 10/13  随机模型对照实验")
-    rc_cfg = cfg.get("random_comparison", {})
-    if rc_cfg.get("enabled", True):
-        try:
-            comparison = run_random_model_comparison(
-                trajectories=trajectories,
-                attractor_results=attractor_results,
-                lyapunov_results=results.get("lyapunov"),
-                response_matrix=response_matrix,
-                random_n_init=rc_cfg.get("n_init", 200),
-                random_steps=rc_cfg.get("steps", 1000),
-                spectral_radius=rc_cfg.get("spectral_radius", 0.9),
-                spectral_radii=rc_cfg.get("spectral_radii", None),
-                n_seeds=rc_cfg.get("n_seeds", 5),
-                seed=cfg["free_dynamics"].get("seed", 42),
-                output_dir=output_dir,
-            )
-            results["random_comparison"] = comparison
-        except Exception as exc:
-            logger.warning("  随机模型对照实验失败 (%s)，跳过。", exc)
-    else:
-        logger.info("  随机模型对照实验已禁用，跳过。")
-
-    # ── Visualisations ────────────────────────────────────────────────────────
-    if cfg["output"].get("save_plots"):
-        _save_plots(results, output_dir, simulator)
-
-    logger.info("=" * 60)
-    logger.info("✓ 动力系统分析全部完成（10 步）！结果保存至: %s", output_dir.resolve())
-    return results
+    return all_results
 
 
 def _save_plots(results: dict, output_dir: Path, simulator) -> None:
@@ -646,8 +825,8 @@ def _parse_args() -> argparse.Namespace:
         "--modality",
         type=str,
         default=None,
-        choices=["fmri", "eeg"],
-        help="分析模态（默认 fmri）",
+        choices=["fmri", "eeg", "both"],
+        help="分析模态：fmri / eeg / both（both 同时运行两种模态，输出至各自子目录）",
     )
     parser.add_argument(
         "--no-plots",
