@@ -137,13 +137,45 @@ def run_free_dynamics(
     if eff_windows > 1:
         ctx_len = simulator._get_context_length()
         stride = max(1, ctx_len // 4)
-        logger.info(
-            "  时序窗口: 使用 %d 个滑窗上下文"
-            "（context_length=%d，stride=%d，%.0f%% 重叠；"
-            "轨迹 i → 窗口 i %% %d）。\n"
-            "  每条轨迹从真正不同的历史时段出发，有效缓解上下文稀释效应。",
-            eff_windows, ctx_len, stride, (1 - stride / ctx_len) * 100, eff_windows,
+        _nt = simulator.modality if simulator.modality != "joint" else "fmri"
+        _T_primary = (
+            int(simulator.base_graph[_nt].x.shape[1])
+            if _nt in simulator.base_graph.node_types
+            and hasattr(simulator.base_graph[_nt], "x")
+            else 0
         )
+        if _T_primary <= ctx_len:
+            # Fallback path: prediction_steps-based stride gave us multiple
+            # shorter-context windows.  Each window uses a different-length
+            # initial context (window k starts with T - k*stride timesteps).
+            logger.info(
+                "  时序窗口: 使用 %d 个变长上下文窗口（回退模式）。\n"
+                "  主模态 '%s' 时序 T=%d ≤ context_length=%d，"
+                "使用 prediction_steps 步幅提取多个较短初始上下文：\n"
+                "    窗口 0 → %d 步上下文（最完整）\n"
+                "    窗口 1 → %d 步上下文\n"
+                "    …\n"
+                "    窗口 %d → %d 步上下文（最短）\n"
+                "  初始上下文质量随窗口编号递减，但在约 %d 步后自回归预测会"
+                "补充到完整 context_length 步，对长轨迹（steps=%d）影响极小。\n"
+                "  轨迹 i → 窗口 i %% %d。",
+                eff_windows,
+                _nt, _T_primary, ctx_len,
+                _T_primary,
+                max(0, _T_primary - stride),
+                eff_windows - 1, max(0, _T_primary - (eff_windows - 1) * stride),
+                ctx_len,
+                steps,
+                eff_windows,
+            )
+        else:
+            logger.info(
+                "  时序窗口: 使用 %d 个滑窗上下文"
+                "（context_length=%d，stride=%d，%.0f%% 重叠；"
+                "轨迹 i → 窗口 i %% %d）。\n"
+                "  每条轨迹从真正不同的历史时段出发，有效缓解上下文稀释效应。",
+                eff_windows, ctx_len, stride, (1 - stride / ctx_len) * 100, eff_windows,
+            )
     else:
         ctx_len = simulator._get_context_length()
         stride = max(1, ctx_len // 4)
@@ -158,10 +190,13 @@ def run_free_dynamics(
         logger.info(
             "  时序窗口: 仅使用 1 个上下文窗口"
             "（主模态 '%s' 时序 T=%d，context_length=%d，stride=%d）。\n"
-            "  要启用第 2 个窗口，需要 T > context_length + stride = %d。\n"
-            "  当前多样性来源: %d 个不同随机初始状态 Uniform[0,1]^%d。",
-            _nt, _T_primary, ctx_len, stride, ctx_len + stride,
+            "  当前多样性来源: %d 个不同随机初始状态 Uniform[0,1]^%d。\n"
+            "  若 context_length（%d）远大于模型实际所需，请检查 config.yaml 中\n"
+            "  v5_optimization.advanced_prediction.context_length 是否与\n"
+            "  训练时一致（当前从 predictor.context_length=%d 读取）。",
+            _nt, _T_primary, ctx_len, stride,
             n_init, n_regions,
+            ctx_len, ctx_len,
         )
 
     trajectories = np.empty((n_init, steps, n_regions), dtype=np.float32)

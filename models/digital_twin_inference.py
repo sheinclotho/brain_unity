@@ -239,7 +239,22 @@ class TwinBrainDigitalTwin:
         # under strict=False → those tensors are silently skipped).
         model_cfg = (config or {}).get("model", {})
         prediction_steps: int = model_cfg.get("prediction_steps", 10)
+        # predictor_config may live under two different keys depending on which
+        # version of config.yaml was used:
+        #   • config['model']['predictor_config']  — legacy / explicit path
+        #   • config['v5_optimization']['advanced_prediction']  — standard training path
+        # Try the legacy path first; fall back to the training path if not found.
         predictor_config: Optional[Dict] = model_cfg.get("predictor_config", None)
+        if predictor_config is None:
+            predictor_config = (config or {}).get("v5_optimization", {}).get(
+                "advanced_prediction", None
+            )
+            if predictor_config is not None:
+                logger.info(
+                    "  predictor_config 读取自 v5_optimization.advanced_prediction "
+                    "(context_length=%s)",
+                    predictor_config.get("context_length", "default"),
+                )
         use_prediction: bool = bool(model_cfg.get("use_prediction", True))
         num_decoder_layers: int = model_cfg.get("num_decoder_layers", 3)
         dropout: float = float(model_cfg.get("dropout", 0.1))
