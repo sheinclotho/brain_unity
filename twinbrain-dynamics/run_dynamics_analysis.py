@@ -137,7 +137,7 @@ _DEFAULTS = {
     },
     # Steps here mean fMRI prediction steps (not EEG samples).
     # With prediction_steps=50 (TR=2s), steps=50 → 100s of future prediction.
-    "free_dynamics": {"n_init": 10, "steps": 50, "seed": 42},
+    "free_dynamics": {"n_init": 10, "steps": 50, "seed": 42, "n_temporal_windows": None},
     "attractor_analysis": {
         "tail_steps": 10,
         "k_candidates": [2, 3, 4, 5, 6],
@@ -318,9 +318,9 @@ def run(cfg: dict) -> dict:
     logger.info("步骤 3/10  自由动力学实验")
     fd_cfg = cfg["free_dynamics"]
     # Each rollout() injects a different random x0 into the LAST time step of the
-    # base_graph context.  The preceding (context_length − 1) steps are shared.
-    # The resulting trajectory diversity depends on how strongly the model responds
-    # to the last-step perturbation vs the shared context history.
+    # selected context window.  When base_graph has T > context_length, different
+    # historical windows are automatically used for different trajectories
+    # (trajectory i → window i % n_windows), giving truly diverse starting contexts.
     trajectories = run_free_dynamics(
         simulator=simulator,
         n_init=fd_cfg.get("n_init", 10),
@@ -328,6 +328,7 @@ def run(cfg: dict) -> dict:
         seed=fd_cfg.get("seed", 42),
         output_dir=output_dir if cfg["output"].get("save_trajectories") else None,
         device=device,
+        n_temporal_windows=fd_cfg.get("n_temporal_windows", None),
     )
     results["trajectories"] = trajectories
 

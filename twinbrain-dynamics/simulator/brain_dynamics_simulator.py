@@ -300,6 +300,7 @@ class BrainDynamicsSimulator:
         x0: Optional[np.ndarray] = None,
         steps: int = 50,
         stimulus: Optional[Stimulus] = None,
+        context_window_idx: int = 0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         连续动力学模拟（TwinBrainDigitalTwin 自回归预测）。
@@ -308,19 +309,34 @@ class BrainDynamicsSimulator:
             若提供 ``x0``，它将被写入初始上下文的最后一个时间步，覆盖图缓存中
             对应模态的原始数值。这样不同的 ``x0`` 会产生不同的初始脑状态，使
             ``run_free_dynamics`` 中的多条轨迹真正从不同位置出发（计划书 §五）。
-            注意：上下文窗口其余 context_length-1 步来自 base_graph，由所有轨迹共享。
+
+        ``context_window_idx`` 时序窗口机制：
+            选择从 ``base_graph`` 时间序列的哪个历史窗口作为初始上下文。
+            当 ``base_graph[modality].x`` 的时间维度 ``T > context_length`` 时，
+            可使用不同的历史片段为不同轨迹提供真正不同的上下文，从而提升
+            轨迹多样性（解决所有轨迹共享同一历史导致的 Wolf 上下文稀释问题）。
+
+              context_window_idx=0 → 最近 context_length 步（默认行为）
+              context_window_idx=1 → 倒数第二个 context_length 步
+              context_window_idx=k → x[:, -(k+1)*L:-k*L, :] （L=context_length）
+
+            可用窗口数通过 ``simulator.n_temporal_windows`` 属性查询。
 
         Args:
-            x0:       初始脑状态，shape (n_regions,)。
-                      注入为初始上下文最后一步（可选，默认保留图缓存数据）。
-            steps:    模拟步数（fMRI TR 数）。
-            stimulus: 刺激对象（实现 Stimulus.value(t)）；None → 自由演化。
+            x0:                 初始脑状态，shape (n_regions,)。
+                                注入为初始上下文最后一步（可选）。
+            steps:              模拟步数（fMRI TR 数）。
+            stimulus:           刺激对象（实现 Stimulus.value(t)）；None → 自由演化。
+            context_window_idx: 选择哪个时序窗口作为初始上下文（默认 0 = 最近窗口）。
 
         Returns:
             trajectory: shape (steps, n_regions)，每步的脑状态。
             times:      shape (steps,)，以秒为单位的时间轴。
         """
-        return self._rollout_with_twin(steps=steps, stimulus=stimulus, x0=x0)
+        return self._rollout_with_twin(
+            steps=steps, stimulus=stimulus, x0=x0,
+            context_window_idx=context_window_idx,
+        )
 
     def rollout_multi_stim(
         self,
@@ -469,6 +485,98 @@ class BrainDynamicsSimulator:
 
     # ── Private helpers ─────────────────────────────────────────────────────────
 
+    def _get_context_length(self) -> int:
+        """Return the predictor's context_length (defaults to 200 if not found).
+
+        200 is the standard context_length for the EnhancedMultiStepPredictor
+        in TwinBrain V5 (see API.md §4.3 and training config model.context_length).
+        Using it as the fallback keeps behaviour identical to the previous hard-coded
+        ``_trim_context`` logic, which also defaulted to 200.
+        """
+        _predictor = getattr(getattr(self.model, "model", None), "predictor", None)
+        return int(getattr(_predictor, "context_length", 200))
+
+    @property
+    def n_temporal_windows(self) -> int:
+        """
+        Number of non-overlapping ``context_length``-step windows available in
+        ``base_graph``.
+
+        Each window is a distinct historical segment of the stored fMRI/EEG time
+        series.  Using different windows as initial contexts gives trajectories
+        genuinely different histories (not just different last-step injections),
+        which resolves the Wolf context-dilution bias where all trajectories share
+        ``context_length − 1`` identical history steps.
+
+        Computed as ``min(T_nt // context_length)`` across all node types with a
+        temporal ``.x`` attribute.  Returns at least 1.
+
+        Example:
+            base_graph['fmri'].x has T=400, context_length=200
+            → n_temporal_windows = 2  (windows 0 and 1)
+        """
+        ctx_len = self._get_context_length()
+        min_windows = float("inf")
+        for nt in self.base_graph.node_types:
+            if not hasattr(self.base_graph[nt], "x"):
+                continue
+            T = int(self.base_graph[nt].x.shape[1])
+            min_windows = min(min_windows, T // ctx_len)
+        # Guard against float("inf") before int() conversion (no node types had .x)
+        if min_windows == float("inf"):
+            return 1
+        return max(1, int(min_windows))
+
+    def _get_context_for_window(self, window_idx: int = 0) -> HeteroData:
+        """
+        Return a cloned HeteroData using the specified temporal window as context.
+
+        Selects a ``context_length``-step slice from each node type's time series,
+        counting backwards from the end of ``base_graph``:
+
+          window_idx = 0  →  x[:, T-L:T, :]          (most recent, default)
+          window_idx = 1  →  x[:, T-2L:T-L, :]
+          window_idx = k  →  x[:, T-(k+1)L:T-kL, :]  (L = context_length)
+
+        When ``window_idx`` exceeds the available history for a node type, the
+        earliest feasible ``context_length``-step slice is used instead of raising
+        an error (graceful degradation).
+
+        Args:
+            window_idx: Non-negative integer selecting which historical window to
+                        use (0 = most recent = current default behaviour).
+
+        Returns:
+            Cloned ``HeteroData`` with every node type's ``.x`` set to the
+            requested window, ready for ``_inject_x0_into_context``.
+        """
+        ctx_len = self._get_context_length()
+        context = _clone_hetero_graph(self.base_graph)
+
+        for nt in list(context.node_types):
+            if not hasattr(context[nt], "x"):
+                continue
+            nt_x = context[nt].x   # [N, T, C]
+            T = int(nt_x.shape[1])
+            # Count backward from the end:
+            #   window 0 → [T-L:T], window 1 → [T-2L:T-L], ...
+            end = T - window_idx * ctx_len
+            start = end - ctx_len
+            if start < 0 or end <= 0:
+                # Requested window extends before the start of the recording;
+                # fall back to the oldest full-length window available.
+                start = 0
+                end = min(ctx_len, T)
+                if window_idx > 0:
+                    logger.debug(
+                        "_get_context_for_window: '%s' T=%d, window_idx=%d is "
+                        "out of range (need T≥%d); using earliest window [0:%d].",
+                        nt, T, window_idx, (window_idx + 1) * ctx_len, end,
+                    )
+            context[nt].x = nt_x[:, start:end, :]
+
+        return context
+
     def _trim_context(self, context: HeteroData) -> HeteroData:
         """
         Trim **all** modalities in ``context`` to ``predictor.context_length`` timesteps.
@@ -578,43 +686,28 @@ class BrainDynamicsSimulator:
         steps: int,
         stimulus: Optional[Stimulus],
         x0: Optional[np.ndarray] = None,
+        context_window_idx: int = 0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Autoregressive rollout using TwinBrainDigitalTwin.
 
         Initialization (计划书 §四/§十三):
-            The base_graph is used **once** as the initial context.  All modalities
-            are trimmed to ``context_length`` timesteps (see ``_trim_context``),
-            capping peak encoder activation memory at O(context_length × N × H)
-            regardless of the original EEG sequence length.
+            ``_get_context_for_window(context_window_idx)`` selects the initial
+            context window from ``base_graph``.  ``window_idx=0`` reproduces the
+            original behaviour (last ``context_length`` steps).  Higher indices
+            select earlier historical segments, giving each trajectory a genuinely
+            different context history.  This resolves the Wolf context-dilution
+            bias where all trajectories shared the same ``context_length − 1``
+            history steps (see AGENTS.md §Wolf上下文稀释).
 
             If ``x0`` is provided, it is injected into the last time step of the
-            primary modality's context, overriding the graph-cache values.  This
-            lets ``run_free_dynamics`` start 200 trajectories from 200 genuinely
-            different brain states (计划书 §五: ``x0 = sample_random_state()``).
-
-        Self-iteration:
-            After each ``predict_future()`` call, **all** modalities present in
-            ``pred_dict`` are advanced together via ``_advance_context``.  This
-            keeps every modality's context window temporally aligned and ensures
-            the EEG context does not fall behind the fMRI context over long rollouts.
-
-        Stimulus handling:
-            When a stimulus is active in a chunk, ``simulate_intervention()`` is
-            called; its ``perturbed`` dict is used both for trajectory recording
-            and context advancement.
-
-        Memory (8 GB GPU):
-            After ``_trim_context``, every ``predict_future`` call encodes
-            context of shape ``[N, context_length, C]`` per modality.
-            Example: context_length=200, N_eeg=63, H=128 →
-            peak EEG activation ≈ 12.9 MB (vs 6.34 GB before the fix).
+            selected context window.
         """
         chunk_size: int = getattr(getattr(self.model, "model", None), "prediction_steps", 50)
 
-        # Clone base_graph and trim ALL modalities to context_length.
-        # This is the key memory fix: EEG goes from T=98500 to T=context_length.
-        context = self._trim_context(_clone_hetero_graph(self.base_graph))
+        # Select the requested temporal window from base_graph.
+        # window_idx=0 reproduces the previous _trim_context behaviour exactly.
+        context = self._get_context_for_window(context_window_idx)
 
         # Inject x0 as the "current brain state" (last time step override).
         # This ensures 200 rollouts start from 200 different initial conditions.
