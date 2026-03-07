@@ -509,3 +509,32 @@ r ≈ 0 的两个神经生物学合理原因：
 - **规则**: `n_temporal_windows` 始终基于主模态 T 和 stride 计算；次要模态窗口回退不影响计数；joint 模式使用双模态最小 T。
 
 *Last updated: 2026-03-07*
+
+### [2026-03-07] 响应矩阵纯对角线 Bug — load_graph_for_inference 缺少同模态边重建
+
+#### 根因
+- **问题**: 第六步（响应矩阵）生成 y=x 对角线图，即刺激区域 i 只影响区域 i 本身，对其它任何区域均无传播效应。
+- **根因**: V5 图缓存（`outputs/graph_cache/*.pt`）**只存储节点特征**（`fmri.x`/`eeg.x`），不含任何边。`load_graph_for_inference` 旧版只添加跨模态边（`eeg → fmri`），**从未添加同模态边**（`fmri 'connects' fmri`）。
+- **连锁效应**: 
+  1. `GraphNativeBrainEncoder` 对 `edge_type in edge_index_dict` 的判断失败 → 每层图卷积的 `messages` 列表为空 → 返回 `x`（passthrough）→ 编码器退化为纯时序模型（仅 Conv1d + attention）。
+  2. `GraphPredictionPropagator` 同样无边 → passthrough → 刺激节点 i 的潜空间扰动经 predictor 传播后，在 propagator 阶段无法扩散到邻居节点。
+  3. `causal_effect[j] = sig_perturbed[j] - sig_baseline[j] ≈ 0` 对所有 j≠i → 完美对角线矩阵。
+- **旧 docstring 错误**: "只存储同模态边" — 实为"只存储节点特征（不含任何边）"。
+
+#### 修复
+- **`load_graph_for_inference`**（`twinbrain-dynamics/loader/load_model.py`）：
+  - 导入 `GraphNativeBrainMapper` 一次，供所有边重建步骤共用。
+  - 对每个存在于缓存中的模态（`fmri`/`eeg`），从其时序特征重建同模态 FC 边：
+    - fMRI：`_compute_correlation_gpu(ts)` → `build_graph_structure(threshold=0.3, k_nearest=20)`
+    - EEG：`_compute_eeg_connectivity(ts)` → `build_graph_structure(threshold=0.2, k_nearest=10)`
+  - 若缓存中已有有效边（`edge_index.shape[1] > 0`），保留原值，不覆盖。
+  - 边重建失败时 log WARNING 并继续（服务器不崩溃），fallback 行为在日志中明确说明。
+  - 跨模态边重建逻辑不变（放在同模态边之后）。
+  - docstring 更新：说明 V5 缓存只含节点特征、边均需重建，并解释不重建的后果（对角线）。
+
+#### 规则
+- `load_graph_for_inference` 调用后，`graph.edge_types` 必须包含 `('fmri', 'connects', 'fmri')`（若 fMRI 存在）和 `('eeg', 'connects', 'eeg')`（若 EEG 存在）。
+- 任何需要完整图结构的分析（响应矩阵、动力学分析、EC 推断）都必须通过 `load_graph_for_inference` 加载图，而不是直接 `torch.load`。
+- 若直接 `torch.load` 后发现响应矩阵退化为对角线，立即检查 `graph.edge_types` 是否缺少同模态边。
+
+*Last updated: 2026-03-07*
