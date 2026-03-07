@@ -553,10 +553,20 @@ def _save_plots(results: dict, output_dir: Path, simulator) -> None:
             save_path=plots_dir / "lyapunov_histogram.png",
         )
         if len(lya_results.get("log_growth_curve", [])) > 0:
+            # Use the best (unbiased) LLE estimate for the plot annotation.
+            # When Wolf bias is detected, Rosenstein is the primary estimate;
+            # using the biased Wolf mean would mis-label the chart.
+            wolf_biased = lya_results.get("wolf_bias_warning", False)
+            rosen_val   = lya_results.get("mean_rosenstein")
+            best_lle = (
+                float(rosen_val)
+                if (wolf_biased and rosen_val is not None and np.isfinite(float(rosen_val)))
+                else float(lya_results["mean_lyapunov"])
+            )
             plot_lyapunov_growth(
                 lya_results["log_growth_curve"],
                 renorm_steps=lya_results.get("renorm_steps", 20),
-                mean_lle=lya_results["mean_lyapunov"],
+                mean_lle=best_lle,
                 chaos_regime=lya_results["chaos_regime"]["regime"],
                 save_path=plots_dir / "lyapunov_growth.png",
             )

@@ -220,12 +220,39 @@ def _compute_summary_stats(
         else None
     )
 
-    # Mean Lyapunov exponent
-    mean_lyapunov = (
-        float(lyapunov_results["mean_lyapunov"])
-        if lyapunov_results is not None
-        else None
-    )
+    # Mean Lyapunov exponent — prefer Rosenstein over Wolf when bias is detected.
+    #
+    # When Wolf bias is detected (wolf_bias_warning=True), the Wolf mean LLE is
+    # systematically wrong for twin mode (context-dilution effect: perturbation
+    # injected only at the last context step is diluted by the L-1 identical
+    # history steps, making all trajectories appear to converge at the same rate
+    # regardless of their starting state).  The Rosenstein method works directly
+    # on the trajectory data and is unaffected by this bias.
+    #
+    # Using the biased Wolf value in the comparison note would produce an
+    # incorrect conclusion — e.g., the log showed:
+    #   Wolf mean  = -0.05589  (biased, all 200 trajectories gave same value)
+    #   Rosenstein = +0.01228  (unbiased, weakly chaotic)
+    # Using Wolf gave: "real model is between stable and chaotic"
+    # Using Rosenstein gives the correct: "real model is weakly chaotic"
+    mean_lyapunov = None
+    mean_lyapunov_source = None
+    if lyapunov_results is not None:
+        bias_detected = lyapunov_results.get("wolf_bias_warning", False)
+        rosen = lyapunov_results.get("mean_rosenstein")
+        if bias_detected and rosen is not None and np.isfinite(float(rosen)):
+            mean_lyapunov = float(rosen)
+            mean_lyapunov_source = "rosenstein"
+        else:
+            mean_lyapunov = float(lyapunov_results["mean_lyapunov"])
+            mean_lyapunov_source = "wolf"
+        if bias_detected:
+            wolf_val = float(lyapunov_results["mean_lyapunov"])
+            logger.info(
+                "  随机对照: Wolf 偏差已检测。使用 Rosenstein LLE=%.5f "
+                "（Wolf 偏差值 %.5f 已弃用）作为真实模型 LLE。",
+                mean_lyapunov, wolf_val,
+            )
 
     # Response matrix Frobenius norm
     rm_norm = (
@@ -234,12 +261,15 @@ def _compute_summary_stats(
         else None
     )
 
-    return {
+    stats = {
         "n_attractors": n_attractors,
         "mean_lyapunov": mean_lyapunov,
         "trajectory_variance": traj_var,
         "response_matrix_norm": rm_norm,
     }
+    if mean_lyapunov_source is not None:
+        stats["mean_lyapunov_source"] = mean_lyapunov_source
+    return stats
 
 
 def _random_lle_multi_seed(
@@ -415,6 +445,7 @@ def run_random_model_comparison(
 
     # Summary note: where does the real model sit?
     real_lle = model_stats.get("mean_lyapunov")
+    real_lle_source = model_stats.get("mean_lyapunov_source", "wolf")
     if real_lle is not None:
         stable_lles = [
             v["mean_lyapunov"]
@@ -428,15 +459,24 @@ def run_random_model_comparison(
             if k.startswith("random_sr") and isinstance(v, dict)
             and v.get("spectral_radius", 0) > 1.0
         ]
+        source_label = f"({real_lle_source.capitalize()} LLE)" if real_lle_source != "wolf" else ""
         if stable_lles and chaotic_lles:
+            mean_chaotic = np.mean(chaotic_lles)
+            mean_stable  = np.mean(stable_lles)
+            if real_lle < mean_stable:
+                position = "比随机稳定基线更稳定"
+            elif real_lle < mean_chaotic:
+                position = "介于稳定与混沌之间"
+            else:
+                position = "与随机混沌系统相当（弱混沌或以上）"
             note = (
-                f"真实模型 LLE={real_lle:.5f}。"
-                f"随机稳定基线(ρ<1) LLE≈{np.mean(stable_lles):.5f}，"
-                f"随机混沌基线(ρ>1) LLE≈{np.mean(chaotic_lles):.5f}。"
-                f"真实模型{'更稳定' if real_lle < np.mean(stable_lles) else '介于稳定与混沌之间' if real_lle < np.mean(chaotic_lles) else '与随机混沌相当'}于随机基线。"
+                f"真实模型 LLE={real_lle:.5f}{source_label}。"
+                f"随机稳定基线(ρ<1) LLE≈{mean_stable:.5f}，"
+                f"随机混沌基线(ρ>1) LLE≈{mean_chaotic:.5f}。"
+                f"真实模型{position}于随机基线。"
             )
         else:
-            note = f"真实模型 LLE={real_lle:.5f}。"
+            note = f"真实模型 LLE={real_lle:.5f}{source_label}。"
         comparison["chaos_boundary_note"] = note
         logger.info("  %s", note)
 
