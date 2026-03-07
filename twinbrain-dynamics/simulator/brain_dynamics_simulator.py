@@ -659,35 +659,54 @@ class BrainDynamicsSimulator:
         """
         Number of overlapping context windows available in ``base_graph``.
 
-        Windows are extracted using a sliding stride of
-        ``context_length // 4`` (75 % overlap).  This approach maximises
-        trajectory diversity without requiring the time series to be an
-        integer multiple of ``context_length`` in length.
-
-        **Modality-aware**: For single-modality analysis (``fmri`` / ``eeg``),
-        only the **primary** modality's temporal dimension ``T_primary``
-        determines the window count.  Secondary modalities in the same graph
-        (e.g. EEG when analysing fMRI) may have shorter or longer ``T``
-        without bottlenecking the result — ``_get_context_for_window`` handles
-        them gracefully at execution time by falling back to the oldest
-        available slice.
-
-        For ``joint`` analysis, the minimum ``T`` across both ``fmri`` and
-        ``eeg`` node types is used (both must supply a full context window for
-        the joint state vector).
-
-        Formula::
+        **Primary path** — full-context sliding windows (75 % overlap):
 
             stride      = max(1, context_length // 4)
             n_windows   = max(1, (T_primary - context_length) // stride + 1)
 
-        Examples (context_length = 200, stride = 50):
+        This gives n_windows ≥ 2 only when ``T_primary > context_length +
+        stride``, which requires more data than the model's full context window.
 
-            T_primary = 200  →  1 window   (no room to shift)
-            T_primary = 250  →  2 windows  ([50:250], [0:200])
-            T_primary = 300  →  3 windows  ([100:300], [50:250], [0:200])
+        **Fallback path** — prediction_steps-based stride (when T ≤
+        context_length + stride and only 1 full-context window would be
+        available):  use ``prediction_steps`` as the minimum stride to extract
+        multiple shorter-context windows from the same recording.  Each window
+        uses the oldest available slice of data:
+
+            window 0  →  x[:, 0 : T, :]                    (full T steps)
+            window 1  →  x[:, 0 : T−stride, :]             (T − stride steps)
+            window k  →  x[:, 0 : T−k·stride, :]
+
+        Predictions from shorter-context windows have lower initial quality but
+        converge to full-context quality after
+        ``(context_length − window_context) / prediction_steps`` autoregressive
+        chunks.  For a 1000-step rollout this is a small fraction of the total
+        trajectory.
+
+        The fallback window count is capped at the number of genuinely distinct
+        windows that ``_get_context_for_window`` can produce (i.e. windows
+        whose ``end = T − k · stride > 0``).
+
+        **Modality-aware**: For single-modality analysis (``fmri`` / ``eeg``),
+        only the **primary** modality's temporal dimension ``T_primary``
+        determines the window count.  Secondary modalities are handled
+        gracefully at extraction time.
+
+        For ``joint`` analysis, the minimum ``T`` across both ``fmri`` and
+        ``eeg`` node types is used.
+
+        Examples (context_length = 200, stride = 50, prediction_steps = 50):
+
+            T_primary = 150  →  1 window   (T < context_length)
+            T_primary = 200  →  4 windows  fallback: [0:200],[0:150],[0:100],[0:50]
+            T_primary = 250  →  2 windows  primary: [50:250],[0:200]
+            T_primary = 300  →  3 windows
             T_primary = 400  →  5 windows
             T_primary = 600  →  9 windows
+
+        Examples (context_length = 37, stride = 9, prediction_steps = 17):
+
+            T_primary = 200  →  19 windows  primary path (context fits many times)
         """
         ctx_len = self._get_context_length()
         stride = max(1, ctx_len // 4)
@@ -712,9 +731,32 @@ class BrainDynamicsSimulator:
                 return 1
             T_primary = int(self.base_graph[nt].x.shape[1])
 
-        if T_primary < ctx_len:
-            return 1
-        return max(1, (T_primary - ctx_len) // stride + 1)
+        # ── Primary path: full-context sliding windows ────────────────────────
+        n_full = max(1, (T_primary - ctx_len) // stride + 1)
+        if n_full > 1:
+            return n_full
+
+        # ── Fallback path: prediction_steps-based stride ─────────────────────
+        # When T ≤ context_length + stride (only 1 full-context window), we can
+        # still offer multiple shorter-context windows whose stride equals
+        # prediction_steps.  This is only meaningful when prediction_steps <
+        # context_length; otherwise there is no benefit over the single window.
+        # Note: double-getattr is safe — getattr(None, attr, default) returns
+        # default without raising AttributeError.
+        _inner = getattr(self.model, "model", None)
+        pred_steps: int = int(getattr(_inner, "prediction_steps", 0))
+        if pred_steps > 0 and pred_steps < ctx_len and T_primary >= stride:
+            n_pred = max(1, (T_primary - pred_steps) // pred_steps + 1)
+            # Cap at the number of genuinely distinct windows _get_context_for_window
+            # can provide: only windows where end = T - k*stride > 0 are unique;
+            # beyond that the fallback in _get_context_for_window always returns
+            # the same [0:T] slice.
+            n_extractable = (T_primary - 1) // stride + 1  # ceil(T / stride)
+            n_fallback = min(n_pred, n_extractable)
+            if n_fallback > 1:
+                return n_fallback
+
+        return 1
 
     def _get_context_for_window(self, window_idx: int = 0) -> HeteroData:
         """

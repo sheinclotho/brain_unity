@@ -1967,5 +1967,227 @@ class TestLyapunovConvergenceFirst(unittest.TestCase):
             self.assertTrue(report["skipped_wolf"])
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# n_temporal_windows: prediction_steps fallback when T ≤ context_length
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNTemporalWindowsFallback(unittest.TestCase):
+    """
+    Tests for the prediction_steps-based fallback in n_temporal_windows.
+
+    When T_primary ≤ context_length + stride (only 1 full-context window is
+    available), n_temporal_windows should fall back to prediction_steps as the
+    stride and return multiple shorter-context windows instead of just 1.
+    """
+
+    def setUp(self):
+        _models_dir = Path(__file__).parent.parent / "models"
+        if str(_models_dir.parent) not in sys.path:
+            sys.path.insert(0, str(_models_dir.parent))
+
+    def _make_sim(self, T_base: int, context_length: int, pred_steps: int):
+        """Build a BrainDynamicsSimulator with given T, context_length, pred_steps."""
+        from models.graph_native_system import GraphNativeBrainModel
+        from models.digital_twin_inference import TwinBrainDigitalTwin
+        from torch_geometric.data import HeteroData
+
+        H = 16
+        model = GraphNativeBrainModel(
+            node_types=["fmri"],
+            edge_types=[("fmri", "connects", "fmri")],
+            in_channels_dict={"fmri": 1},
+            hidden_channels=H,
+            prediction_steps=pred_steps,
+            predictor_config={"context_length": context_length},
+        )
+        model.eval()
+        twin = TwinBrainDigitalTwin(model=model, device="cpu")
+        g = HeteroData()
+        g["fmri"].x = torch.randn(N, T_base, 1)
+        g["fmri", "connects", "fmri"].edge_index = torch.zeros(2, 0, dtype=torch.long)
+        return BrainDynamicsSimulator(model=twin, base_graph=g, modality="fmri", device="cpu")
+
+    def test_t_equals_ctx_gives_multiple_windows(self):
+        """T=context_length: fallback should give pred_steps-based windows (>1)."""
+        # T=200, ctx_len=200, pred_steps=50, stride=50 → fallback gives 4 windows
+        sim = self._make_sim(T_base=200, context_length=200, pred_steps=50)
+        self.assertGreater(sim.n_temporal_windows, 1,
+                           "Expected >1 windows via pred_steps fallback when T=context_length")
+
+    def test_t_greater_ctx_uses_primary_path(self):
+        """T > context_length + stride: primary path should give ≥ 2 windows."""
+        # T=300, ctx_len=200, stride=50 → primary gives (300-200)//50+1 = 3 windows
+        sim = self._make_sim(T_base=300, context_length=200, pred_steps=50)
+        self.assertGreaterEqual(sim.n_temporal_windows, 2,
+                                "Expected ≥2 windows via primary sliding-window path")
+
+    def test_t_less_than_ctx_returns_at_least_one(self):
+        """T < context_length and pred_steps >= ctx: should still return 1."""
+        # T=10, ctx_len=20, pred_steps=20 (pred_steps >= ctx_len → no fallback benefit)
+        sim = self._make_sim(T_base=10, context_length=20, pred_steps=20)
+        self.assertEqual(sim.n_temporal_windows, 1)
+
+    def test_window_count_capped_by_extractable(self):
+        """Window count must not exceed what _get_context_for_window can provide."""
+        # T=200, ctx_len=200, stride=50, pred_steps=10:
+        #   pred-based: (200-10)//10+1 = 20 windows
+        #   extractable: (200-1)//50+1 = 4 windows
+        #   result should be exactly min(20,4) = 4
+        sim = self._make_sim(T_base=200, context_length=200, pred_steps=10)
+        n = sim.n_temporal_windows
+        self.assertEqual(n, 4,
+                         "Window count should be exactly 4 (capped at extractable windows)")
+
+    def test_small_context_length_uses_primary_path(self):
+        """With small context_length=37, T=200 gives many windows via primary path."""
+        # ctx_len=37, stride=9, T=200 → (200-37)//9+1 = 19 windows
+        sim = self._make_sim(T_base=200, context_length=37, pred_steps=17)
+        n = sim.n_temporal_windows
+        self.assertGreaterEqual(n, 10,
+                                "With context_length=37 and T=200, expect many windows")
+
+    def test_fallback_windows_are_usable(self):
+        """rollout with context_window_idx > 0 should work without crashing."""
+        sim = self._make_sim(T_base=200, context_length=200, pred_steps=50)
+        n = sim.n_temporal_windows
+        self.assertGreater(n, 1)
+        # Each window index should produce a valid trajectory
+        for idx in range(min(n, 3)):
+            with self.subTest(window_idx=idx):
+                traj, _ = sim.rollout(steps=3, context_window_idx=idx)
+                self.assertEqual(traj.shape, (3, N))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Config reading fix: predictor_config from v5_optimization.advanced_prediction
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPredictorConfigFromV5Optimization(unittest.TestCase):
+    """
+    Tests that TwinBrainDigitalTwin.from_checkpoint correctly reads
+    predictor_config from config['v5_optimization']['advanced_prediction']
+    as a fallback when config['model']['predictor_config'] is absent.
+
+    This fixes the bug where context_length always defaulted to 200 even when
+    the training config had a different value under v5_optimization.
+    """
+
+    def setUp(self):
+        _models_dir = Path(__file__).parent.parent / "models"
+        if str(_models_dir.parent) not in sys.path:
+            sys.path.insert(0, str(_models_dir.parent))
+
+    def test_predictor_config_read_from_v5_optimization(self):
+        """
+        from_checkpoint extracts predictor_config from
+        config['v5_optimization']['advanced_prediction'] when
+        config['model']['predictor_config'] is absent.
+        """
+        import io
+        import unittest.mock as mock
+        from models.digital_twin_inference import TwinBrainDigitalTwin
+        from models.graph_native_system import GraphNativeBrainModel
+
+        # Build a real model so we have a valid state_dict
+        H = 16
+        real_model = GraphNativeBrainModel(
+            node_types=["fmri"],
+            edge_types=[("fmri", "connects", "fmri")],
+            in_channels_dict={"fmri": 1},
+            hidden_channels=H,
+            prediction_steps=17,
+            predictor_config={"context_length": 37},
+        )
+        real_model.eval()
+
+        # Save to a temporary checkpoint
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt_path = Path(tmp) / "model.pt"
+            torch.save({"model_state_dict": real_model.state_dict()}, ckpt_path)
+
+            # Config that uses the v5_optimization path (standard training config)
+            cfg = {
+                "model": {
+                    "prediction_steps": 17,
+                    # NOTE: NO 'predictor_config' key here
+                },
+                "v5_optimization": {
+                    "advanced_prediction": {
+                        "context_length": 37,
+                        "use_hierarchical": True,
+                        "use_transformer": True,
+                    }
+                },
+            }
+
+            loaded = TwinBrainDigitalTwin.from_checkpoint(
+                checkpoint_path=ckpt_path,
+                config=cfg,
+                device="cpu",
+            )
+
+        # The predictor should have context_length=37, not the default 200
+        predictor = loaded.model.predictor
+        self.assertEqual(
+            predictor.context_length, 37,
+            f"Expected context_length=37 from v5_optimization config, "
+            f"got {predictor.context_length}",
+        )
+
+    def test_legacy_predictor_config_still_works(self):
+        """
+        config['model']['predictor_config'] takes priority over
+        v5_optimization.advanced_prediction.
+        """
+        from models.digital_twin_inference import TwinBrainDigitalTwin
+        from models.graph_native_system import GraphNativeBrainModel
+
+        H = 16
+        real_model = GraphNativeBrainModel(
+            node_types=["fmri"],
+            edge_types=[("fmri", "connects", "fmri")],
+            in_channels_dict={"fmri": 1},
+            hidden_channels=H,
+            prediction_steps=50,
+            predictor_config={"context_length": 100},
+        )
+        real_model.eval()
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt_path = Path(tmp) / "model.pt"
+            torch.save({"model_state_dict": real_model.state_dict()}, ckpt_path)
+
+            # Legacy path: predictor_config under model
+            cfg = {
+                "model": {
+                    "prediction_steps": 50,
+                    "predictor_config": {"context_length": 100},
+                },
+                "v5_optimization": {
+                    "advanced_prediction": {"context_length": 999},  # must be ignored
+                },
+            }
+
+            loaded = TwinBrainDigitalTwin.from_checkpoint(
+                checkpoint_path=ckpt_path,
+                config=cfg,
+                device="cpu",
+            )
+
+        predictor = loaded.model.predictor
+        self.assertEqual(
+            predictor.context_length, 100,
+            "Legacy model.predictor_config should take priority",
+        )
+        # Explicitly confirm the v5_optimization value (999) was NOT used
+        self.assertNotEqual(
+            predictor.context_length, 999,
+            "v5_optimization.context_length=999 must be ignored when "
+            "model.predictor_config is present",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
