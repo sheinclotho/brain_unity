@@ -427,15 +427,15 @@ class BrainDynamicsSimulator:
 
         ``context_window_idx`` 时序窗口机制：
             选择从 ``base_graph`` 时间序列的哪个历史窗口作为初始上下文。
-            当 ``base_graph[modality].x`` 的时间维度 ``T > context_length`` 时，
-            可使用不同的历史片段为不同轨迹提供真正不同的上下文，从而提升
-            轨迹多样性（解决所有轨迹共享同一历史导致的 Wolf 上下文稀释问题）。
+            使用滑动步长 ``stride = max(1, context_length // 4)``（75% 重叠），
+            从有限时序数据中最大化可用窗口数：
 
               context_window_idx=0 → 最近 context_length 步（默认行为）
-              context_window_idx=1 → 倒数第二个 context_length 步
-              context_window_idx=k → x[:, -(k+1)*L:-k*L, :] （L=context_length）
+              context_window_idx=1 → 起点向前移动 stride 步
+              context_window_idx=k → x[:, T-L-k*s : T-k*s, :] （L=context_length, s=stride）
 
-            可用窗口数通过 ``simulator.n_temporal_windows`` 属性查询。
+            可用窗口数通过 ``simulator.n_temporal_windows`` 属性查询（取决于
+            主模态时序长度和 stride 大小）。
 
         Args:
             x0:                 初始脑状态，shape (n_regions,)。
@@ -657,48 +657,85 @@ class BrainDynamicsSimulator:
     @property
     def n_temporal_windows(self) -> int:
         """
-        Number of non-overlapping ``context_length``-step windows available in
-        ``base_graph``.
+        Number of overlapping context windows available in ``base_graph``.
 
-        Each window is a distinct historical segment of the stored fMRI/EEG time
-        series.  Using different windows as initial contexts gives trajectories
-        genuinely different histories (not just different last-step injections),
-        which resolves the Wolf context-dilution bias where all trajectories share
-        ``context_length − 1`` identical history steps.
+        Windows are extracted using a sliding stride of
+        ``context_length // 4`` (75 % overlap).  This approach maximises
+        trajectory diversity without requiring the time series to be an
+        integer multiple of ``context_length`` in length.
 
-        Computed as ``min(T_nt // context_length)`` across all node types with a
-        temporal ``.x`` attribute.  Returns at least 1.
+        **Modality-aware**: For single-modality analysis (``fmri`` / ``eeg``),
+        only the **primary** modality's temporal dimension ``T_primary``
+        determines the window count.  Secondary modalities in the same graph
+        (e.g. EEG when analysing fMRI) may have shorter or longer ``T``
+        without bottlenecking the result — ``_get_context_for_window`` handles
+        them gracefully at execution time by falling back to the oldest
+        available slice.
 
-        Example:
-            base_graph['fmri'].x has T=400, context_length=200
-            → n_temporal_windows = 2  (windows 0 and 1)
+        For ``joint`` analysis, the minimum ``T`` across both ``fmri`` and
+        ``eeg`` node types is used (both must supply a full context window for
+        the joint state vector).
+
+        Formula::
+
+            stride      = max(1, context_length // 4)
+            n_windows   = max(1, (T_primary - context_length) // stride + 1)
+
+        Examples (context_length = 200, stride = 50):
+
+            T_primary = 200  →  1 window   (no room to shift)
+            T_primary = 250  →  2 windows  ([50:250], [0:200])
+            T_primary = 300  →  3 windows  ([100:300], [50:250], [0:200])
+            T_primary = 400  →  5 windows
+            T_primary = 600  →  9 windows
         """
         ctx_len = self._get_context_length()
-        min_windows = float("inf")
-        for nt in self.base_graph.node_types:
-            if not hasattr(self.base_graph[nt], "x"):
-                continue
-            T = int(self.base_graph[nt].x.shape[1])
-            min_windows = min(min_windows, T // ctx_len)
-        # Guard against float("inf") before int() conversion (no node types had .x)
-        if min_windows == float("inf"):
+        stride = max(1, ctx_len // 4)
+
+        if self.modality == "joint":
+            # Joint mode: both fMRI and EEG must supply a full context window.
+            min_t: float = float("inf")
+            for nt in ("fmri", "eeg"):
+                if nt in self.base_graph.node_types and hasattr(
+                    self.base_graph[nt], "x"
+                ):
+                    min_t = min(min_t, int(self.base_graph[nt].x.shape[1]))
+            if min_t == float("inf"):
+                return 1
+            T_primary = int(min_t)
+        else:
+            # Single-modality: only the primary modality determines window count.
+            nt = self.modality
+            if nt not in self.base_graph.node_types or not hasattr(
+                self.base_graph[nt], "x"
+            ):
+                return 1
+            T_primary = int(self.base_graph[nt].x.shape[1])
+
+        if T_primary < ctx_len:
             return 1
-        return max(1, int(min_windows))
+        return max(1, (T_primary - ctx_len) // stride + 1)
 
     def _get_context_for_window(self, window_idx: int = 0) -> HeteroData:
         """
         Return a cloned HeteroData using the specified temporal window as context.
 
-        Selects a ``context_length``-step slice from each node type's time series,
-        counting backwards from the end of ``base_graph``:
+        Selects a ``context_length``-step slice from each node type's time series
+        using an overlapping sliding-window scheme.  The stride between consecutive
+        windows is ``max(1, context_length // 4)`` (75 % overlap), consistent with
+        ``n_temporal_windows``::
 
-          window_idx = 0  →  x[:, T-L:T, :]          (most recent, default)
-          window_idx = 1  →  x[:, T-2L:T-L, :]
-          window_idx = k  →  x[:, T-(k+1)L:T-kL, :]  (L = context_length)
+          stride = max(1, context_length // 4)
 
-        When ``window_idx`` exceeds the available history for a node type, the
-        earliest feasible ``context_length``-step slice is used instead of raising
-        an error (graceful degradation).
+          window_idx = 0  →  x[:, T-L : T, :]
+          window_idx = 1  →  x[:, T-L-s : T-s, :]
+          window_idx = k  →  x[:, T-L-k*s : T-k*s, :]   (L=context_length, s=stride)
+
+        When ``window_idx`` would push the start before the beginning of the
+        recording (``start < 0``), the earliest available ``context_length``-step
+        slice is used instead of raising an error (graceful degradation).  This
+        can happen for secondary modalities (e.g. EEG when analysing fMRI) that
+        have a shorter stored time series than the primary modality.
 
         Args:
             window_idx: Non-negative integer selecting which historical window to
@@ -709,6 +746,7 @@ class BrainDynamicsSimulator:
             requested window, ready for ``_inject_x0_into_context``.
         """
         ctx_len = self._get_context_length()
+        stride = max(1, ctx_len // 4)
         context = _clone_hetero_graph(self.base_graph)
 
         for nt in list(context.node_types):
@@ -716,9 +754,9 @@ class BrainDynamicsSimulator:
                 continue
             nt_x = context[nt].x   # [N, T, C]
             T = int(nt_x.shape[1])
-            # Count backward from the end:
-            #   window 0 → [T-L:T], window 1 → [T-2L:T-L], ...
-            end = T - window_idx * ctx_len
+            # Overlapping sliding windows (stride = ctx_len // 4):
+            #   window 0 → [T-L:T], window 1 → [T-L-s:T-s], ...
+            end = T - window_idx * stride
             start = end - ctx_len
             if start < 0 or end <= 0:
                 # Requested window extends before the start of the recording;
@@ -728,8 +766,10 @@ class BrainDynamicsSimulator:
                 if window_idx > 0:
                     logger.debug(
                         "_get_context_for_window: '%s' T=%d, window_idx=%d is "
-                        "out of range (need T≥%d); using earliest window [0:%d].",
-                        nt, T, window_idx, (window_idx + 1) * ctx_len, end,
+                        "out of range (ctx_len=%d, stride=%d, need T≥%d); "
+                        "using earliest window [0:%d].",
+                        nt, T, window_idx, ctx_len, stride,
+                        ctx_len + window_idx * stride, end,
                     )
             context[nt].x = nt_x[:, start:end, :]
 

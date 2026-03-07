@@ -5,7 +5,7 @@ Free Dynamics Experiment
 验证系统在 **无输入情况下** 的长期行为。
 
 流程：
-1. 确定可用的时序窗口数（base_graph 时间维度 // context_length）
+1. 确定可用的时序窗口数（见下文时序窗口机制）
 2. 采样 n_init 个随机初始状态
 3. 轨迹 i 使用窗口 i % n_windows 作为历史上下文（不同历史片段）
 4. 将 x0 注入选定上下文的最后一个时间步
@@ -19,14 +19,20 @@ Free Dynamics Experiment
   只有最后 1 步被不同 x0 覆盖。注意力机制将这 1 步扰动稀释在 L-1 个相同历史中，
   导致所有轨迹几乎相同（Wolf std ≈ 1.85e-05，见 AGENTS.md §Wolf上下文稀释偏差）。
 
-  当 base_graph 时间维度 T ≥ 2 × context_length 时，本模块自动将轨迹分配到
-  n_windows = T // context_length 个非重叠历史片段：
+  本模块使用 **滑窗策略**：步长 stride = context_length // 4（75% 重叠），
+  从主模态时序 T_primary 中提取多个历史窗口：
 
-    窗口 0：x[:, T-L:T, :]          （最近历史，原有行为）
-    窗口 1：x[:, T-2L:T-L, :]       （较早历史）
-    窗口 k：x[:, T-(k+1)L:T-kL, :]
+    窗口 0：x[:, T-L:T, :]               （最近历史，原有行为）
+    窗口 1：x[:, T-L-s:T-s, :]           （s = stride = L // 4）
+    窗口 k：x[:, T-L-k*s:T-k*s, :]
 
-  每条轨迹都从真正不同的历史出发，从根本上解决上下文稀释问题。
+  相比非重叠分块（要求 T ≥ k × L），滑窗方案只需 T > L + stride 即可产生第 2
+  个窗口。对于典型 10 分钟 fMRI（300 TR、L=200、s=50），可得 3 个窗口，
+  显著提升轨迹多样性。
+
+  **模态感知**：窗口数仅由主模态（fmri/eeg）的时序长度决定。次要模态（如
+  joint 模式中的 EEG）若时序较短，_get_context_for_window 会自动回退到
+  最早可用窗口，不影响主模态的窗口计数。
 """
 
 import logging
@@ -77,16 +83,20 @@ def run_free_dynamics(
     则 context_length-1 步历史完全相同，模型对不同 x0 的响应被大量相同历史
     所稀释，导致轨迹在统计上几乎无法区分（Wolf std ≈ 1.85e-05，见 AGENTS.md）。
 
-    当 ``base_graph`` 时间维度 ``T > context_length`` 时，可将轨迹分配到
-    ``n_windows = T // context_length`` 个非重叠历史窗口：
+    本模块使用 **滑窗策略**（stride = context_length // 4，75% 重叠）从主模态
+    时序中提取多个历史窗口。只要主模态时序 ``T > context_length + stride``
+    （即 ``T > 1.25 × context_length``），即可得到 ≥2 个窗口：
 
-      轨迹 i 使用窗口 ``i % n_windows``，即 ``x[:, T-(k+1)L:T-kL, :]``。
+      轨迹 i 使用窗口 ``i % n_windows``，即 ``x[:, T-L-k*s:T-k*s, :]``。
 
-    这样不同轨迹从真正不同的历史片段出发，显著提升初始多样性，使
-    Rosenstein LLE 和 Wolf LLE 在不同轨迹间有实质性差异。
+    与以往要求 ``T ≥ n_windows × context_length``（严格非重叠分块）不同，
+    滑窗方案能从更短的时序数据中提取更多有效历史上下文，大幅降低多样性对数据
+    长度的要求。
 
-    ``n_temporal_windows=None``（默认）：自动使用 ``simulator.n_temporal_windows``
-    （图缓存时间维度所支持的最大非重叠窗口数）。
+    **模态感知**：窗口数仅由 **主模态**（fmri/eeg，非所有模态的最小值）决定，
+    避免次要模态短时序错误瓶颈主模态窗口计数。
+
+    ``n_temporal_windows=None``（默认）：自动使用 ``simulator.n_temporal_windows``。
     ``n_temporal_windows=1``：禁用多窗口，仅使用最近一个历史窗口。
 
     Args:
@@ -112,8 +122,9 @@ def run_free_dynamics(
         eff_windows = min(int(n_temporal_windows), max_available)
         if int(n_temporal_windows) > max_available:
             logger.warning(
-                "  ⚠  n_temporal_windows=%d 超过图缓存支持的最大窗口数 %d"
-                "（需要 T_total ≥ n_windows × context_length），实际使用 %d 个窗口。",
+                "  ⚠  n_temporal_windows=%d 超过可用滑窗数 %d"
+                "（主模态时序 T 不足以支撑该数量的 stride=context_length//4 滑窗），"
+                "实际使用 %d 个窗口。",
                 n_temporal_windows, max_available, eff_windows,
             )
 
@@ -124,22 +135,32 @@ def run_free_dynamics(
     )
 
     if eff_windows > 1:
+        ctx_len = simulator._get_context_length()
+        stride = max(1, ctx_len // 4)
         logger.info(
-            "  时序窗口: 使用 %d 个不同历史上下文窗口（轨迹 i → 窗口 i %% %d）。\n"
-            "  每个窗口对应 base_graph 时间序列的一段独立历史，从根本上解决\n"
-            "  '所有轨迹共享相同 context_length-1 历史步' 的上下文稀释问题。",
-            eff_windows, eff_windows,
+            "  时序窗口: 使用 %d 个滑窗上下文"
+            "（context_length=%d，stride=%d，%.0f%% 重叠；"
+            "轨迹 i → 窗口 i %% %d）。\n"
+            "  每条轨迹从真正不同的历史时段出发，有效缓解上下文稀释效应。",
+            eff_windows, ctx_len, stride, (1 - stride / ctx_len) * 100, eff_windows,
         )
     else:
-        logger.info(
-            "  时序窗口: 仅使用 1 个上下文窗口（图缓存时间序列长度 ≤ 2 × context_length）。\n"
-            "  要启用多窗口轨迹多样性，需要更长的图缓存时间序列"
-            "（T_total ≥ 2 × context_length）。"
-            "增大 free_dynamics.n_temporal_windows 配置值不能弥补数据不足。",
+        ctx_len = simulator._get_context_length()
+        stride = max(1, ctx_len // 4)
+        # Determine primary modality T for the diagnostic message.
+        _nt = simulator.modality if simulator.modality != "joint" else "fmri"
+        _T_primary = (
+            int(simulator.base_graph[_nt].x.shape[1])
+            if _nt in simulator.base_graph.node_types
+            and hasattr(simulator.base_graph[_nt], "x")
+            else 0
         )
         logger.info(
-            "  初始条件: %d 个不同的随机初始状态（均匀采样 Uniform[0,1]^%d），"
-            "每条轨迹注入为初始上下文的最后一个时间步。",
+            "  时序窗口: 仅使用 1 个上下文窗口"
+            "（主模态 '%s' 时序 T=%d，context_length=%d，stride=%d）。\n"
+            "  要启用第 2 个窗口，需要 T > context_length + stride = %d。\n"
+            "  当前多样性来源: %d 个不同随机初始状态 Uniform[0,1]^%d。",
+            _nt, _T_primary, ctx_len, stride, ctx_len + stride,
             n_init, n_regions,
         )
 
