@@ -182,23 +182,41 @@ _DEFAULTS = {
         # "rosenstein" (default): uses only the pre-computed free-dynamics
         #   trajectories — zero extra model calls.  Strongly recommended for
         #   TwinBrainDigitalTwin (no context-dilution bias).
-        # "wolf" / "ftle" / "both": each trajectory requires 2 extra rollouts
-        #   per segment × n_segments.  With n_traj=40 and n_segments=1 that is
-        #   80 extra predict_future() calls, vs. 0 for "rosenstein".
-        "method": "rosenstein",    # Changed from "both" — saves ~480 model calls for 40 traj
+        # "wolf" / "ftle" / "both": Wolf requires 2 predict_future() calls per
+        #   renormalisation period × n_traj trajectories × n_segments segments.
+        #   With n_traj=200, steps=1000, renorm_steps=50 (→ 20 periods/traj),
+        #   n_segments=1: 200 × 20 × 2 = ~8000 calls → ~60 min on CPU.
+        #   Using method="rosenstein" reduces this to 0 extra calls.
+        "method": "rosenstein",    # Default: zero extra model calls, no Wolf bias
         "epsilon": 1e-6,           # Nominal perturbation magnitude
         "renorm_steps": 50,        # Steps per Wolf period
         "skip_fraction": 0.1,      # Skip initial transient fraction when fitting (FTLE)
-        "convergence_threshold": 0.01,  # Skip Wolf if distance_ratio < this
+        # Raised from 0.01 to 0.05: distance_ratio=0.010 (e.g. 0.0026/0.2547) now
+        # correctly triggers Wolf skip.  The old threshold missed the boundary case
+        # where ratio==0.010 due to strict `<` comparison.
+        "convergence_threshold": 0.05,
         # ── n_segments ────────────────────────────────────────────────────────
-        # Number of starting segments sampled per trajectory.
-        # For Rosenstein this has negligible cost (pure NumPy).  For Wolf/FTLE
-        # each extra segment adds 2 more model calls per trajectory.  Default
-        # reduced from 3→1 to avoid unexpected slowdowns when users switch to
-        # "wolf" or "both".  Increase to 3 for more robust Wolf/FTLE estimates.
-        "n_segments": 1,           # Changed from 3 — reduces Wolf/FTLE cost by 3×
+        # For Rosenstein, each extra segment adds negligible cost (pure NumPy);
+        # 3 segments samples the attractor at early / mid / late trajectory
+        # positions, giving a more robust LLE estimate.  For Wolf/FTLE, each
+        # extra segment adds 2 model calls per trajectory (keep at 1 for speed).
+        "n_segments": 3,           # Changed from 1 → 3 for better Rosenstein coverage
         "rosenstein_max_lag": 50,  # Rosenstein method: max tracking lag
         "rosenstein_min_sep": 20,  # Rosenstein method: min temporal separation for NN search
+        # ── Delay embedding (Takens) ──────────────────────────────────────────
+        # Set delay_embed_dim >= 2 to run Rosenstein in a delay-embedded space
+        # instead of the raw N-dimensional state space.  This avoids the "curse
+        # of dimensionality" (N=190 → all NN distances nearly equal) and improves
+        # LLE estimate quality.
+        #
+        # Recommended value: the FNN min_sufficient_dim from step 12 (embedding
+        # dimension analysis).  Typical value: 4–9 for fMRI/EEG brain dynamics.
+        # The log from step 12 suggests: FNN min dimension = 4, Takens min = 9.
+        #
+        # 0 = disabled (default): run Rosenstein in original N-dim space.
+        # Set to 7 after running step 12 once to obtain the FNN dimension.
+        "delay_embed_dim": 0,      # 0 = disabled; set to FNN dim for better NN quality
+        "delay_embed_tau": 1,      # Delay embedding lag (steps)
         # ── Parallelism ───────────────────────────────────────────────────────
         # n_workers > 1 enables parallel computation of Wolf/FTLE across
         # trajectories using a ThreadPoolExecutor.  Requires thread-safe model
@@ -489,10 +507,12 @@ def _run_single_modality(
                 skip_fraction=lya_cfg.get("skip_fraction", 0.1),
                 method=lya_method,
                 convergence_result=results.get("trajectory_convergence"),
-                convergence_threshold=lya_cfg.get("convergence_threshold", 0.01),
-                n_segments=lya_cfg.get("n_segments", 1),
+                convergence_threshold=lya_cfg.get("convergence_threshold", 0.05),
+                n_segments=lya_cfg.get("n_segments", 3),
                 rosenstein_max_lag=lya_cfg.get("rosenstein_max_lag", 50),
                 rosenstein_min_sep=lya_cfg.get("rosenstein_min_sep", 20),
+                rosenstein_delay_embed_dim=lya_cfg.get("delay_embed_dim", 0),
+                rosenstein_delay_embed_tau=lya_cfg.get("delay_embed_tau", 1),
                 n_workers=lya_cfg.get("n_workers", 1),
                 output_dir=output_dir,
             )
@@ -860,6 +880,36 @@ def _save_plots(results: dict, output_dir: Path, simulator) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+# Quick-mode presets: drastically reduced defaults for fast pre-experiments.
+# All values can be further overridden by explicit --n-init / --steps flags.
+_QUICK_OVERRIDES: dict = {
+    "free_dynamics": {
+        "n_init": 20,    # 20 trajectories instead of 200 (10× faster)
+        "steps": 200,    # 200 steps instead of 1000 (5× faster)
+    },
+    "response_matrix": {
+        "n_nodes": 10,   # 10 nodes instead of all 190+
+    },
+    "random_comparison": {
+        "n_init": 20,
+        "steps": 200,
+        "n_seeds": 2,    # fewer seeds per spectral radius
+    },
+    "lyapunov": {
+        "method": "rosenstein",  # fastest method (zero extra model calls)
+        "n_segments": 1,
+    },
+    "surrogate_test": {
+        "n_surrogates": 9,       # 9 surrogates (p < 0.10) instead of 19
+        "n_traj_sample": 3,
+    },
+    "embedding_dimension": {
+        "fnn_max_dim": 4,        # fewer dimensions to test
+        "corr_dim": False,       # skip correlation dimension (slow)
+    },
+}
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="TwinBrain — Brain Network Dynamics Testbed",
@@ -944,6 +994,28 @@ def _parse_args() -> argparse.Namespace:
         choices=["cpu", "cuda", "auto"],
         help="计算设备（auto 自动选择 CUDA/CPU）",
     )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help=(
+            "快速预实验模式：大幅缩减轨迹数量与步数，跳过耗时分析，适合快速验证。\n"
+            "  n_init: 200 → 20，steps: 1000 → 200，response_matrix n_nodes: 10，\n"
+            "  Lyapunov 方法: rosenstein（零额外模型调用），surrogate: 9 个。\n"
+            "  完整分析请去掉此标志，或在 --n-init / --steps 中明确指定数量。"
+        ),
+    )
+    parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=None,
+        dest="n_workers",
+        help=(
+            "Lyapunov Wolf/FTLE 分析的并行 worker 数（覆盖配置，默认 1）。\n"
+            "  CPU 推断：设 4–8 可显著加速 Wolf/FTLE。\n"
+            "  GPU 推断：保持 1（多线程 GPU 调用会产生显存竞争）。\n"
+            "  Rosenstein 方法（推荐）不受此参数影响（始终并行）。"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -953,6 +1025,22 @@ def main() -> None:
     # Load and merge dynamics configuration
     file_cfg = _load_config(args.config)
     cfg = _merge_config(_DEFAULTS, file_cfg)
+
+    # Apply --quick preset BEFORE explicit overrides so --n-init/--steps can
+    # still override the quick defaults.
+    if args.quick:
+        cfg = _merge_config(cfg, _QUICK_OVERRIDES)
+        logger.info(
+            "⚡ 快速预实验模式（--quick）：\n"
+            "   n_init=%d, steps=%d, response_matrix n_nodes=%d, "
+            "Lyapunov=%s, surrogate=%d 个。\n"
+            "   完整分析请去掉 --quick 标志。",
+            cfg["free_dynamics"]["n_init"],
+            cfg["free_dynamics"]["steps"],
+            cfg["response_matrix"]["n_nodes"],
+            cfg["lyapunov"]["method"],
+            cfg["surrogate_test"]["n_surrogates"],
+        )
 
     # Apply CLI overrides (--model and --graph are required by argparse)
     cfg["model"]["path"] = args.model
@@ -971,6 +1059,8 @@ def main() -> None:
         cfg["output"]["save_plots"] = False
     if args.device:
         cfg["model"]["device"] = args.device
+    if args.n_workers is not None:
+        cfg["lyapunov"]["n_workers"] = args.n_workers
 
     run(cfg)
 
