@@ -632,10 +632,7 @@ def _run_single_modality(
                 tail_steps=jac_cfg.get("tail_steps", 20),
                 n_states=jac_cfg.get("n_states", 3),
                 epsilon=jac_cfg.get("epsilon", 1e-4),
-                seed=fd_cfg.get("seed", 42),
-                output_dir=output_dir if cfg["output"].get("save_plots") else None,
-            )
-            results["jacobian_analysis"] = jac_results
+                seed=jac_cfg.get("seed", fd_cfg.get("seed", 42)),
             logger.info(
                 "  Jacobian 谱: ρ=%.4f, n_slow=%d, n_Hopf=%d, dominant_osc=%.4f Hz/step",
                 jac_results["spectral_radius"],
@@ -664,8 +661,7 @@ def _run_single_modality(
                 n_exponents=lys_cfg.get("n_exponents", 10),
                 renorm_steps=lys_cfg.get("renorm_steps", 50),
                 epsilon=lys_cfg.get("epsilon", 1e-6),
-                seed=fd_cfg.get("seed", 42),
-                n_traj_sample=lys_cfg.get("n_traj_sample", 3),
+                seed=lys_cfg.get("seed", fd_cfg.get("seed", 42)),
                 output_dir=output_dir if cfg["output"].get("save_plots") else None,
             )
             results["lyapunov_spectrum"] = lys_results
@@ -706,7 +702,7 @@ def _run_single_modality(
                     n_init=ec_cfg.get("n_init", 5),
                     steps=ec_cfg.get("steps", 200),
                     warmup=ec_cfg.get("warmup", 50),
-                    seed=fd_cfg.get("seed", 42),
+                    seed=ec_cfg.get("seed", fd_cfg.get("seed", 42)),
                     output_dir=output_dir if cfg["output"].get("save_plots") else None,
                 )
                 ec_results["alpha_scan"] = ec_scan
@@ -724,7 +720,7 @@ def _run_single_modality(
                     E_ref=ec_cfg.get("E_ref", 1.0),
                     steps=ec_cfg.get("steps", 300),
                     n_init=ec_cfg.get("n_init", 5),
-                    seed=fd_cfg.get("seed", 42),
+                    seed=ec_cfg.get("seed", fd_cfg.get("seed", 42)),
                     output_dir=output_dir if cfg["output"].get("save_plots") else None,
                 )
                 ec_results["dynamic_energy"] = ec_dynamic

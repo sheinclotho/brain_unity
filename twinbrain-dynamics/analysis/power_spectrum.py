@@ -126,8 +126,13 @@ def compute_trajectory_psd(
         # FFT: shape (n_freqs, N)
         fft_vals = np.fft.rfft(seg_w, axis=0)
         psd_i = (np.abs(fft_vals) ** 2) / win_norm      # (n_freqs, N)
-        # Double non-DC/Nyquist bins (one-sided spectrum)
-        psd_i[1: -1 if T_use % 2 == 0 else None] *= 2
+        # Double non-DC/Nyquist bins (one-sided spectrum):
+        # For even T_use, Nyquist (last bin) should NOT be doubled.
+        # For odd T_use, there is no Nyquist bin — all non-DC bins are doubled.
+        if T_use % 2 == 0:
+            psd_i[1:-1] *= 2
+        else:
+            psd_i[1:] *= 2
         region_psd_acc += psd_i.T   # (N, n_freqs)
 
     region_psd = region_psd_acc / n_traj                # (N, n_freqs)

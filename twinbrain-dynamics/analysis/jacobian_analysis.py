@@ -109,8 +109,14 @@ def estimate_jacobian_at_point(
         f_fwd = traj_fwd[0].astype(np.float64)
         f_bwd = traj_bwd[0].astype(np.float64)
 
-        # Effective step (may be smaller than 2ε due to clipping)
-        h = float(np.abs(x_fwd[i] - x_bwd[i])) + 1e-30
+        # Effective step using signed difference (avoids masking asymmetric clipping).
+        # When both fwd and bwd are clipped the same way, the sign is preserved and
+        # the Jacobian estimate degrades gracefully rather than silently dividing by
+        # the wrong magnitude.
+        h = float(x_fwd[i] - x_bwd[i])
+        if abs(h) < 1e-30:
+            # Both clipped to the same boundary; skip this column
+            continue
         J[:, i] = (f_fwd - f_bwd) / h
 
     return J

@@ -166,7 +166,10 @@ def _run_power_spectrum_builtin(
         seg_w = seg * win[:, None]
         fft_v = np.fft.rfft(seg_w, axis=0)
         psd_i = (np.abs(fft_v) ** 2) / win_norm
-        psd_i[1: -1 if T_use % 2 == 0 else None] *= 2
+        if T_use % 2 == 0:
+            psd_i[1:-1] *= 2
+        else:
+            psd_i[1:] *= 2
         region_psd_acc += psd_i.T
     region_psd = region_psd_acc / n_traj
     mean_psd = region_psd.mean(axis=0)

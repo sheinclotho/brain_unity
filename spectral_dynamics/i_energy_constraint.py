@@ -350,10 +350,10 @@ def _try_plot_alpha_scan(result: Dict, output_path: Path) -> None:
         ax.grid(True, alpha=0.3)
 
     axes[0].axhline(0, ls="--", color="red", lw=1, label="LLE=0")
-    if np.isfinite(rho):
-        axes[0].axvline(1.0 / rho if rho > 0 else float("inf"),
+    if np.isfinite(rho) and rho > 1e-12:
+        axes[0].axvline(1.0 / rho,
                         ls="--", color="purple", lw=0.8, alpha=0.6,
-                        label=f"1/ρ(W)={1/rho:.2f}" if rho > 0 else "")
+                        label=f"1/ρ(W)={1/rho:.2f}")
     axes[0].set_title(
         f"Energy Constraint Bifurcation  [{result['label']}]\n"
         f"x(t+1) = α·tanh(W·x)  |  ρ(W)={rho:.3f}, "

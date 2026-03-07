@@ -110,7 +110,7 @@ def plot_pca_trajectories(
     # ── Fit PCA on all post-burnin states ─────────────────────────────────────
     traj_use = trajectories[:, burnin:, :]            # (n_traj, T, N)
     T = traj_use.shape[1]
-    n_components = min(3, n_regions, T, n_traj)
+    n_components = min(3, n_regions, n_traj * T)
     all_states = traj_use.reshape(-1, n_regions)       # (n_traj*T, N)
 
     pca = PCA(n_components=n_components, random_state=42)
@@ -118,7 +118,7 @@ def plot_pca_trajectories(
     var_ratio = pca.explained_variance_ratio_          # (n_components,)
 
     # Cumulative variance for all components up to min(20, n_regions)
-    n_full = min(20, n_regions, T, n_traj)
+    n_full = min(20, n_regions, n_traj * T)
     pca_full = PCA(n_components=n_full, random_state=42)
     pca_full.fit(all_states)
     var_full = pca_full.explained_variance_ratio_
@@ -276,7 +276,7 @@ def plot_pca_trajectories(
 
     # ── Overall title ─────────────────────────────────────────────────────────
     n_pc90 = idx_90 + 1 if idx_90 < n_full else n_full
-    cum2 = float(var_cumsum[min(1, n_full - 1)] * 100)
+    cum2 = float(var_cumsum[1 if n_full > 1 else 0] * 100)
     fig.suptitle(
         f"Free Dynamics — PCA Analysis  "
         f"[{n_traj} trajectories × {steps} steps, N={n_regions} regions]\n"
