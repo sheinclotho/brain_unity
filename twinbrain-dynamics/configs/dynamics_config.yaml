@@ -20,6 +20,7 @@ free_dynamics:
   n_init: 200         # Number of random initial states to simulate
   steps: 1000         # Simulation steps per trajectory
   seed: 42            # Random seed for reproducibility
+  # Quick pre-experiment hint: --quick sets n_init=20, steps=200 (10× / 5× faster)
 
 # Attractor analysis
 attractor_analysis:
@@ -61,11 +62,18 @@ stability_analysis:
 # Lyapunov exponent estimation
 lyapunov:
   enabled: true
-  method: "both"          # "wolf" (renormalized), "ftle" (fast), or "both" (cross-validation)
+  method: "both"          # "rosenstein" (fast, zero model calls), "wolf", "ftle", or "both"
   epsilon: 1.0e-6         # Nominal perturbation magnitude (reduced from 1e-5 to lower boundary bias)
   renorm_steps: 50        # Steps between Wolf renormalization periods (increased from 20)
   skip_fraction: 0.1      # Fraction of trajectory to skip (transient, ftle only)
   convergence_threshold: 0.01  # Skip Wolf if trajectory distance_ratio < this (system is stable)
+  n_workers: 1            # Parallel workers for Wolf/FTLE (1 = sequential)
+  # GPU acceleration note:
+  #   - method="rosenstein": zero extra model calls, pure NumPy → safe to set n_workers>1
+  #   - method="wolf"/"ftle"/"both": each worker calls the model; on GPU this causes
+  #     VRAM contention → n_workers is automatically clamped to 1 when device=cuda.
+  #     For CPU inference, set n_workers=4~8 for multi-core speedup.
+  #   - CLI override: python run_dynamics_analysis.py ... --n-workers 4
 
 # Trajectory convergence analysis
 trajectory_convergence:

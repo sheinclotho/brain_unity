@@ -789,6 +789,27 @@ def run_lyapunov_analysis(
             skipped_wolf = True
             effective_method = "ftle"
 
+    # ── GPU auto-limit: Wolf/FTLE with multiple workers causes VRAM contention ─
+    # Each Wolf/FTLE worker invokes the neural network independently on the same
+    # GPU → concurrent CUDA kernels compete for the same memory bus and compute
+    # units, causing non-deterministic slowdowns or OOM errors.
+    # For Rosenstein (pure NumPy, no model calls) this is not an issue.
+    _run_wolf_or_ftle = (effective_method in ("wolf", "ftle", "both"))
+    if _run_wolf_or_ftle and n_workers > 1:
+        _on_gpu = (
+            simulator is not None
+            and str(getattr(simulator, "device", "cpu")).startswith("cuda")
+        )
+        if _on_gpu:
+            logger.warning(
+                "  ⚠  GPU 推断下 Wolf/FTLE 多 worker（n_workers=%d）会产生显存竞争，"
+                "自动降为 n_workers=1（顺序执行）。\n"
+                "  如需并行加速，请切换 method='rosenstein'（纯 NumPy，线程安全）"
+                "或使用 CPU 推断（--device cpu）。",
+                n_workers,
+            )
+            n_workers = 1
+
     logger.info(
         "Lyapunov 指数分析: method=%s, %d 条轨迹, 每条 %d 步, ε=%.2e, "
         "n_segments=%d, n_workers=%d",

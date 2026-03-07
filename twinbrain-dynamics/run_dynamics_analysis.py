@@ -860,6 +860,36 @@ def _save_plots(results: dict, output_dir: Path, simulator) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+# Quick-mode presets: drastically reduced defaults for fast pre-experiments.
+# All values can be further overridden by explicit --n-init / --steps flags.
+_QUICK_OVERRIDES: dict = {
+    "free_dynamics": {
+        "n_init": 20,    # 20 trajectories instead of 200 (10× faster)
+        "steps": 200,    # 200 steps instead of 1000 (5× faster)
+    },
+    "response_matrix": {
+        "n_nodes": 10,   # 10 nodes instead of all 190+
+    },
+    "random_comparison": {
+        "n_init": 20,
+        "steps": 200,
+        "n_seeds": 2,    # fewer seeds per spectral radius
+    },
+    "lyapunov": {
+        "method": "rosenstein",  # fastest method (zero extra model calls)
+        "n_segments": 1,
+    },
+    "surrogate_test": {
+        "n_surrogates": 9,       # 9 surrogates (p < 0.10) instead of 19
+        "n_traj_sample": 3,
+    },
+    "embedding_dimension": {
+        "fnn_max_dim": 4,        # fewer dimensions to test
+        "corr_dim": False,       # skip correlation dimension (slow)
+    },
+}
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="TwinBrain — Brain Network Dynamics Testbed",
@@ -944,6 +974,28 @@ def _parse_args() -> argparse.Namespace:
         choices=["cpu", "cuda", "auto"],
         help="计算设备（auto 自动选择 CUDA/CPU）",
     )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help=(
+            "快速预实验模式：大幅缩减轨迹数量与步数，跳过耗时分析，适合快速验证。\n"
+            "  n_init: 200 → 20，steps: 1000 → 200，response_matrix n_nodes: 10，\n"
+            "  Lyapunov 方法: rosenstein（零额外模型调用），surrogate: 9 个。\n"
+            "  完整分析请去掉此标志，或在 --n-init / --steps 中明确指定数量。"
+        ),
+    )
+    parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=None,
+        dest="n_workers",
+        help=(
+            "Lyapunov Wolf/FTLE 分析的并行 worker 数（覆盖配置，默认 1）。\n"
+            "  CPU 推断：设 4–8 可显著加速 Wolf/FTLE。\n"
+            "  GPU 推断：保持 1（多线程 GPU 调用会产生显存竞争）。\n"
+            "  Rosenstein 方法（推荐）不受此参数影响（始终并行）。"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -953,6 +1005,22 @@ def main() -> None:
     # Load and merge dynamics configuration
     file_cfg = _load_config(args.config)
     cfg = _merge_config(_DEFAULTS, file_cfg)
+
+    # Apply --quick preset BEFORE explicit overrides so --n-init/--steps can
+    # still override the quick defaults.
+    if args.quick:
+        cfg = _merge_config(cfg, _QUICK_OVERRIDES)
+        logger.info(
+            "⚡ 快速预实验模式（--quick）：\n"
+            "   n_init=%d, steps=%d, response_matrix n_nodes=%d, "
+            "Lyapunov=%s, surrogate=%d 个。\n"
+            "   完整分析请去掉 --quick 标志。",
+            cfg["free_dynamics"]["n_init"],
+            cfg["free_dynamics"]["steps"],
+            cfg["response_matrix"]["n_nodes"],
+            cfg["lyapunov"]["method"],
+            cfg["surrogate_test"]["n_surrogates"],
+        )
 
     # Apply CLI overrides (--model and --graph are required by argparse)
     cfg["model"]["path"] = args.model
@@ -971,6 +1039,8 @@ def main() -> None:
         cfg["output"]["save_plots"] = False
     if args.device:
         cfg["model"]["device"] = args.device
+    if args.n_workers is not None:
+        cfg["lyapunov"]["n_workers"] = args.n_workers
 
     run(cfg)
 

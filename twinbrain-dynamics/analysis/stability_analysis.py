@@ -242,7 +242,9 @@ def classify_dynamics_delay(
     trajectory: np.ndarray,
     delay_dt: int = _DEFAULT_DELAY_DT,
     fixed_point_tol: float = 1e-3,
-    limit_cycle_var_tol: float = 1e-3,
+    limit_cycle_cv_tol: float = 0.30,
+    limit_cycle_acf_with_cv: float = 0.20,
+    limit_cycle_acf_strong: float = _ADAPTIVE_LC_ACF_STRONG,
     metastable_tol: float = 0.1,
     tail_fraction: float = 0.5,
 ) -> str:
@@ -252,13 +254,30 @@ def classify_dynamics_delay(
     与方法 A（邻接差分）相比，此方法对较小量级的周期振荡更鲁棒，
     且阈值更宽松，避免大多数轨迹被误判为 unstable。
 
+    **v2 修复（高维极限环）**：
+    原版使用绝对方差阈值 ``Δ_var < 1e-3`` 检测极限环，在以下情况失效：
+    (a) 相位同步轨迹（高维系统所有轨迹收敛到同一相位）：延迟距离序列自身
+        周期性振荡，方差可达 3e-3，超过固定阈值，全部误判为 unstable。
+    (b) 振幅较大的振荡：即使 CV 很低，绝对方差也可超过 1e-3。
+
+    修复策略（与方法 C 保持对齐）：
+    - **联合条件（C3 同等逻辑）**：CV(delays) < 0.30 AND acf_score > 0.20
+      → 延迟距离规则 + ACF 确认周期性 → 极限环
+      （纯噪声的 ACF 远低于 0.20，避免高 N 时 LLN 造成的假阳性。）
+    - **强 ACF 条件（C4 同等逻辑）**：acf_score > 0.35
+      → ACF 单独确认强周期振荡 → 极限环
+      （覆盖相位同步场景：cv_delay 可达 0.5，但 acf 接近 1.0。）
+
     Args:
-        trajectory:         shape (T, n_regions)。
-        delay_dt:           延迟步数（推荐 50）。
-        fixed_point_tol:    Δ_mean < tol → fixed_point。
-        limit_cycle_var_tol: Δ_var < tol → limit_cycle。
-        metastable_tol:     Δ_mean < tol → metastable。
-        tail_fraction:      使用轨迹末尾的哪个比例判断（0.0–1.0）。
+        trajectory:              shape (T, n_regions)。
+        delay_dt:                延迟步数（推荐 50）。
+        fixed_point_tol:         Δ_mean < tol → fixed_point。
+        limit_cycle_cv_tol:      CV(delays) 上限（条件 1，默认 0.30）。
+        limit_cycle_acf_with_cv: 与 CV 联合使用的 ACF 最低值（默认 0.20）。
+                                 纯噪声的 ACF << 0.20，可有效避免高维系统的假阳性。
+        limit_cycle_acf_strong:  ACF 单独确认极限环的下限（默认 0.35）。
+        metastable_tol:          Δ_mean < tol → metastable。
+        tail_fraction:           使用轨迹末尾的哪个比例判断（0.0–1.0）。
 
     Returns:
         classification: "fixed_point" | "limit_cycle" | "metastable" | "unstable"
@@ -271,12 +290,26 @@ def classify_dynamics_delay(
     tail_delays = delays[-tail_len:]
 
     delta_mean = float(tail_delays.mean())
-    delta_var = float(tail_delays.var())
+    delta_std  = float(tail_delays.std())
 
     if delta_mean < fixed_point_tol:
         return "fixed_point"
-    if delta_var < limit_cycle_var_tol:
+
+    # Compute ACF oscillation score (shares logic with method C, O(n_samples×T logT))
+    acf_score = compute_acf_oscillation_score(trajectory)
+
+    # Condition 1 (C3-equivalent): low CV + ACF confirmation.
+    # Avoids false positives from high-N LLN concentration (noise always has low acf).
+    cv_delta = delta_std / max(delta_mean, 1e-12)
+    if cv_delta < limit_cycle_cv_tol and acf_score > limit_cycle_acf_with_cv:
         return "limit_cycle"
+
+    # Condition 2 (C4-equivalent): strong ACF alone confirms oscillatory attractor.
+    # Covers synchronized limit cycles where cv_delay > 0.30 (delay distances
+    # oscillate periodically), but ACF of state x_i(t) is very high (≈ 0.8).
+    if acf_score > limit_cycle_acf_strong:
+        return "limit_cycle"
+
     if delta_mean < metastable_tol:
         return "metastable"
     return "unstable"
@@ -473,15 +506,28 @@ def classify_dynamics(
     convergence_tol: float = _CONVERGENCE_TOL,
     period_max_lag: int = 100,
     tail_fraction: float = 0.2,
+    trajectory: Optional[np.ndarray] = None,
 ) -> str:
     """
     根据状态变化模式对轨迹动力学进行分类。
+
+    **v2 修复（高维极限环）**：
+    (a) 联合 CV 条件：step_cv = std(||Δx||) / mean(||Δx||) < 0.30 AND acf_score > 0.20
+        → 邻接 L2 范数规则 + ACF 确认振荡 → 极限环
+        （高维相位相消使 step_cv 很低；纯噪声 acf 远低于 0.20，避免误判。）
+    (b) 强 ACF 条件：acf_score > 0.35 → 极限环
+        （覆盖相位同步场景：step_cv 可达 0.5，但 acf 接近 1.0。）
+    (c) ACF 周期峰阈值从 0.5 降至 0.3：高维系统 ACF 峰因噪声而偏低。
+
+    传入 trajectory（可选）可获得更精确的 ACF 评分；未传时对邻接差分序列
+    计算 ACF（快速但精度稍低）。
 
     Args:
         deltas:            shape (T-1,)，L2 范数序列。
         convergence_tol:   ||Δx|| < tol 认为收敛为固定点。
         period_max_lag:    检测周期轨道的最大延迟（步）。
         tail_fraction:     使用轨迹末尾的哪个比例来判断（0.0–1.0）。
+        trajectory:        原始轨迹 shape (T, n_regions)，用于 ACF 评分（可选）。
 
     Returns:
         classification: "fixed_point" | "limit_cycle" | "metastable" | "unstable"
@@ -497,20 +543,36 @@ def classify_dynamics(
     if mean_delta < convergence_tol:
         return "fixed_point"
 
-    # 2. Limit cycle: periodic variation detected via autocorrelation
+    # 2. ACF-based conditions (shared with method B v2 and method C).
+    # Compute state-ACF score if trajectory provided; otherwise skip.
+    acf_score = 0.0
+    if trajectory is not None:
+        acf_score = compute_acf_oscillation_score(trajectory)
+
+    # Condition 2a: Low step-to-step CV + ACF confirmation.
+    cv_delta = std_delta / max(mean_delta, 1e-12)
+    if cv_delta < 0.30 and acf_score > 0.20:
+        return "limit_cycle"
+
+    # Condition 2b: Strong ACF alone (handles synchronized LC, cv may be high).
+    if acf_score > 0.35:
+        return "limit_cycle"
+
+    # 3. Limit cycle via autocorrelation periodicity (threshold 0.5→0.3 for
+    #    noisier high-dimensional systems; no trajectory needed).
     if tail_len >= 2 * period_max_lag:
         autocorr = _autocorrelation(tail_deltas, max_lag=period_max_lag)
         # Look for secondary peak beyond lag=1
         if len(autocorr) > 5:
             secondary_peaks = _find_peaks(autocorr[5:])
-            if secondary_peaks and autocorr[secondary_peaks[0] + 5] > 0.5:
+            if secondary_peaks and autocorr[secondary_peaks[0] + 5] > 0.3:
                 return "limit_cycle"
 
-    # 3. Metastable: slow drift (small but non-zero mean delta, low std)
+    # 4. Metastable: slow drift (small but non-zero mean delta, low std)
     if mean_delta < 0.05 and std_delta < mean_delta:
         return "metastable"
 
-    # 4. Unstable / chaotic: large or growing deltas
+    # 5. Unstable / chaotic: large or growing deltas
     return "unstable"
 
 
@@ -554,6 +616,7 @@ def analyze_trajectory_stability(
         deltas,
         convergence_tol=convergence_tol,
         period_max_lag=period_max_lag,
+        trajectory=trajectory,  # pass for ACF-based conditions
     )
     classification_v2 = classify_dynamics_delay(trajectory, delay_dt=delay_dt)
 
@@ -733,6 +796,26 @@ def run_stability_analysis(
         class_counts_v1["metastable"] / n_traj * 100,
         class_counts_v1["unstable"] / n_traj * 100,
     )
+
+    # ── Cross-method consistency diagnostic ──────────────────────────────────
+    # When methods disagree, log an explanation so users are not confused.
+    c_lc_frac = class_counts["limit_cycle"] / n_traj
+    b_lc_frac = class_counts_v2["limit_cycle"] / n_traj
+    a_lc_frac = class_counts_v1["limit_cycle"] / n_traj
+    if c_lc_frac > 0.5 and (b_lc_frac < 0.3 or a_lc_frac < 0.3):
+        logger.info(
+            "  ⓘ 方法 A/B 与方法 C 不一致（方法C: 极限环 %.0f%%；"
+            "方法B: %.0f%%；方法A: %.0f%%）。\n"
+            "    这是高维极限环的已知现象，方法 C（自适应相对阈值）为正确结果。\n"
+            "    原因 1（方法B）：相位同步轨迹的延迟距离序列自身振荡，使绝对方差偏高。\n"
+            "      修复后方法B已改用相对变异系数（CV）阈值，应与方法C一致。\n"
+            "    原因 2（方法A）：高维系统各脑区相位相消使邻接L2范数近似恒定，"
+            "ACF缺乏明显峰值。\n"
+            "      修复后方法A已降低ACF阈值并加入CV回退，应与方法C一致。\n"
+            "    若方法A/B仍显示不稳定，请以方法C结果为准。",
+            c_lc_frac * 100, b_lc_frac * 100, a_lc_frac * 100,
+        )
+
     logger.info(
         "  delta_ratio 分布: 均值=%.4f  中位数=%.4f  p25=%.4f  p75=%.4f  p95=%.4f",
         delta_ratio_stats["mean"], delta_ratio_stats["median"],

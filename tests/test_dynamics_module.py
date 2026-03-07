@@ -546,6 +546,53 @@ class TestStabilityAnalysis(unittest.TestCase):
         result = classify_dynamics_delay(traj, delay_dt=50)
         self.assertIn(result, ["unstable", "metastable"])
 
+    def test_classify_dynamics_delay_high_dim_synchronized_limit_cycle(self):
+        """Synchronized limit cycle (all N regions same phase, N=30) → limit_cycle.
+
+        This reproduces the real-world scenario seen in logs where N≈190
+        trajectories all converge to the SAME limit cycle attractor (same phase),
+        making the delay-distance series oscillate periodically (cv > 0.30) but
+        with a very strong ACF (acf_score ≈ 0.80).
+
+        The old method (absolute variance < 1e-3) fails here because the
+        delay-distance series oscillates, making delta_var >> 1e-3.
+        The new method correctly detects the strong ACF oscillation signal.
+        """
+        n_reg = 30
+        T = 400
+        PERIOD = 80  # oscillation period in steps (should be detectable by ACF)
+        t = np.arange(T)
+        # All N regions oscillate at the same phase (synchronized attractor)
+        traj_sync = (0.5 + 0.3 * np.sin(2 * np.pi * t / PERIOD)).astype(np.float32)
+        traj_sync = np.broadcast_to(traj_sync[:, None], (T, n_reg)).copy()
+        result = classify_dynamics_delay(traj_sync, delay_dt=20)
+        self.assertEqual(
+            result, "limit_cycle",
+            msg=(
+                f"classify_dynamics_delay returned '{result}' for synchronized "
+                f"limit cycle (N={n_reg}, T={T}, period={PERIOD}). Expected 'limit_cycle'. "
+                "This is the high-dimensional synchronized-attractor case that "
+                "the old absolute-variance method (var < 1e-3) failed to detect."
+            ),
+        )
+
+    def test_classify_dynamics_delay_phase_diverse_limit_cycle(self):
+        """Phase-diverse limit cycle (N regions with uniform phase spread) → limit_cycle.
+
+        In high-D systems with uniformly distributed phases, delay-distance series
+        is nearly constant (phase cancellation), giving cv ≈ 0 — detected by the
+        combined CV + ACF condition.
+        """
+        n_reg = 30
+        T = 400
+        PERIOD = 80  # oscillation period in steps
+        t = np.arange(T)
+        phases = np.linspace(0, 2 * np.pi, n_reg, endpoint=False)
+        traj_div = (0.5 + 0.3 * np.sin(2 * np.pi * t[:, None] / PERIOD + phases[None, :])).astype(np.float32)
+        result = classify_dynamics_delay(traj_div, delay_dt=20)
+        self.assertEqual(result, "limit_cycle",
+                         msg=f"got '{result}' for phase-diverse LC")
+
     def test_json_contains_both_methods(self):
         """stability_metrics.json must contain counts for method A, B, and C."""
         with tempfile.TemporaryDirectory() as tmp:
