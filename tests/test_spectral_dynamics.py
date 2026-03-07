@@ -385,6 +385,13 @@ class TestPhaseDiagram(unittest.TestCase):
     def setUp(self):
         self.W = _low_rank_matrix(rho=0.8)
 
+    def test_wc_trajectories_bounded(self):
+        # WC dynamics: x(t+1) = clip(tanh(g*W@x), 0, 1) must stay in [0, 1]
+        W = _low_rank_matrix(rho=0.9)
+        trajs = _wc_trajectories(W, n_traj=5, steps=50)
+        self.assertGreaterEqual(float(trajs.min()), -1e-6)
+        self.assertLessEqual(float(trajs.max()), 1.0 + 1e-6)
+
     def test_oscillation_amplitude_positive(self):
         trajs = _random_trajectories()
         amp = _compute_oscillation_amplitude(trajs)

@@ -543,15 +543,16 @@ def main() -> None:
         response_matrix: Optional[np.ndarray] = None
 
         if args.trajectories is not None:
-            trajectories = load_trajectories(args.trajectories.parent
-                                             if args.trajectories.name == "trajectories.npy"
-                                             else args.trajectories.parent)
+            # Accept either a .npy file path or the containing directory
+            traj_dir = (args.trajectories.parent
+                        if args.trajectories.name == "trajectories.npy"
+                        else args.trajectories)
+            trajectories = load_trajectories(traj_dir)
         if args.response_matrix is not None:
-            response_matrix = load_response_matrix(
-                args.response_matrix.parent
-                if args.response_matrix.name == "response_matrix.npy"
-                else args.response_matrix.parent
-            )
+            rm_dir = (args.response_matrix.parent
+                      if args.response_matrix.name == "response_matrix.npy"
+                      else args.response_matrix)
+            response_matrix = load_response_matrix(rm_dir)
 
         if trajectories is None and response_matrix is None:
             logger.error(

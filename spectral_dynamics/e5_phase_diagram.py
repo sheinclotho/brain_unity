@@ -150,7 +150,7 @@ def _simple_rosenstein(ts: np.ndarray, max_lag: int = 30, min_sep: int = 10) -> 
 
     # Mask temporal neighbours
     for k in range(min(min_sep, T)):
-        for sign in range(-1, 2, 2):
+        for sign in (-1, 1):
             idx = np.arange(T) + sign * k
             valid = (idx >= 0) & (idx < T)
             D2[np.arange(T)[valid], idx[valid]] = np.inf
