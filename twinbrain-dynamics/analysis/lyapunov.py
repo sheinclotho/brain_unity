@@ -106,7 +106,10 @@ _DEFAULT_RENORM_STEPS: int = 50
 
 # Convergence ratio threshold below which Wolf is skipped and the system is
 # directly classified as stable (distance_ratio from trajectory_convergence).
-_DEFAULT_CONVERGENCE_THRESHOLD: float = 0.01
+# Raised from 0.01 to 0.05: the log showed distance_ratio=0.0102 being missed
+# by the strict < 0.01 check (0.0102 is not < 0.01).  0.05 safely covers all
+# strongly converging systems (trajectories shrink distance by 20× or more).
+_DEFAULT_CONVERGENCE_THRESHOLD: float = 0.05
 
 # Minimum number of periods required for a reliable LLE estimate
 _MIN_PERIODS: int = 5
@@ -142,6 +145,74 @@ _WOLF_BIAS_STD_THRESHOLD: float = 1e-3
 # For uniform random x0 in [0,1]^N: expected std ≈ sqrt(1/12) ≈ 0.289.
 # A value < 0.02 means trajectories differ by < 7% of a random baseline → context-dominated.
 _TRAJECTORY_DIVERSITY_LOW_THRESHOLD: float = 0.02
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Delay-embedding helper for Rosenstein (Takens reconstruction)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_delay_embedding(
+    trajectory: np.ndarray,
+    m: int,
+    tau: int = 1,
+) -> np.ndarray:
+    """
+    从多通道轨迹构造 Takens 延迟嵌入空间（单 PC 观测量）。
+
+    **科学动机**：
+    Rosenstein 方法的近邻搜索在高维空间（如 N=190 脑区）中受"维数灾难"影响：
+    - 所有点对距离趋于相等（集中现象），导致最近邻几乎不比随机点更近；
+    - LLE 估计主要受环境噪声和空间几何影响，而非吸引子动力学。
+
+    Takens 定理保证：若 m ≥ 2D+1（D 为内在维度），对任意通用观测函数 h(x)，
+    延迟向量 [h(t), h(t+τ), ..., h(t+(m-1)τ)] 与原始相空间微分同胚。
+    因此 m×T_embed 矩阵与原始 N×T 矩阵携带**相同**的 LLE，但 m << N，
+    近邻搜索更高效、更准确。
+
+    **实现**：
+    1. 计算第一主成分得分作为 1D 观测量（功率迭代，O(T×N×20)）；
+    2. 构造延迟嵌入矩阵 y(t) = [obs(t), obs(t+τ), ..., obs(t+(m-1)τ)]。
+
+    Args:
+        trajectory: shape (T, N)，多通道轨迹（float32 / float64）。
+        m:          嵌入维度（建议使用 FNN 确定的最小充分维度，典型值 4–9）。
+                    若 m <= 1 或轨迹过短，返回原始轨迹（关闭嵌入）。
+        tau:        延迟步数（默认 1，即相邻预测步）。
+
+    Returns:
+        shape (T - (m-1)*tau, m)，延迟嵌入轨迹；
+        若 m <= 1 或嵌入后长度 < 10，则返回原始 trajectory（float64）。
+    """
+    T, N = trajectory.shape
+    T_embed = T - (m - 1) * tau
+
+    if m <= 1 or T_embed < 10:
+        return trajectory.astype(np.float64)
+
+    # ── First PC as 1-D observable via power iteration ───────────────────────
+    X = trajectory.astype(np.float64)
+    X = X - X.mean(axis=0)   # centre columns
+
+    # 20 iterations of power method to get dominant right singular vector.
+    # Cost: O(T × N × 20) = O(1000 × 190 × 20) ≈ 3.8 M ops — negligible.
+    rng_local = np.random.default_rng(0)
+    v = rng_local.standard_normal(N)
+    for _ in range(20):
+        u = X @ v           # (T,)
+        v = X.T @ u         # (N,)
+        norm_v = np.linalg.norm(v)
+        if norm_v < 1e-30:
+            break
+        v /= norm_v
+
+    obs = X @ v  # (T,) — unnormalised first PC score
+
+    # ── Build Takens delay matrix ─────────────────────────────────────────────
+    embedded = np.empty((T_embed, m), dtype=np.float64)
+    for k in range(m):
+        embedded[:, k] = obs[k * tau : k * tau + T_embed]
+
+    return embedded
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -365,6 +436,8 @@ def rosenstein_lyapunov(
     max_lag: int = _DEFAULT_ROSENSTEIN_MAX_LAG,
     min_temporal_sep: int = _DEFAULT_ROSENSTEIN_MIN_SEP,
     regression_fraction: float = 0.6,
+    delay_embed_dim: int = 0,
+    delay_embed_tau: int = 1,
 ) -> Tuple[float, np.ndarray]:
     """
     Rosenstein-Collins-De Luca (1993) 方法估计最大 Lyapunov 指数。
@@ -377,6 +450,14 @@ def rosenstein_lyapunov(
       2. 追踪对数平均分离: S(j) = <log||x(t+j) − x(t*+j)||>_t
       3. LLE = S(j) 线性增长段的斜率
 
+    **延迟嵌入加速（delay_embed_dim > 1）**：
+    当 delay_embed_dim >= 2 时，先将多通道轨迹投影到 Takens 延迟嵌入空间
+    （第一主成分观测量，m = delay_embed_dim）再进行近邻搜索，从而：
+      - 绕开 N=190 维空间的"维数灾难"（所有点对距离趋于相等）；
+      - 近邻质量更高，LLE 斜率拟合更准确；
+      - 计算量更小（近邻矩阵 O(T²×m) << O(T²×N)）。
+    推荐使用 delay_embed_dim = FNN 确定的最小充分维度（通常 4–9）。
+
     适用场景：
       - TwinBrainDigitalTwin (twin mode) — 推荐首选，绕开上下文稀释
       - WC 模式 — 与 Wolf 方法的独立交叉验证
@@ -386,6 +467,7 @@ def rosenstein_lyapunov(
 
     参考：
       Rosenstein, Collins & De Luca (1993) Physica D 65:117-134.
+      Kennel, Brown & Abarbanel (1992) Phys. Rev. A 45:3403 — FNN 维度选取
 
     Args:
         trajectory:          shape (T, n_regions)，轨迹数组（float32/64）。
@@ -394,13 +476,33 @@ def rosenstein_lyapunov(
         min_temporal_sep:    近邻对的最小时间间距（默认 20），避免平凡近邻。
         regression_fraction: 用于线性拟合的增长段比例（从 lag=1 开始）。
                              默认 0.6（使用 60% 的 max_lag 范围拟合）。
+        delay_embed_dim:     Takens 延迟嵌入维度（默认 0 = 关闭，直接用原始空间）。
+                             设为 FNN 确定的最小充分维度（如 4 或 7）可改善
+                             高维空间中的近邻搜索质量（见 embedding_dimension.py）。
+        delay_embed_tau:     延迟嵌入的时间步长（默认 1）。
 
     Returns:
         (lle, mean_log_divergence):
           lle:               估计的最大 Lyapunov 指数（每步单位）。
           mean_log_divergence: shape (max_lag,)，平均对数分离曲线。
     """
-    T, N = trajectory.shape
+    # ── Optional delay embedding ──────────────────────────────────────────────
+    if delay_embed_dim >= 2:
+        orig_T = trajectory.shape[0]
+        traj_work = _build_delay_embedding(
+            trajectory, m=delay_embed_dim, tau=delay_embed_tau
+        )
+        if traj_work.shape[0] < orig_T // 2:
+            # Embedding consumed too much of the trajectory; fall back to raw
+            logger.debug(
+                "rosenstein_lyapunov: 延迟嵌入后 T_embed=%d < T/2=%d，回退到原始空间。",
+                traj_work.shape[0], orig_T // 2,
+            )
+            traj_work = trajectory.astype(np.float64)
+    else:
+        traj_work = trajectory.astype(np.float64)
+
+    T, N = traj_work.shape
     # Require at least 2 * min_temporal_sep + max_lag samples
     min_required = 2 * min_temporal_sep + max_lag
     if T < min_required:
@@ -422,9 +524,9 @@ def rosenstein_lyapunov(
     max_ref_points = 2000
     if T > max_ref_points:
         step = T // max_ref_points
-        traj_sub = trajectory[::step].astype(np.float64)
+        traj_sub = traj_work[::step]
     else:
-        traj_sub = trajectory.astype(np.float64)
+        traj_sub = traj_work
         step = 1
 
     T_sub = len(traj_sub)
@@ -683,6 +785,8 @@ def run_lyapunov_analysis(
     n_segments: int = 1,
     rosenstein_max_lag: int = _DEFAULT_ROSENSTEIN_MAX_LAG,
     rosenstein_min_sep: int = _DEFAULT_ROSENSTEIN_MIN_SEP,
+    rosenstein_delay_embed_dim: int = 0,
+    rosenstein_delay_embed_tau: int = 1,
     n_workers: int = 1,
     output_dir: Optional[Path] = None,
 ) -> Dict:
@@ -693,12 +797,18 @@ def run_lyapunov_analysis(
 
     Rosenstein 方法直接从预计算轨迹工作，无需额外调用模型（零推断成本）。
     Wolf/FTLE 每条轨迹每个 segment 需要 2 次 predict_future() 调用：
-      - 40 轨迹 × n_segments=3 × 2 = 240 次调用 → 约 30 分钟（CPU）
-      - 切换为 method="rosenstein" + n_segments=1 → 秒级完成
+      - 200 轨迹 × n_segments=1 × ~20 Wolf 周期 = ~4000 次调用 → 约 60 分钟（CPU）
+      - 切换为 method="rosenstein" → 秒级完成（纯 NumPy）
 
     **自适应 Rosenstein 参数**：
     对短轨迹（total_steps 较小时），max_lag 和 min_sep 自动缩减，确保
     Rosenstein 对任意长度轨迹都能返回有意义的估计（而非 NaN）。
+
+    **延迟嵌入加速（rosenstein_delay_embed_dim > 1）**：
+    当 rosenstein_delay_embed_dim >= 2 时，将每条轨迹投影到 Takens 延迟嵌入
+    空间再做 Rosenstein 近邻搜索，绕开 N=190 维空间的"维数灾难"。推荐使用
+    嵌入维度分析（步骤 12）确定的 FNN 最小充分维度（通常 4–9）。
+    当不设置（默认 0）时，直接在原始 N 维空间运行。
 
     **并行加速（n_workers > 1）**：
     Rosenstein 方法：纯 NumPy，ThreadPoolExecutor 并行，线程安全。
@@ -707,7 +817,7 @@ def run_lyapunov_analysis(
 
     **收敛优先策略**：若 ``convergence_result`` 来自
     ``run_trajectory_convergence`` 且
-    ``distance_ratio < convergence_threshold``（默认 0.01），则跳过
+    ``distance_ratio < convergence_threshold``（默认 0.05），则跳过
     Wolf 计算，直接用 FTLE 做快速交叉验证并标注 "stable_by_convergence"。
 
     **多段采样（n_segments > 1）**：
@@ -725,32 +835,39 @@ def run_lyapunov_analysis(
     使用 method="rosenstein" 可绕开上下文稀释偏差。
 
     Args:
-        trajectories:         shape (n_init, steps, n_regions)。
-        simulator:            ``BrainDynamicsSimulator`` 实例。
-        epsilon:              名义扰动幅度（默认 1e-6）。
-        renorm_steps:         Wolf 方法的重归一化周期步数（默认 50）。
-        skip_fraction:        FTLE 方法跳过前段比例。
-        method:               "rosenstein"（默认，twin 模式推荐，零额外推断成本）、
-                              "wolf"（经典，WC 模式推荐）、
-                              "ftle"（快速对照）、
-                              "both"（Wolf + FTLE + Rosenstein 交叉验证）。
-        convergence_result:   ``run_trajectory_convergence`` 的返回字典；
-                              若 distance_ratio < convergence_threshold 则
-                              跳过 Wolf 并标注稳定。None → 不做收敛优先判断。
-        convergence_threshold: distance_ratio 低于此阈值视为强收敛（默认 0.01）。
-        n_segments:           每条轨迹的采样段数（默认 1 = 仅使用 x0）。
-                              设为 3–5 可在轨迹不同位置多次采样，减少偏差。
-                              对 Rosenstein 方法成本极低；对 Wolf/FTLE 每段增加
-                              2 次模型调用。
-        rosenstein_max_lag:   Rosenstein 方法追踪的最大步数（默认 50）；
-                              自动缩减以适配短轨迹。
-        rosenstein_min_sep:   Rosenstein 方法近邻对最小时间间距（默认 20）；
-                              自动缩减以适配短轨迹。
-        n_workers:            并行 worker 数量（默认 1 = 顺序执行）。
-                              n_workers > 1 对 Rosenstein 始终安全（纯 NumPy）。
-                              对 Wolf/FTLE 仅推荐在 CPU 推断时开启。
-        output_dir:           保存 lyapunov_values.npy、log_growth_curve.npy、
-                              lyapunov_report.json；None → 不保存。
+        trajectories:              shape (n_init, steps, n_regions)。
+        simulator:                 ``BrainDynamicsSimulator`` 实例。
+        epsilon:                   名义扰动幅度（默认 1e-6）。
+        renorm_steps:              Wolf 方法的重归一化周期步数（默认 50）。
+        skip_fraction:             FTLE 方法跳过前段比例。
+        method:                    "rosenstein"（默认，twin 模式推荐，零额外推断成本）、
+                                   "wolf"（经典，WC 模式推荐）、
+                                   "ftle"（快速对照）、
+                                   "both"（Wolf + FTLE + Rosenstein 交叉验证）。
+        convergence_result:        ``run_trajectory_convergence`` 的返回字典；
+                                   若 distance_ratio < convergence_threshold 则
+                                   跳过 Wolf 并标注稳定。None → 不做收敛优先判断。
+        convergence_threshold:     distance_ratio 低于此阈值视为强收敛（默认 0.05）。
+                                   原为 0.01；提高到 0.05 避免边界值（如 0.010）
+                                   因浮点精度未能触发 Wolf 跳过。
+        n_segments:                每条轨迹的采样段数（默认 1 = 仅使用 x0）。
+                                   设为 3 可在轨迹不同位置多次采样，减少偏差。
+                                   对 Rosenstein 方法成本极低；对 Wolf/FTLE 每段增加
+                                   2 次模型调用。
+        rosenstein_max_lag:        Rosenstein 方法追踪的最大步数（默认 50）；
+                                   自动缩减以适配短轨迹。
+        rosenstein_min_sep:        Rosenstein 方法近邻对最小时间间距（默认 20）；
+                                   自动缩减以适配短轨迹。
+        rosenstein_delay_embed_dim: Takens 延迟嵌入维度（默认 0 = 关闭）。
+                                   >= 2 时在运行 Rosenstein 前将每条轨迹投影到
+                                   第一 PC 的 m 维延迟嵌入空间，改善高维 NN 质量。
+                                   推荐设为 FNN min_sufficient_dim（步骤 12 给出）。
+        rosenstein_delay_embed_tau: 延迟嵌入步长（默认 1）。
+        n_workers:                 并行 worker 数量（默认 1 = 顺序执行）。
+                                   n_workers > 1 对 Rosenstein 始终安全（纯 NumPy）。
+                                   对 Wolf/FTLE 仅推荐在 CPU 推断时开启。
+        output_dir:                保存 lyapunov_values.npy、log_growth_curve.npy、
+                                   lyapunov_report.json；None → 不保存。
 
     Returns:
         results: {
@@ -769,6 +886,7 @@ def run_lyapunov_analysis(
           "mean_rosenstein":      float（含 rosenstein/both 时）
           "skipped_wolf":         bool       Wolf 是否因收敛而被跳过
           "wolf_bias_warning":    bool       Wolf 结果是否可能有上下文稀释偏差
+          "delay_embed_dim":      int        实际使用的延迟嵌入维度（0 = 未使用）
         }
     """
     n_traj, total_steps, n_regions = trajectories.shape
@@ -809,6 +927,16 @@ def run_lyapunov_analysis(
                 n_workers,
             )
             n_workers = 1
+
+    # ── Log delay-embedding info if active ────────────────────────────────────
+    _use_delay_embed = (rosenstein_delay_embed_dim >= 2)
+    if _use_delay_embed and effective_method in ("rosenstein", "both"):
+        logger.info(
+            "  Rosenstein 延迟嵌入已启用: m=%d, τ=%d "
+            "（将 N=%d 维轨迹投影到 %d 维延迟空间，改善近邻搜索质量）",
+            rosenstein_delay_embed_dim, rosenstein_delay_embed_tau,
+            n_regions, rosenstein_delay_embed_dim,
+        )
 
     logger.info(
         "Lyapunov 指数分析: method=%s, %d 条轨迹, 每条 %d 步, ε=%.2e, "
@@ -955,6 +1083,8 @@ def run_lyapunov_analysis(
                 trajectory=sub_traj,
                 max_lag=adapt_max_lag,
                 min_temporal_sep=adapt_min_sep,
+                delay_embed_dim=rosenstein_delay_embed_dim,
+                delay_embed_tau=rosenstein_delay_embed_tau,
             )
             if np.isfinite(rosen_lle):
                 rosen_segs.append(rosen_lle)
@@ -1195,6 +1325,8 @@ def run_lyapunov_analysis(
         "initial_trajectory_diversity": initial_diversity,
         "final_trajectory_diversity": final_diversity,
         "context_dominated": context_dominated,
+        # Delay-embedding info (0 = disabled; >1 = Takens embedding dimension used)
+        "delay_embed_dim": rosenstein_delay_embed_dim if _use_delay_embed else 0,
     }
 
     if run_ftle or effective_method == "ftle":

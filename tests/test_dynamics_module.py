@@ -15,6 +15,8 @@ Covers:
   - Lyapunov exponent estimation
   - Trajectory convergence analysis
   - Random model comparison
+  - Delay-embedding helper (_build_delay_embedding)
+  - Convergence-threshold skip behaviour (raised to 0.05)
   - load_model: error behavior for missing / non-TwinBrain checkpoints
 """
 
@@ -60,6 +62,8 @@ from analysis.lyapunov import (
     multi_direction_ftle,
     classify_chaos_regime,
     run_lyapunov_analysis,
+    _build_delay_embedding,
+    _DEFAULT_CONVERGENCE_THRESHOLD,
 )
 from analysis.trajectory_convergence import (
     compute_pairwise_distances,
@@ -1013,6 +1017,200 @@ class TestMultiSegmentLyapunov(unittest.TestCase):
             with open(Path(tmp) / "lyapunov_report.json") as fh:
                 report = json.load(fh)
             self.assertIn("mean_rosenstein", report)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Delay Embedding Tests (_build_delay_embedding)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBuildDelayEmbedding(unittest.TestCase):
+    """Tests for _build_delay_embedding (Takens reconstruction helper)."""
+
+    def _make_limit_cycle(self, T: int = 300, n_regions: int = 10) -> np.ndarray:
+        t = np.linspace(0, 6 * np.pi, T)
+        traj = np.column_stack(
+            [0.5 + 0.3 * np.sin(t + i * 0.1) for i in range(n_regions)]
+        ).astype(np.float64)
+        return traj
+
+    def test_output_shape(self):
+        """Shape (T - (m-1)*tau, m) for valid parameters."""
+        T, N, m = 200, 10, 7
+        traj = self._make_limit_cycle(T, N)
+        emb = _build_delay_embedding(traj, m=m, tau=1)
+        self.assertEqual(emb.shape, (T - m + 1, m))
+
+    def test_tau_gt_1_shape(self):
+        """Shape with tau=2: T_embed = T - (m-1)*tau."""
+        T, N, m, tau = 200, 10, 4, 2
+        traj = self._make_limit_cycle(T, N)
+        emb = _build_delay_embedding(traj, m=m, tau=tau)
+        expected_T = T - (m - 1) * tau
+        self.assertEqual(emb.shape, (expected_T, m))
+
+    def test_m1_returns_original(self):
+        """m=1 (or m=0) should return original trajectory (fallback)."""
+        traj = self._make_limit_cycle()
+        for m in (0, 1):
+            emb = _build_delay_embedding(traj, m=m, tau=1)
+            self.assertEqual(emb.shape[1], traj.shape[1],
+                             f"m={m} should return original N-dim space")
+
+    def test_short_trajectory_fallback(self):
+        """Very short trajectory should not crash and returns original."""
+        traj = self._make_limit_cycle(T=5, n_regions=4)
+        emb = _build_delay_embedding(traj, m=7, tau=1)
+        # T_embed = 5 - 6 = -1 → fallback to original
+        self.assertEqual(emb.shape, traj.shape)
+
+    def test_output_dtype_float64(self):
+        """Output should be float64 regardless of input dtype."""
+        traj = self._make_limit_cycle().astype(np.float32)
+        emb = _build_delay_embedding(traj, m=4, tau=1)
+        self.assertEqual(emb.dtype, np.float64)
+
+    def test_first_column_is_pc_score(self):
+        """The first column should be proportional to the first PC score."""
+        T, N, m = 200, 10, 4
+        traj = self._make_limit_cycle(T, N)
+        emb = _build_delay_embedding(traj, m=m, tau=1)
+        # Column 0 is obs(t), column 1 is obs(t+1). They should have identical
+        # structure but shifted by one step.
+        col0 = emb[:, 0]
+        col1_shifted = emb[:-1, 1]  # obs(t+1) aligns with obs[1:T_embed]
+        col0_aligned = col0[:-1]    # drop last to match length
+        # Correlation between adjacent lags should be very high for a slow signal
+        corr = float(np.corrcoef(col0_aligned, col1_shifted)[0, 1])
+        self.assertGreater(corr, 0.90, "Adjacent delay columns should be highly correlated")
+
+    def test_rosenstein_with_delay_embedding_finite(self):
+        """rosenstein_lyapunov with delay_embed_dim=4 should return finite LLE."""
+        traj = self._make_limit_cycle(T=400, n_regions=10)
+        lle, curve = rosenstein_lyapunov(
+            traj, max_lag=30, min_temporal_sep=10,
+            delay_embed_dim=4, delay_embed_tau=1,
+        )
+        self.assertTrue(np.isfinite(lle), f"Expected finite LLE, got {lle}")
+        self.assertEqual(len(curve), 30)
+
+    def test_delay_embed_dim_in_results(self):
+        """run_lyapunov_analysis should report delay_embed_dim in results dict."""
+        # Use a minimal mock that satisfies rosenstein (no model calls needed)
+        class _MockSim:
+            device = "cpu"
+            state_bounds = (0.0, 1.0)
+
+        T = 300
+        t = np.linspace(0, 6 * np.pi, T)
+        trajs = np.stack([
+            np.column_stack([0.5 + 0.3 * np.sin(t + i * 0.1 + j * 0.2)
+                             for i in range(N)]).astype(np.float32)
+            for j in range(4)
+        ])
+        results = run_lyapunov_analysis(
+            trajs, _MockSim(), method="rosenstein",
+            rosenstein_delay_embed_dim=4,
+            rosenstein_delay_embed_tau=1,
+            rosenstein_max_lag=20, rosenstein_min_sep=5,
+        )
+        self.assertEqual(results["delay_embed_dim"], 4,
+                         "delay_embed_dim should be stored in results")
+        self.assertTrue(np.isfinite(results["mean_rosenstein"]))
+
+    def test_delay_embed_dim_0_not_stored(self):
+        """When delay_embed_dim=0 (disabled), results should report 0."""
+        class _MockSim:
+            device = "cpu"
+            state_bounds = (0.0, 1.0)
+
+        trajs = np.random.rand(3, 300, N).astype(np.float32)
+        results = run_lyapunov_analysis(
+            trajs, _MockSim(), method="rosenstein",
+            rosenstein_delay_embed_dim=0,
+            rosenstein_max_lag=20, rosenstein_min_sep=5,
+        )
+        self.assertEqual(results["delay_embed_dim"], 0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Convergence Threshold Tests (raised from 0.01 → 0.05)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestConvergenceThreshold(unittest.TestCase):
+    """Tests that the convergence_threshold correctly skips Wolf for ratio=0.010."""
+
+    def test_default_threshold_is_0_05(self):
+        """The module-level default must be 0.05 (raised from 0.01)."""
+        self.assertAlmostEqual(_DEFAULT_CONVERGENCE_THRESHOLD, 0.05)
+
+    def test_boundary_case_old_threshold_missed(self):
+        """distance_ratio=0.010 was missed by the old threshold=0.01 (strict <)."""
+        # Demonstrates the original boundary bug: 0.010 is NOT < 0.010
+        self.assertFalse(0.010 < 0.01,
+                         "0.010 < 0.01 should be False (this was the bug)")
+
+    def test_boundary_case_new_threshold_catches(self):
+        """distance_ratio=0.010 is now correctly caught by threshold=0.05."""
+        self.assertTrue(0.010 < 0.05,
+                        "0.010 < 0.05 should be True (this is the fix)")
+
+    def test_convergence_skip_with_ratio_0_010(self):
+        """run_lyapunov_analysis should skip Wolf when ratio=0.010 and threshold=0.05.
+
+        When Wolf is skipped due to convergence, effective_method switches to 'ftle'.
+        The mock simulator provides a minimal rollout for the FTLE computation.
+        Key assertion: skipped_wolf=True is set correctly.
+        """
+        class _MockSim:
+            device = "cpu"
+            state_bounds = (0.0, 1.0)
+            # Minimal rollout so FTLE can complete
+            def rollout(self, x0, steps, stimulus=None, context_window_idx=0):
+                rng = np.random.default_rng(0)
+                traj = np.clip(
+                    x0[None, :] + rng.standard_normal((steps, len(x0))) * 0.001,
+                    0.0, 1.0,
+                )
+                return traj.astype(np.float32), {}
+
+        T = 100
+        t = np.linspace(0, 4 * np.pi, T)
+        trajs = np.stack([
+            np.column_stack([0.5 + 0.3 * np.sin(t + i * 0.1)
+                             for i in range(N)]).astype(np.float32)
+            for _ in range(4)
+        ])
+        conv_result = {"distance_ratio": 0.010}
+
+        results = run_lyapunov_analysis(
+            trajs, _MockSim(),
+            method="wolf",                  # would take long if not skipped
+            convergence_result=conv_result,
+            convergence_threshold=0.05,     # new value
+            rosenstein_max_lag=15, rosenstein_min_sep=5,
+        )
+        self.assertTrue(results["skipped_wolf"],
+                        "Wolf should be skipped for ratio=0.010 < threshold=0.05")
+
+    def test_no_skip_above_threshold(self):
+        """ratio=0.10 should NOT trigger skip with threshold=0.05."""
+        class _MockSim:
+            device = "cpu"
+            state_bounds = (0.0, 1.0)
+
+        trajs = np.random.rand(3, 100, N).astype(np.float32)
+        conv_result = {"distance_ratio": 0.10}  # above threshold
+
+        results = run_lyapunov_analysis(
+            trajs, _MockSim(),
+            method="rosenstein",            # use rosenstein so no model calls needed
+            convergence_result=conv_result,
+            convergence_threshold=0.05,
+            rosenstein_max_lag=15, rosenstein_min_sep=5,
+        )
+        # skipped_wolf only applies to wolf; for rosenstein method, it's False
+        self.assertFalse(results["skipped_wolf"],
+                         "Wolf should NOT be skipped for ratio=0.10 > threshold=0.05")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

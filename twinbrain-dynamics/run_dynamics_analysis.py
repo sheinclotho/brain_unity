@@ -182,23 +182,41 @@ _DEFAULTS = {
         # "rosenstein" (default): uses only the pre-computed free-dynamics
         #   trajectories — zero extra model calls.  Strongly recommended for
         #   TwinBrainDigitalTwin (no context-dilution bias).
-        # "wolf" / "ftle" / "both": each trajectory requires 2 extra rollouts
-        #   per segment × n_segments.  With n_traj=40 and n_segments=1 that is
-        #   80 extra predict_future() calls, vs. 0 for "rosenstein".
-        "method": "rosenstein",    # Changed from "both" — saves ~480 model calls for 40 traj
+        # "wolf" / "ftle" / "both": Wolf requires 2 predict_future() calls per
+        #   renormalisation period × n_traj trajectories × n_segments segments.
+        #   With n_traj=200, steps=1000, renorm_steps=50 (→ 20 periods/traj),
+        #   n_segments=1: 200 × 20 × 2 = ~8000 calls → ~60 min on CPU.
+        #   Using method="rosenstein" reduces this to 0 extra calls.
+        "method": "rosenstein",    # Default: zero extra model calls, no Wolf bias
         "epsilon": 1e-6,           # Nominal perturbation magnitude
         "renorm_steps": 50,        # Steps per Wolf period
         "skip_fraction": 0.1,      # Skip initial transient fraction when fitting (FTLE)
-        "convergence_threshold": 0.01,  # Skip Wolf if distance_ratio < this
+        # Raised from 0.01 to 0.05: distance_ratio=0.010 (e.g. 0.0026/0.2547) now
+        # correctly triggers Wolf skip.  The old threshold missed the boundary case
+        # where ratio==0.010 due to strict `<` comparison.
+        "convergence_threshold": 0.05,
         # ── n_segments ────────────────────────────────────────────────────────
-        # Number of starting segments sampled per trajectory.
-        # For Rosenstein this has negligible cost (pure NumPy).  For Wolf/FTLE
-        # each extra segment adds 2 more model calls per trajectory.  Default
-        # reduced from 3→1 to avoid unexpected slowdowns when users switch to
-        # "wolf" or "both".  Increase to 3 for more robust Wolf/FTLE estimates.
-        "n_segments": 1,           # Changed from 3 — reduces Wolf/FTLE cost by 3×
+        # For Rosenstein, each extra segment adds negligible cost (pure NumPy);
+        # 3 segments samples the attractor at early / mid / late trajectory
+        # positions, giving a more robust LLE estimate.  For Wolf/FTLE, each
+        # extra segment adds 2 model calls per trajectory (keep at 1 for speed).
+        "n_segments": 3,           # Changed from 1 → 3 for better Rosenstein coverage
         "rosenstein_max_lag": 50,  # Rosenstein method: max tracking lag
         "rosenstein_min_sep": 20,  # Rosenstein method: min temporal separation for NN search
+        # ── Delay embedding (Takens) ──────────────────────────────────────────
+        # Set delay_embed_dim >= 2 to run Rosenstein in a delay-embedded space
+        # instead of the raw N-dimensional state space.  This avoids the "curse
+        # of dimensionality" (N=190 → all NN distances nearly equal) and improves
+        # LLE estimate quality.
+        #
+        # Recommended value: the FNN min_sufficient_dim from step 12 (embedding
+        # dimension analysis).  Typical value: 4–9 for fMRI/EEG brain dynamics.
+        # The log from step 12 suggests: FNN min dimension = 4, Takens min = 9.
+        #
+        # 0 = disabled (default): run Rosenstein in original N-dim space.
+        # Set to 7 after running step 12 once to obtain the FNN dimension.
+        "delay_embed_dim": 0,      # 0 = disabled; set to FNN dim for better NN quality
+        "delay_embed_tau": 1,      # Delay embedding lag (steps)
         # ── Parallelism ───────────────────────────────────────────────────────
         # n_workers > 1 enables parallel computation of Wolf/FTLE across
         # trajectories using a ThreadPoolExecutor.  Requires thread-safe model
@@ -489,10 +507,12 @@ def _run_single_modality(
                 skip_fraction=lya_cfg.get("skip_fraction", 0.1),
                 method=lya_method,
                 convergence_result=results.get("trajectory_convergence"),
-                convergence_threshold=lya_cfg.get("convergence_threshold", 0.01),
-                n_segments=lya_cfg.get("n_segments", 1),
+                convergence_threshold=lya_cfg.get("convergence_threshold", 0.05),
+                n_segments=lya_cfg.get("n_segments", 3),
                 rosenstein_max_lag=lya_cfg.get("rosenstein_max_lag", 50),
                 rosenstein_min_sep=lya_cfg.get("rosenstein_min_sep", 20),
+                rosenstein_delay_embed_dim=lya_cfg.get("delay_embed_dim", 0),
+                rosenstein_delay_embed_tau=lya_cfg.get("delay_embed_tau", 1),
                 n_workers=lya_cfg.get("n_workers", 1),
                 output_dir=output_dir,
             )

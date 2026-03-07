@@ -313,7 +313,8 @@ def plot_lyapunov_growth(
     ax.set_ylabel("log(r/ε) per period")
     ax.set_title(
         "Per-Period Log Growth\n"
-        "✓ Identical bars after convergence are expected (LLE has stabilised)",
+        "✓ Stable systems: bars converge to identical height (LLE stabilised)\n"
+        "  Chaotic systems: bars fluctuate around mean LLE — bimodal ok",
         fontsize=9,
     )
     ax.legend(fontsize=7, loc="upper right", ncol=2)

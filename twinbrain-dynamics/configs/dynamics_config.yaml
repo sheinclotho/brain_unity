@@ -62,17 +62,64 @@ stability_analysis:
 # Lyapunov exponent estimation
 lyapunov:
   enabled: true
-  method: "both"          # "rosenstein" (fast, zero model calls), "wolf", "ftle", or "both"
-  epsilon: 1.0e-6         # Nominal perturbation magnitude (reduced from 1e-5 to lower boundary bias)
-  renorm_steps: 50        # Steps between Wolf renormalization periods (increased from 20)
-  skip_fraction: 0.1      # Fraction of trajectory to skip (transient, ftle only)
-  convergence_threshold: 0.01  # Skip Wolf if trajectory distance_ratio < this (system is stable)
-  n_workers: 1            # Parallel workers for Wolf/FTLE (1 = sequential)
+  # ── Method selection ──────────────────────────────────────────────────────
+  # "rosenstein" (recommended default for TwinBrainDigitalTwin):
+  #   Uses only the pre-computed free-dynamics trajectories — ZERO extra model
+  #   calls.  Not affected by the Wolf context-dilution bias.
+  #   Typical runtime: < 30 seconds for 200 trajectories × 1000 steps.
+  #
+  # "both": Wolf + FTLE + Rosenstein cross-validation.  Wolf requires 2 calls
+  #   per renormalisation period × n_traj × n_segments.  With n_traj=200,
+  #   steps=1000, renorm_steps=50 (20 periods/traj), n_segments=1:
+  #   200 × 20 × 2 = ~8000 extra predict_future() calls → ~60 min on CPU.
+  #   Wolf is ALWAYS biased for TwinBrainDigitalTwin (context dilution),
+  #   so "both" is only useful for explicit bias quantification — the pipeline
+  #   will auto-switch to Rosenstein for chaos classification anyway.
+  #
+  # "wolf" / "ftle": not recommended for TwinBrainDigitalTwin.
+  method: "rosenstein"           # Changed from "both" — saves ~60 min of Wolf compute
+  epsilon: 1.0e-6                # Nominal perturbation magnitude
+  renorm_steps: 50               # Steps between Wolf renormalization periods
+  skip_fraction: 0.1             # Fraction of trajectory to skip (transient, ftle only)
+  # ── Convergence-first threshold ──────────────────────────────────────────
+  # Skip Wolf if trajectory distance_ratio (final/initial distance) < this.
+  # Raised from 0.01 to 0.05: the log showed distance_ratio=0.0102 being
+  # missed by the strict < 0.01 check.  0.05 safely covers all strongly
+  # converging systems (distance shrinks by 20× or more).
+  convergence_threshold: 0.05    # Was 0.01; raised to catch boundary cases like ratio=0.010
+  # ── Multi-segment sampling ────────────────────────────────────────────────
+  # Number of trajectory segments to sample per trajectory.  For Rosenstein
+  # this is essentially free (pure NumPy); 3 segments gives estimates at
+  # early / mid / late attractor positions → more robust LLE.
+  # For Wolf/FTLE, each extra segment adds 2 model calls per trajectory.
+  n_segments: 3                  # Was 1; raised to 3 for Rosenstein (negligible cost)
+  # ── Rosenstein parameters ────────────────────────────────────────────────
+  rosenstein_max_lag: 50         # Max tracking lag (auto-reduced for short trajectories)
+  rosenstein_min_sep: 20         # Min temporal separation for nearest-neighbour search
+  # ── Takens delay embedding (improves Rosenstein NN quality) ─────────────
+  # When delay_embed_dim >= 2, the trajectory is projected to a Takens delay-
+  # embedded space (1st PC observable, m-dimensional) before Rosenstein NN
+  # search.  This avoids the "curse of dimensionality" in N=190 dim space
+  # where all point-pair distances are nearly equal.
+  #
+  # How to choose:
+  #   1. Run the pipeline once with delay_embed_dim: 0 (default).
+  #   2. Check step 12 (embedding dimension analysis): look for
+  #      "FNN 最小充分维度 = N" in the log.  A typical value is 4–9.
+  #   3. Set delay_embed_dim to that value and re-run step 9.
+  #
+  # From the sample log: FNN min dim = 4, Takens min = 9.  A safe choice
+  # is 7 (satisfies Takens theorem 2D+1=9 with small safety margin from
+  # the correlation dimension D₂=1.57 → 2×4+1=9, use 7).
+  delay_embed_dim: 0             # 0 = disabled; set to FNN dim (e.g. 7) after step 12
+  delay_embed_tau: 1             # Delay step (1 = use consecutive prediction steps)
+  # ── Parallelism ──────────────────────────────────────────────────────────
+  n_workers: 1                   # 1 = sequential; set >1 for multi-core Rosenstein
   # GPU acceleration note:
-  #   - method="rosenstein": zero extra model calls, pure NumPy → safe to set n_workers>1
-  #   - method="wolf"/"ftle"/"both": each worker calls the model; on GPU this causes
-  #     VRAM contention → n_workers is automatically clamped to 1 when device=cuda.
-  #     For CPU inference, set n_workers=4~8 for multi-core speedup.
+  #   - method="rosenstein": zero extra model calls, pure NumPy → safe to set
+  #     n_workers=4~8 for CPU parallelism; on GPU the model is idle so no contention.
+  #   - method="wolf"/"ftle"/"both": each worker calls the model; on GPU this
+  #     causes VRAM contention → n_workers is automatically clamped to 1.
   #   - CLI override: python run_dynamics_analysis.py ... --n-workers 4
 
 # Trajectory convergence analysis
