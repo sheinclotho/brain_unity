@@ -191,10 +191,19 @@ def load_graph_for_inference(
     k_cross_modal: int = 5,
 ) -> HeteroData:
     """
-    加载图缓存文件并重建跨模态边，返回推理就绪的 ``HeteroData``。
+    加载图缓存文件并重建所有图边，返回推理就绪的 ``HeteroData``。
 
-    图缓存（``outputs/graph_cache/*.pt``）只存储同模态边；跨模态边
-    ``('eeg', 'projects_to', 'fmri')`` 每次从节点特征动态重建（见 API.md §2.5）。
+    V5 图缓存（``outputs/graph_cache/*.pt``）**只存储节点特征**（``fmri.x``、
+    ``eeg.x``）。图边不被存储，必须在推理时从节点时序动态重建：
+
+    - 同模态边 ``('fmri', 'connects', 'fmri')``：从 fMRI 时序的 Pearson 相关
+      矩阵计算（与训练时一致）。EEG 同模态边同理。
+    - 跨模态边 ``('eeg', 'projects_to', 'fmri')``：随机 k-NN 映射（仅在
+      fMRI + EEG 双模态下生成）。
+
+    **如果跳过这一步（只有节点特征无边）：**
+    ``GraphPredictionPropagator`` 和编码器的图卷积均退化为 passthrough，
+    刺激节点 i 的效应无法传播到任何 j≠i，导致响应矩阵呈纯对角线形态。
 
     Args:
         graph_path:    图缓存文件路径（``{subject_id}_{task}_{hash}.pt``）。
@@ -257,17 +266,66 @@ def load_graph_for_inference(
         {nt: tuple(graph[nt].x.shape) for nt in graph.node_types},
     )
 
-    # Rebuild cross-modal edges if both modalities are present
-    if "eeg" in graph.node_types and "fmri" in graph.node_types:
-        try:
-            from models.graph_native_mapper import GraphNativeBrainMapper
-        except ImportError as exc:
-            raise ImportError(
-                f"无法导入 GraphNativeBrainMapper: {exc}\n"
-                f"请确保仓库根目录（{_REPO_ROOT}）在 PYTHONPATH 中。"
-            ) from exc
+    # ── Import mapper once for all edge-reconstruction steps ─────────────────
+    try:
+        from models.graph_native_mapper import GraphNativeBrainMapper
+    except ImportError as exc:
+        raise ImportError(
+            f"无法导入 GraphNativeBrainMapper: {exc}\n"
+            f"请确保仓库根目录（{_REPO_ROOT}）在 PYTHONPATH 中。"
+        ) from exc
 
-        mapper = GraphNativeBrainMapper(device="cpu")
+    mapper = GraphNativeBrainMapper(device="cpu")
+
+    # ── Rebuild intra-modal edges (fMRI and/or EEG) ──────────────────────────
+    # V5 caches store only node features; intra-modal FC edges must be
+    # recomputed here so that the encoder's graph convolutions and the
+    # GraphPredictionPropagator can propagate stimulation effects across
+    # brain regions.  Without these edges both modules degrade to passthrough,
+    # producing a perfectly diagonal response matrix (stimulating region i only
+    # changes region i — no inter-regional propagation).
+    _INTRA_MODAL_CFG = {
+        "fmri": (mapper.threshold_fmri, mapper.k_nearest_fmri, "fMRI"),
+        "eeg":  (mapper.threshold_eeg,  mapper.k_nearest_eeg,  "EEG"),
+    }
+    for nt, (thresh, k_nn, label) in _INTRA_MODAL_CFG.items():
+        if nt not in graph.node_types:
+            continue
+        edge_type = (nt, "connects", nt)
+        # Respect pre-existing valid edges (e.g. from training pipelines that
+        # save edges in the cache).
+        if edge_type in graph.edge_types:
+            existing = getattr(graph[edge_type], "edge_index", None)
+            if existing is not None and existing.shape[1] > 0:
+                logger.info(
+                    "  %s 同模态边已存在，保留缓存值 (E=%d)", label, existing.shape[1]
+                )
+                continue
+        try:
+            # graph[nt].x shape: [N, T, 1]  →  timeseries: [N, T] numpy
+            ts = graph[nt].x.squeeze(-1).cpu().numpy()  # [N, T]
+            if nt == "fmri":
+                conn = mapper._compute_correlation_gpu(ts)
+            else:
+                conn = mapper._compute_eeg_connectivity(ts)
+            ei, ea = mapper.build_graph_structure(
+                conn, threshold=thresh, k_nearest=k_nn
+            )
+            graph[edge_type].edge_index = ei
+            graph[edge_type].edge_attr  = ea
+            logger.info(
+                "  ✓ %s 同模态边重建完成 (N=%d, E=%d, avg_degree=%.1f)",
+                label, ts.shape[0], ei.shape[1], ei.shape[1] / max(ts.shape[0], 1),
+            )
+        except (RuntimeError, ValueError, TypeError) as exc:
+            logger.warning(
+                "  ⚠ %s 同模态边重建失败: %s\n"
+                "    编码器和传播器将以 passthrough 模式运行（响应矩阵可能退化为对角线）。",
+                label, exc,
+            )
+
+    # ── Rebuild cross-modal edges if both modalities are present ─────────────
+    if "eeg" in graph.node_types and "fmri" in graph.node_types:
         cross_ei, cross_ea = mapper.create_simple_cross_modal_edges(
             graph, k_cross_modal=k_cross_modal
         )
