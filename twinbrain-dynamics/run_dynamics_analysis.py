@@ -132,9 +132,19 @@ _DEFAULTS = {
         "k_cross_modal": 5,    # Cross-modal edges per EEG electrode (API.md §2.5)
     },
     "simulator": {
-        # Which modality to simulate: 'fmri', 'eeg', or 'both'.
-        # 'both' runs the full pipeline twice (once per modality) and writes
-        # results to output_dir/fmri/ and output_dir/eeg/ respectively.
+        # Which modality to simulate: 'fmri', 'eeg', 'both', or 'joint'.
+        # - 'fmri'  : analyse the fMRI BOLD stream only.
+        # - 'eeg'   : analyse the EEG stream only.
+        # - 'both'  : run the full pipeline independently for each modality,
+        #             outputting separate results under output_dir/fmri/ and
+        #             output_dir/eeg/.  Requires both node types in the graph cache.
+        # - 'joint' : single pipeline run using a COMBINED fMRI+EEG state vector.
+        #             predict_future() is called once; each modality's predictions are
+        #             z-score normalised per channel, then concatenated into a joint
+        #             state [z_fmri | z_eeg] of dimension N_fmri+N_eeg.  Produces a
+        #             single set of dynamics metrics (one Lyapunov exponent, one
+        #             attractor, etc.) that reflects the joint multi-scale brain state.
+        #             Requires both 'fmri' and 'eeg' nodes in the graph cache.
         "modality": "fmri",
         "fmri_subsample": 25,  # Kept for compatibility; model infers dt from graph
     },
@@ -253,11 +263,11 @@ def _run_single_modality(
       2  Create simulator
       3  Free dynamics
       4  Attractor analysis
-      5  Virtual stimulation
-      6  Response matrix
+      5  Virtual stimulation  (skipped for joint mode)
+      6  Response matrix      (skipped for joint mode)
       7  Stability analysis
       8  Trajectory convergence
-      9  Lyapunov exponent
+      9  Lyapunov exponent    (joint mode forces method='rosenstein')
       10 Random model comparison
       11 Surrogate test          (GPT-review validation)
       12 Embedding dimension     (GPT-review validation)
@@ -266,7 +276,7 @@ def _run_single_modality(
         cfg:        Merged configuration dict.
         twin:       Loaded TwinBrainDigitalTwin model.
         base_graph: HeteroData graph cache.
-        modality:   ``"fmri"`` or ``"eeg"``.
+        modality:   ``"fmri"``, ``"eeg"``, or ``"joint"``.
         output_dir: Per-modality output directory.
         device:     Compute device string.
 
@@ -299,12 +309,17 @@ def _run_single_modality(
         fmri_subsample=cfg["simulator"].get("fmri_subsample", 25),
         device=device,
     )
-    logger.info(
-        "  模式=TwinBrainDigitalTwin, modality=%s, n_regions=%d, dt=%.4f s",
-        simulator.modality,
-        simulator.n_regions,
-        simulator.dt,
-    )
+    if modality == "joint":
+        logger.info(
+            "  joint 模态: N_fmri=%d, N_eeg=%d, N_joint=%d, dt=%.4f s/TR",
+            simulator.n_fmri_regions, simulator.n_eeg_regions,
+            simulator.n_regions, simulator.dt,
+        )
+    else:
+        logger.info(
+            "  模式=TwinBrainDigitalTwin, modality=%s, n_regions=%d, dt=%.4f s/TR",
+            simulator.modality, simulator.n_regions, simulator.dt,
+        )
 
     results: dict = {}
 
@@ -350,6 +365,16 @@ def _run_single_modality(
             simulator.n_regions,
         )
         target_nodes = [0]
+    if modality == "joint":
+        # In joint mode node indices are in [0, N_fmri+N_eeg).
+        # Log which modality each target node falls into for transparency.
+        for tn in target_nodes:
+            _tmod = "fmri" if tn < simulator.n_fmri_regions else "eeg"
+            _tch = tn if tn < simulator.n_fmri_regions else tn - simulator.n_fmri_regions
+            logger.info(
+                "  target_node=%d → %s 节点 %d（联合模态索引映射）",
+                tn, _tmod, _tch,
+            )
 
     stim_results = run_virtual_stimulation(
         simulator=simulator,
@@ -368,9 +393,19 @@ def _run_single_modality(
     logger.info("=" * 60)
     logger.info("步骤 6/%d  响应矩阵计算", n_total_steps)
     rm_cfg = cfg["response_matrix"]
-    n_nodes_rm = min(
-        rm_cfg.get("n_nodes", simulator.n_regions), simulator.n_regions
-    )
+    n_nodes_rm = min(rm_cfg.get("n_nodes", simulator.n_regions), simulator.n_regions)
+    if modality == "joint":
+        # In joint mode the response matrix covers both fMRI and EEG nodes.
+        # The first N_fmri rows are fMRI stimulation effects; the next N_eeg
+        # rows are EEG stimulation effects.  Each row is a z-normalised joint
+        # response vector of length N_fmri + N_eeg.
+        logger.info(
+            "  joint 模态响应矩阵：n_nodes=%d（fMRI: [0,%d), EEG: [%d,%d)），"
+            "每行为 z-score 联合响应向量（长度 %d）",
+            n_nodes_rm, simulator.n_fmri_regions,
+            simulator.n_fmri_regions, simulator.n_regions,
+            simulator.n_regions,
+        )
     response_matrix = compute_response_matrix(
         simulator=simulator,
         n_nodes=n_nodes_rm,
@@ -413,13 +448,27 @@ def _run_single_modality(
     lya_cfg = cfg.get("lyapunov", {})
     if lya_cfg.get("enabled", True):
         try:
+            # Joint mode: z-scored unbounded state space → Wolf/FTLE clipping to
+            # [0,1] is inappropriate.  Force Rosenstein method which requires
+            # no state-space bounds and works directly on the trajectory.
+            lya_method = lya_cfg.get("method", "both")
+            if modality == "joint" and lya_method != "rosenstein":
+                logger.info(
+                    "  joint 模态自动切换 Lyapunov 方法: '%s' → 'rosenstein'。\n"
+                    "  原因：Wolf/FTLE 依赖 [0,1] 状态空间裁剪，"
+                    "联合模态的 z-score 空间无上下界，裁剪会引入虚假吸引点。\n"
+                    "  Rosenstein 方法不依赖状态空间边界，适合 z-score 轨迹。",
+                    lya_method,
+                )
+                lya_method = "rosenstein"
+
             lyapunov_results = run_lyapunov_analysis(
                 trajectories=trajectories,
                 simulator=simulator,
                 epsilon=lya_cfg.get("epsilon", 1e-6),
                 renorm_steps=lya_cfg.get("renorm_steps", 50),
                 skip_fraction=lya_cfg.get("skip_fraction", 0.1),
-                method=lya_cfg.get("method", "both"),
+                method=lya_method,
                 convergence_result=results.get("trajectory_convergence"),
                 convergence_threshold=lya_cfg.get("convergence_threshold", 0.01),
                 n_segments=lya_cfg.get("n_segments", 3),
@@ -598,6 +647,32 @@ def run(cfg: dict) -> dict:
     modality_cfg = cfg["simulator"].get("modality", "fmri")
     available_modalities = list(base_graph.node_types)
 
+    if modality_cfg == "joint":
+        # Joint mode: single pipeline run with a combined fMRI+EEG state vector.
+        # Requires BOTH fmri and eeg to be present in the graph cache.
+        if "fmri" not in available_modalities or "eeg" not in available_modalities:
+            raise ValueError(
+                f"modality='joint' 需要图缓存同时包含 'fmri' 和 'eeg' 节点。\n"
+                f"图缓存节点类型: {available_modalities}\n"
+                "scientific note: joint mode 使用单次 predict_future() 调用同时"
+                "获取 fMRI+EEG 预测，各自 z-score 归一化后拼接为联合状态向量，"
+                "计算统一的混沌/动力学指标。"
+            )
+        logger.info(
+            "modality='joint'：单次模型调用联合处理 fMRI(%d) + EEG(%d) → "
+            "拼接 z-score 状态向量，输出单一动力学指标。",
+            base_graph["fmri"].x.shape[0],
+            base_graph["eeg"].x.shape[0],
+        )
+        return _run_single_modality(
+            cfg=cfg,
+            twin=twin,
+            base_graph=base_graph,
+            modality="joint",
+            output_dir=output_dir,
+            device=device,
+        )
+
     if modality_cfg == "both":
         modalities_to_run = [m for m in ["fmri", "eeg"] if m in available_modalities]
         if not modalities_to_run:
@@ -614,7 +689,7 @@ def run(cfg: dict) -> dict:
             raise ValueError(
                 f"请求的 modality='{modality_cfg}' 不在图缓存节点类型中。\n"
                 f"图缓存节点类型: {available_modalities}\n"
-                f"本模块支持 'fmri' 和 'eeg' 两种模态（或 'both' 同时运行）。\n"
+                f"本模块支持 'fmri' 和 'eeg' 两种模态（'both' 同时运行，'joint' 联合分析）。\n"
                 f"其他节点类型（如 {[m for m in available_modalities if m not in ('fmri','eeg')]}）"
                 f"暂不支持作为分析模态，请检查 --graph 文件是否正确。"
             )
@@ -827,8 +902,15 @@ def _parse_args() -> argparse.Namespace:
         "--modality",
         type=str,
         default=None,
-        choices=["fmri", "eeg", "both"],
-        help="分析模态：fmri / eeg / both（both 同时运行两种模态，输出至各自子目录）",
+        choices=["fmri", "eeg", "both", "joint"],
+        help=(
+            "分析模态：\n"
+            "  fmri  — 仅分析 fMRI BOLD 流\n"
+            "  eeg   — 仅分析 EEG 流\n"
+            "  both  — 对两种模态分别独立运行完整管线，输出至各自子目录\n"
+            "  joint — 单次 predict_future() 联合预测 fMRI+EEG，\n"
+            "          z-score 归一化后拼接为联合状态向量，输出单一动力学指标"
+        ),
     )
     parser.add_argument(
         "--no-plots",
