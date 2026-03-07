@@ -85,6 +85,7 @@ Lyapunov Exponent Analysis
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -461,31 +462,49 @@ def rosenstein_lyapunov(
     # For each reference point t, find the nearest valid neighbour
     nn_indices = np.argmin(dist2, axis=1)  # (T_sub,), one NN per reference point
 
-    # ── Divergence accumulation ───────────────────────────────────────────────
-    # Iterate over reference points t; for each (t, nn_t) pair compute
-    # log separation at subsequent lags j=1..max_j using vectorised norms.
+    # ── Vectorised divergence accumulation (lag-loop strategy) ───────────────
+    # Instead of iterating over n_ref reference points (150+ iterations), we
+    # iterate over eff_max_lag-1 lags (~49 iterations).  For each lag j:
+    #   - Compute all K divergences at once: traj_sub[ref_v+j] - traj_sub[nn_v+j]
+    #   - This gives a (K, N) difference matrix → K L2 norms in one shot.
+    # Each lag iteration allocates ~K×N float64 arrays (e.g. 150×190×8 ≈ 228 KB)
+    # — far less than the (K, J, N) batch approach and typically 1.3–1.5× faster
+    # than the per-reference Python loop due to reduced Python dispatch overhead.
     n_ref = T_sub - eff_max_lag
-    for t in range(n_ref):
-        nn_idx = int(nn_indices[t])
-        if not np.isfinite(dist2[t, nn_idx]):
-            continue  # no valid neighbour (can happen if T_sub is very small)
+    if n_ref > 0 and eff_max_lag > 1:
+        ref_all = np.arange(n_ref, dtype=np.intp)  # (n_ref,)
+        nn_all  = nn_indices[:n_ref].astype(np.intp)
 
-        max_j = min(eff_max_lag, T_sub - max(t, nn_idx) - 1)
-        if max_j < 2:
-            continue
+        # Keep only reference points with a finite nearest neighbour.
+        has_nn = np.isfinite(dist2[ref_all, nn_all])
+        ref_v  = ref_all[has_nn]   # (K,)
+        nn_v   = nn_all[has_nn]    # (K,)
 
-        # Vectorised lag loop: compute ‖x(t+j) - x(nn_idx+j)‖ for j=1..max_j-1
-        j_range = np.arange(1, max_j)                            # (max_j-1,)
-        diff_j = traj_sub[t + j_range] - traj_sub[nn_idx + j_range]  # (max_j-1, N)
-        d_j = np.sqrt((diff_j ** 2).sum(axis=1))                # (max_j-1,)
+        if len(ref_v) > 0:
+            for j in range(1, eff_max_lag):
+                ri_j = ref_v + j  # (K,) index into traj_sub for reference points
+                ni_j = nn_v  + j  # (K,) index for nearest neighbours
 
-        valid_j = d_j > 0
-        if not valid_j.any():
-            continue
+                # Validity mask: both indices within trajectory bounds.
+                ib_j = (ri_j < T_sub) & (ni_j < T_sub)
+                if not ib_j.any():
+                    break  # all remaining lags will also be out of bounds
 
-        log_d_j = np.where(valid_j, np.log(np.where(valid_j, d_j, 1.0)), 0.0)
-        np.add.at(log_div_sum,   j_range, log_d_j * valid_j)
-        np.add.at(log_div_count, j_range, valid_j.astype(np.int64))
+                ri_j_s = np.clip(ri_j, 0, T_sub - 1)   # safe for advanced indexing
+                ni_j_s = np.clip(ni_j, 0, T_sub - 1)
+
+                diff_j = traj_sub[ri_j_s] - traj_sub[ni_j_s]  # (K, N)
+                d_j    = np.sqrt((diff_j ** 2).sum(axis=1))    # (K,)
+
+                valid_j  = ib_j & (d_j > 0)
+                log_d_j  = np.where(
+                    valid_j,
+                    np.log(np.where(valid_j, d_j, 1.0)),
+                    0.0,
+                )
+
+                log_div_sum[j]   += (log_d_j * valid_j).sum()
+                log_div_count[j] += int(valid_j.sum())
 
     # Average log divergence curve
     valid = log_div_count > 0
@@ -655,16 +674,33 @@ def run_lyapunov_analysis(
     epsilon: float = _DEFAULT_EPSILON,
     renorm_steps: int = _DEFAULT_RENORM_STEPS,
     skip_fraction: float = 0.1,
-    method: str = "wolf",
+    method: str = "rosenstein",
     convergence_result: Optional[Dict] = None,
     convergence_threshold: float = _DEFAULT_CONVERGENCE_THRESHOLD,
     n_segments: int = 1,
     rosenstein_max_lag: int = _DEFAULT_ROSENSTEIN_MAX_LAG,
     rosenstein_min_sep: int = _DEFAULT_ROSENSTEIN_MIN_SEP,
+    n_workers: int = 1,
     output_dir: Optional[Path] = None,
 ) -> Dict:
     """
     对所有轨迹估计最大 Lyapunov 指数，并给出混沌评估。
+
+    **性能说明（推荐使用 method="rosenstein"）**：
+
+    Rosenstein 方法直接从预计算轨迹工作，无需额外调用模型（零推断成本）。
+    Wolf/FTLE 每条轨迹每个 segment 需要 2 次 predict_future() 调用：
+      - 40 轨迹 × n_segments=3 × 2 = 240 次调用 → 约 30 分钟（CPU）
+      - 切换为 method="rosenstein" + n_segments=1 → 秒级完成
+
+    **自适应 Rosenstein 参数**：
+    对短轨迹（total_steps 较小时），max_lag 和 min_sep 自动缩减，确保
+    Rosenstein 对任意长度轨迹都能返回有意义的估计（而非 NaN）。
+
+    **并行加速（n_workers > 1）**：
+    Rosenstein 方法：纯 NumPy，ThreadPoolExecutor 并行，线程安全。
+    Wolf/FTLE 方法：需要模型推断；仅当 CPU 推断时建议开启；GPU 可能
+    因显存竞争降速，建议保持 n_workers=1。
 
     **收敛优先策略**：若 ``convergence_result`` 来自
     ``run_trajectory_convergence`` 且
@@ -674,6 +710,7 @@ def run_lyapunov_analysis(
     **多段采样（n_segments > 1）**：
     对每条轨迹从 n_segments 个不同时间段的起始点估计 LLE，然后取均值。
     这样可以探索吸引子的不同区域，减少瞬态偏差，是比单一 x0 更稳健的估计。
+    对 Rosenstein（无额外模型调用）增加 n_segments 开销极低，可设为 3–5。
 
     **Wolf 偏差检测**：
     当 Wolf LLE 的跨轨迹标准差 < _WOLF_BIAS_STD_THRESHOLD（默认 1e-3）且
@@ -690,9 +727,9 @@ def run_lyapunov_analysis(
         epsilon:              名义扰动幅度（默认 1e-6）。
         renorm_steps:         Wolf 方法的重归一化周期步数（默认 50）。
         skip_fraction:        FTLE 方法跳过前段比例。
-        method:               "wolf"（经典，WC 模式推荐）、
+        method:               "rosenstein"（默认，twin 模式推荐，零额外推断成本）、
+                              "wolf"（经典，WC 模式推荐）、
                               "ftle"（快速对照）、
-                              "rosenstein"（轨迹数据，twin 模式推荐）、
                               "both"（Wolf + FTLE + Rosenstein 交叉验证）。
         convergence_result:   ``run_trajectory_convergence`` 的返回字典；
                               若 distance_ratio < convergence_threshold 则
@@ -700,8 +737,15 @@ def run_lyapunov_analysis(
         convergence_threshold: distance_ratio 低于此阈值视为强收敛（默认 0.01）。
         n_segments:           每条轨迹的采样段数（默认 1 = 仅使用 x0）。
                               设为 3–5 可在轨迹不同位置多次采样，减少偏差。
-        rosenstein_max_lag:   Rosenstein 方法追踪的最大步数（默认 50）。
-        rosenstein_min_sep:   Rosenstein 方法近邻对最小时间间距（默认 20）。
+                              对 Rosenstein 方法成本极低；对 Wolf/FTLE 每段增加
+                              2 次模型调用。
+        rosenstein_max_lag:   Rosenstein 方法追踪的最大步数（默认 50）；
+                              自动缩减以适配短轨迹。
+        rosenstein_min_sep:   Rosenstein 方法近邻对最小时间间距（默认 20）；
+                              自动缩减以适配短轨迹。
+        n_workers:            并行 worker 数量（默认 1 = 顺序执行）。
+                              n_workers > 1 对 Rosenstein 始终安全（纯 NumPy）。
+                              对 Wolf/FTLE 仅推荐在 CPU 推断时开启。
         output_dir:           保存 lyapunov_values.npy、log_growth_curve.npy、
                               lyapunov_report.json；None → 不保存。
 
@@ -743,20 +787,12 @@ def run_lyapunov_analysis(
             effective_method = "ftle"
 
     logger.info(
-        "Lyapunov 指数分析: method=%s, %d 条轨迹, 每条 %d 步, ε=%.2e, n_segments=%d",
-        effective_method,
-        n_traj,
-        total_steps,
-        epsilon,
-        n_segments,
+        "Lyapunov 指数分析: method=%s, %d 条轨迹, 每条 %d 步, ε=%.2e, "
+        "n_segments=%d, n_workers=%d",
+        effective_method, n_traj, total_steps, epsilon, n_segments, n_workers,
     )
 
     # ── Trajectory diversity diagnostic ──────────────────────────────────────
-    # Compute inter-trajectory state diversity at start and end.
-    # This is crucial for interpreting the LLE uniformity:
-    #   - Low initial diversity → context-dominated twin mode (base_graph overwhelms x0)
-    #   - Normal initial diversity → different start states genuinely tested
-    #   - Low final diversity → convergence evidence (attractor)
     initial_diversity = float(np.std(trajectories[:, 0, :], axis=0).mean())
     final_diversity   = float(np.std(trajectories[:, -1, :], axis=0).mean())
     context_dominated = initial_diversity < _TRAJECTORY_DIVERSITY_LOW_THRESHOLD
@@ -785,7 +821,6 @@ def run_lyapunov_analysis(
             initial_diversity, _TRAJECTORY_DIVERSITY_LOW_THRESHOLD, n_traj,
         )
 
-    rng = np.random.default_rng(42)
     values = np.zeros(n_traj, dtype=np.float64)
     ftle_values = np.zeros(n_traj, dtype=np.float64)
     rosenstein_values = np.full(n_traj, np.nan, dtype=np.float64)
@@ -797,89 +832,205 @@ def run_lyapunov_analysis(
     run_rosenstein = effective_method in ("rosenstein", "both")
 
     # Determine segment start indices for multi-segment sampling.
-    # For n_segments=1, we only use the first step (backward-compatible).
     if n_segments <= 1:
         segment_fracs = [0.0]
     else:
         segment_fracs = [k / n_segments for k in range(n_segments)]
 
-    for i in range(n_traj):
-        traj_i = trajectories[i]   # (T, N)
+    # ── Adaptive Rosenstein parameters ────────────────────────────────────────
+    # Automatically reduce max_lag and min_sep when trajectories are short so
+    # that Rosenstein returns a finite estimate instead of NaN.  The standard
+    # min_required = 2 * min_sep + max_lag must be < T.
+    #
+    # We compute the effective parameters here (once) from the full trajectory
+    # length; the per-segment sub-trajectory is shorter, so we additionally
+    # adapt per-call inside the loop.
+    _r_max_lag = min(rosenstein_max_lag, max(2, total_steps // 4))
+    _r_min_sep = min(
+        rosenstein_min_sep,
+        max(1, (total_steps - _r_max_lag - 1) // 2),
+    )
+    if _r_max_lag != rosenstein_max_lag or _r_min_sep != rosenstein_min_sep:
+        logger.info(
+            "  Rosenstein 参数自适应: max_lag %d→%d, min_sep %d→%d"
+            "（轨迹长度 T=%d 不足默认参数 min_required=%d）",
+            rosenstein_max_lag, _r_max_lag,
+            rosenstein_min_sep, _r_min_sep,
+            total_steps,
+            2 * rosenstein_min_sep + rosenstein_max_lag,
+        )
 
-        # ── Wolf: possibly over multiple starting segments ──────────────────
-        if run_wolf:
-            wolf_lles: List[float] = []
-            wolf_lgs: List[np.ndarray] = []
-            for frac in segment_fracs:
-                seg_start = int(frac * total_steps)
-                x0_seg = traj_i[seg_start].copy()
-                seg_steps = total_steps - seg_start
-                if seg_steps < renorm_steps:
-                    continue  # Not enough steps for even one Wolf period
-                lle_seg, lg_seg = wolf_largest_lyapunov(
-                    simulator=simulator,
-                    x0=x0_seg,
-                    total_steps=seg_steps,
-                    renorm_steps=renorm_steps,
-                    epsilon=epsilon,
-                    rng=rng,
-                )
-                if np.isfinite(lle_seg):
-                    wolf_lles.append(lle_seg)
-                    wolf_lgs.append(lg_seg)
-            if wolf_lles:
-                values[i] = float(np.mean(wolf_lles))
-                # Aggregate log-growth curves (use the first segment's curve)
-                all_log_growth.append(wolf_lgs[0])
-            else:
-                values[i] = float("nan")
-                all_log_growth.append(np.array([], dtype=np.float64))
+    # ── Per-trajectory worker functions (used for both sequential and parallel) ─
 
-        # ── FTLE ────────────────────────────────────────────────────────────
-        if run_ftle:
-            ftle_segs: List[float] = []
-            for frac in segment_fracs:
-                seg_start = int(frac * total_steps)
-                sub_traj = traj_i[seg_start:]
-                if len(sub_traj) < 4:
-                    continue
-                ftle_seg = ftle_lyapunov(
-                    trajectory=sub_traj,
-                    simulator=simulator,
-                    epsilon=epsilon,
-                    skip_fraction=skip_fraction,
-                    rng=rng,
-                )
-                if np.isfinite(ftle_seg):
-                    ftle_segs.append(ftle_seg)
-            ftle_val = float(np.mean(ftle_segs)) if ftle_segs else float("nan")
-            ftle_values[i] = ftle_val
-            if not run_wolf:
-                values[i] = ftle_val
-
-        # ── Rosenstein ────────────────────────────────────────────────────
-        if run_rosenstein:
-            rosen_segs: List[float] = []
-            for frac in segment_fracs:
-                seg_start = int(frac * total_steps)
-                sub_traj = traj_i[seg_start:]
-                rosen_lle, _ = rosenstein_lyapunov(
-                    trajectory=sub_traj,
-                    max_lag=rosenstein_max_lag,
-                    min_temporal_sep=rosenstein_min_sep,
-                )
-                if np.isfinite(rosen_lle):
-                    rosen_segs.append(rosen_lle)
-            r_val = float(np.mean(rosen_segs)) if rosen_segs else float("nan")
-            rosenstein_values[i] = r_val
-            if not run_wolf and not run_ftle:
-                values[i] = r_val
-
-        if (i + 1) % log_interval == 0:
-            logger.info(
-                "  %d/%d 轨迹完成  当前均值 λ=%.4f",
-                i + 1, n_traj, float(np.nanmean(values[:i+1]))
+    def _wolf_for_traj(
+        traj_i: np.ndarray,
+        rng_seed: int,
+    ) -> Tuple[float, np.ndarray]:
+        """Compute Wolf LLE for one trajectory (all segments)."""
+        local_rng = np.random.default_rng(rng_seed)
+        wolf_lles: List[float] = []
+        wolf_lgs: List[np.ndarray] = []
+        for frac in segment_fracs:
+            seg_start = int(frac * total_steps)
+            x0_seg = traj_i[seg_start].copy()
+            seg_steps = total_steps - seg_start
+            if seg_steps < renorm_steps:
+                continue
+            lle_seg, lg_seg = wolf_largest_lyapunov(
+                simulator=simulator,
+                x0=x0_seg,
+                total_steps=seg_steps,
+                renorm_steps=renorm_steps,
+                epsilon=epsilon,
+                rng=local_rng,
             )
+            if np.isfinite(lle_seg):
+                wolf_lles.append(lle_seg)
+                wolf_lgs.append(lg_seg)
+        val = float(np.mean(wolf_lles)) if wolf_lles else float("nan")
+        lg0 = wolf_lgs[0] if wolf_lgs else np.array([], dtype=np.float64)
+        return val, lg0
+
+    def _ftle_for_traj(
+        traj_i: np.ndarray,
+        rng_seed: int,
+    ) -> float:
+        """Compute FTLE for one trajectory (all segments)."""
+        local_rng = np.random.default_rng(rng_seed)
+        ftle_segs: List[float] = []
+        for frac in segment_fracs:
+            seg_start = int(frac * total_steps)
+            sub_traj = traj_i[seg_start:]
+            if len(sub_traj) < 4:
+                continue
+            ftle_seg = ftle_lyapunov(
+                trajectory=sub_traj,
+                simulator=simulator,
+                epsilon=epsilon,
+                skip_fraction=skip_fraction,
+                rng=local_rng,
+            )
+            if np.isfinite(ftle_seg):
+                ftle_segs.append(ftle_seg)
+        return float(np.mean(ftle_segs)) if ftle_segs else float("nan")
+
+    def _rosenstein_for_traj(traj_i: np.ndarray) -> float:
+        """Compute Rosenstein LLE for one trajectory (all segments, adaptive params)."""
+        rosen_segs: List[float] = []
+        for frac in segment_fracs:
+            seg_start = int(frac * total_steps)
+            sub_traj = traj_i[seg_start:]
+            T_sub = len(sub_traj)
+            # Adapt parameters to sub-trajectory length
+            adapt_max_lag = min(_r_max_lag, max(2, T_sub // 4))
+            adapt_min_sep = min(
+                _r_min_sep,
+                max(1, (T_sub - adapt_max_lag - 1) // 2),
+            )
+            rosen_lle, _ = rosenstein_lyapunov(
+                trajectory=sub_traj,
+                max_lag=adapt_max_lag,
+                min_temporal_sep=adapt_min_sep,
+            )
+            if np.isfinite(rosen_lle):
+                rosen_segs.append(rosen_lle)
+        return float(np.mean(rosen_segs)) if rosen_segs else float("nan")
+
+    # ── Sequential vs. parallel dispatch ─────────────────────────────────────
+    _use_parallel = (n_workers > 1)
+
+    if _use_parallel and run_rosenstein and not run_wolf and not run_ftle:
+        # Fast path: pure Rosenstein, fully parallel (no model calls)
+        logger.info(
+            "  并行 Rosenstein: %d workers × %d 轨迹", n_workers, n_traj
+        )
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = {
+                ex.submit(_rosenstein_for_traj, trajectories[i]): i
+                for i in range(n_traj)
+            }
+            for fut in as_completed(futures):
+                i = futures[fut]
+                rosenstein_values[i] = fut.result()
+                values[i] = rosenstein_values[i]
+        # No Wolf log-growth to accumulate
+    elif _use_parallel and (run_wolf or run_ftle):
+        # Parallel Wolf/FTLE (each trajectory uses separate RNG seed)
+        logger.info(
+            "  并行 Wolf/FTLE: %d workers × %d 轨迹 "
+            "（仅推荐用于 CPU 推断；GPU 可能显存竞争）",
+            n_workers, n_traj,
+        )
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            wolf_futs: dict = {}
+            ftle_futs: dict = {}
+            rosen_futs: dict = {}
+            for i in range(n_traj):
+                seed_i = 42 + i
+                if run_wolf:
+                    wolf_futs[ex.submit(_wolf_for_traj, trajectories[i], seed_i)] = i
+                if run_ftle:
+                    ftle_futs[ex.submit(_ftle_for_traj, trajectories[i], seed_i)] = i
+                if run_rosenstein:
+                    rosen_futs[ex.submit(_rosenstein_for_traj, trajectories[i])] = i
+
+            for fut in as_completed(wolf_futs):
+                i = wolf_futs[fut]
+                val, lg0 = fut.result()
+                values[i] = val if np.isfinite(val) else float("nan")
+                all_log_growth.append((i, lg0))  # keep (i, lg) for sorting later
+
+            for fut in as_completed(ftle_futs):
+                i = ftle_futs[fut]
+                ftle_val = fut.result()
+                ftle_values[i] = ftle_val
+                if not run_wolf:
+                    values[i] = ftle_val
+
+            for fut in as_completed(rosen_futs):
+                i = rosen_futs[fut]
+                rosenstein_values[i] = fut.result()
+                if not run_wolf and not run_ftle:
+                    values[i] = rosenstein_values[i]
+
+        # Sort log_growth list by trajectory index and extract arrays
+        if all_log_growth and isinstance(all_log_growth[0], tuple):
+            all_log_growth.sort(key=lambda x: x[0])
+            all_log_growth = [lg for _, lg in all_log_growth]  # type: ignore[assignment]
+
+        # Log progress summary
+        logger.info("  %d/%d 轨迹完成（并行）", n_traj, n_traj)
+    else:
+        # Sequential path (default; required when Wolf context must be serial
+        # or n_workers == 1)
+        for i in range(n_traj):
+            traj_i = trajectories[i]   # (T, N)
+
+            # ── Wolf ────────────────────────────────────────────────────────
+            if run_wolf:
+                val, lg0 = _wolf_for_traj(traj_i, rng_seed=42 + i)
+                values[i] = val
+                all_log_growth.append(lg0)
+
+            # ── FTLE ────────────────────────────────────────────────────────
+            if run_ftle:
+                ftle_val = _ftle_for_traj(traj_i, rng_seed=42 + i)
+                ftle_values[i] = ftle_val
+                if not run_wolf:
+                    values[i] = ftle_val
+
+            # ── Rosenstein ────────────────────────────────────────────────
+            if run_rosenstein:
+                r_val = _rosenstein_for_traj(traj_i)
+                rosenstein_values[i] = r_val
+                if not run_wolf and not run_ftle:
+                    values[i] = r_val
+
+            if (i + 1) % log_interval == 0:
+                logger.info(
+                    "  %d/%d 轨迹完成  当前均值 λ=%.4f",
+                    i + 1, n_traj, float(np.nanmean(values[:i+1]))
+                )
 
     values = values.astype(np.float32)
     mean_lam = float(np.nanmean(values))

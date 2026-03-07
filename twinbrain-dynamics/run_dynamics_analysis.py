@@ -178,14 +178,33 @@ _DEFAULTS = {
     },
     "lyapunov": {
         "enabled": True,
-        "method": "both",          # "wolf", "ftle", "rosenstein", or "both"
+        # ── Method selection ──────────────────────────────────────────────────
+        # "rosenstein" (default): uses only the pre-computed free-dynamics
+        #   trajectories — zero extra model calls.  Strongly recommended for
+        #   TwinBrainDigitalTwin (no context-dilution bias).
+        # "wolf" / "ftle" / "both": each trajectory requires 2 extra rollouts
+        #   per segment × n_segments.  With n_traj=40 and n_segments=1 that is
+        #   80 extra predict_future() calls, vs. 0 for "rosenstein".
+        "method": "rosenstein",    # Changed from "both" — saves ~480 model calls for 40 traj
         "epsilon": 1e-6,           # Nominal perturbation magnitude
         "renorm_steps": 50,        # Steps per Wolf period
         "skip_fraction": 0.1,      # Skip initial transient fraction when fitting (FTLE)
         "convergence_threshold": 0.01,  # Skip Wolf if distance_ratio < this
-        "n_segments": 3,           # Multi-segment sampling (1 = single x0, 3+ = better coverage)
+        # ── n_segments ────────────────────────────────────────────────────────
+        # Number of starting segments sampled per trajectory.
+        # For Rosenstein this has negligible cost (pure NumPy).  For Wolf/FTLE
+        # each extra segment adds 2 more model calls per trajectory.  Default
+        # reduced from 3→1 to avoid unexpected slowdowns when users switch to
+        # "wolf" or "both".  Increase to 3 for more robust Wolf/FTLE estimates.
+        "n_segments": 1,           # Changed from 3 — reduces Wolf/FTLE cost by 3×
         "rosenstein_max_lag": 50,  # Rosenstein method: max tracking lag
         "rosenstein_min_sep": 20,  # Rosenstein method: min temporal separation for NN search
+        # ── Parallelism ───────────────────────────────────────────────────────
+        # n_workers > 1 enables parallel computation of Wolf/FTLE across
+        # trajectories using a ThreadPoolExecutor.  Requires thread-safe model
+        # inference (CPU only; GPU may cause memory contention).
+        # Rosenstein is always parallelised when n_workers > 1 (pure NumPy).
+        "n_workers": 1,            # 1 = sequential; set >1 for multi-core Wolf/FTLE
     },
     "trajectory_convergence": {
         "enabled": True,
@@ -451,7 +470,7 @@ def _run_single_modality(
             # Joint mode: z-scored unbounded state space → Wolf/FTLE clipping to
             # [0,1] is inappropriate.  Force Rosenstein method which requires
             # no state-space bounds and works directly on the trajectory.
-            lya_method = lya_cfg.get("method", "both")
+            lya_method = lya_cfg.get("method", "rosenstein")
             if modality == "joint" and lya_method != "rosenstein":
                 logger.info(
                     "  joint 模态自动切换 Lyapunov 方法: '%s' → 'rosenstein'。\n"
@@ -471,9 +490,10 @@ def _run_single_modality(
                 method=lya_method,
                 convergence_result=results.get("trajectory_convergence"),
                 convergence_threshold=lya_cfg.get("convergence_threshold", 0.01),
-                n_segments=lya_cfg.get("n_segments", 3),
+                n_segments=lya_cfg.get("n_segments", 1),
                 rosenstein_max_lag=lya_cfg.get("rosenstein_max_lag", 50),
                 rosenstein_min_sep=lya_cfg.get("rosenstein_min_sep", 20),
+                n_workers=lya_cfg.get("n_workers", 1),
                 output_dir=output_dir,
             )
             results["lyapunov"] = lyapunov_results
