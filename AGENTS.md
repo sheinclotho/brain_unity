@@ -489,4 +489,23 @@ r ≈ 0 的两个神经生物学合理原因：
 - **CLI**: `--modality` choices 新增 `joint`；`both` 和 `joint` 文档明确区分。
 - **规则**: joint 模式所有操作均显式处理，无 fallback 至单模态行为。步骤 5/6（虚拟刺激/响应矩阵）完全支持 joint，步骤 9（Lyapunov）自动切换 rosenstein。
 
+### [2026-03-07] 自由动力学时序窗口：重叠滑窗 + 模态感知窗口计数
+
+#### 旧设计的两个缺陷
+
+1. **跨模态瓶颈 Bug**：`n_temporal_windows` 对 **所有** 节点类型取 `min(T_nt // ctx_len)`。若次要模态（如 EEG）的 T 较短（如 T_eeg < 2*ctx_len），即使主模态（fMRI）有足够长的时序，也会被错误瓶颈为 1 个窗口。
+2. **非重叠要求过于保守**：旧算法要求 `T ≥ n_windows × context_length`（严格非重叠分块）。对于典型 10 分钟 fMRI（300 TR），ctx_len=200 时只能产生 1 个窗口（300 // 200 = 1），尽管还有 100 步多余历史。
+
+#### 新设计：模态感知滑窗
+
+- **模态感知**：单模态分析（fmri/eeg）仅使用**主模态**的 T 计算窗口数，次要模态通过 `_get_context_for_window` 中的回退机制（fallback [0:ctx_len]）优雅处理。joint 模式使用 fmri 和 eeg 的最小 T（两者都必须提供完整上下文）。
+- **重叠滑窗**：`stride = max(1, context_length // 4)`（75% 重叠），公式 `n_windows = max(1, (T_primary - ctx_len) // stride + 1)`。
+  - T=200（= ctx_len）：1 窗口（不变）
+  - T=250：2 窗口（旧方案 1）
+  - T=300：3 窗口（旧方案 1）
+  - T=400：5 窗口（旧方案 2）
+- **科学依据**：重叠窗口提供真正不同的历史上下文——75% 重叠的两个窗口共享历史步但其时序位置不同，注意力机制对不同时序位置产生不同加权，导致编码器输出不同隐状态。
+- **`_get_context_for_window` 更新**：`end = T - window_idx * stride`（而非原来的 `T - window_idx * ctx_len`），与新窗口计数公式保持一致。
+- **规则**: `n_temporal_windows` 始终基于主模态 T 和 stride 计算；次要模态窗口回退不影响计数；joint 模式使用双模态最小 T。
+
 *Last updated: 2026-03-07*
