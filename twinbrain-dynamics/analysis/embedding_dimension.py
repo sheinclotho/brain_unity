@@ -146,7 +146,7 @@ def _fnn_single_channel(
 
     for m in range(1, max_dim + 1):
         # Number of valid time points for m-dimensional embedding
-        n_pts = T - (m) * tau  # need x[t + m*tau] for testing m+1
+        n_pts = T - m * tau  # need x[t + m*tau] for testing m+1
         if n_pts < 10:
             fnn_list.append(0.0)
             continue
@@ -387,14 +387,16 @@ def identify_observation_space(
     all_states = trajectories.reshape(-1, n_regions)  # (n_init*steps, n_regions)
 
     # ── PCA variance analysis ─────────────────────────────────────────────────
+    # Fit PCA on the first 70% of trajectories (reference set) to avoid the
+    # same leakage pattern that check_pca_leakage() is designed to detect.
+    # Variance statistics are inherently stable once ref set > ~50 samples.
+    n_ref = max(1, int(n_init * 0.7))
+    ref_states = trajectories[:n_ref].reshape(-1, n_regions)  # reference only
     try:
         from sklearn.decomposition import PCA
-        n_comp = min(n_regions, n_init * steps, 50)
+        n_comp = min(n_regions, len(ref_states) - 1, 50)
         pca = PCA(n_components=n_comp)
-        # LEAKAGE NOTE: PCA is fitted on ALL trajectories here, which is acceptable
-        # for the observation-space analysis (we are not making predictive claims).
-        # For Lyapunov estimation, we use the raw trajectories, not PCA-projected ones.
-        pca.fit(all_states)
+        pca.fit(ref_states)  # fitted on reference set, not all trajectories
         cumvar = np.cumsum(pca.explained_variance_ratio_)
         n95 = int(np.searchsorted(cumvar, 0.95)) + 1
         n50 = int(np.searchsorted(cumvar, 0.50)) + 1
@@ -568,8 +570,12 @@ def check_pca_leakage(
     ref_flat = reference_trajectories.reshape(-1, reference_trajectories.shape[-1])
     all_flat = all_trajectories.reshape(-1, all_trajectories.shape[-1])
 
-    n_comp = min(n_components, ref_flat.shape[1], ref_flat.shape[0] - 1,
-                 all_flat.shape[0] - 1)
+    n_comp = min(
+        n_components,        # requested number of components
+        ref_flat.shape[1],   # cannot exceed feature dimension
+        ref_flat.shape[0] - 1,   # PCA needs n_samples > n_components (ref set)
+        all_flat.shape[0] - 1,   # same constraint for full set
+    )
     if n_comp < 1:
         return {
             "max_principal_angle_deg": float("nan"),
@@ -671,16 +677,41 @@ def run_embedding_dimension_analysis(
         n_init, steps, n_regions,
     )
 
-    # ── 1. FNN on a single representative trajectory ──────────────────────────
-    # Use the first trajectory (or an average if too noisy)
-    ref_traj = trajectories[0]  # (steps, n_regions)
-    logger.info("  (1/5) False Nearest Neighbors 分析 (max_dim=%d, τ=%d)", fnn_max_dim, fnn_tau)
-    fnn_results = false_nearest_neighbors(ref_traj, max_dim=fnn_max_dim, tau=fnn_tau)
-    min_suf = fnn_results["min_sufficient_dim"]
+    # ── 1. FNN averaged over up to 3 representative trajectories ─────────────
+    # Averaging over multiple trajectories reduces sensitivity to any single
+    # initial condition.  We cap at 3 to keep the O(T²) cost manageable;
+    # in practice FNN results are stable across trajectories for the same attractor.
+    n_fnn_traj = min(3, n_init)
+    logger.info("  (1/5) False Nearest Neighbors 分析 (max_dim=%d, τ=%d, n_traj=%d)",
+                fnn_max_dim, fnn_tau, n_fnn_traj)
+
+    # Average FNN fractions across sampled trajectories
+    fnn_fracs_all = []
+    for k in range(n_fnn_traj):
+        traj_k = trajectories[k]
+        res_k = false_nearest_neighbors(traj_k, max_dim=fnn_max_dim, tau=fnn_tau)
+        fnn_fracs_all.append(res_k["fnn_fractions"])
+    mean_fracs = [float(np.mean([fnn_fracs_all[k][m] for k in range(n_fnn_traj)]))
+                  for m in range(fnn_max_dim)]
+    # Find minimum sufficient dim using the averaged fractions
+    min_suf = fnn_max_dim
+    for m_idx, frac in enumerate(mean_fracs):
+        if frac < 0.01:
+            min_suf = m_idx + 1
+            break
+    fnn_results = {
+        "fnn_fractions": mean_fracs,
+        "min_sufficient_dim": min_suf,
+        "recommended_embed_dim": max(min_suf, 2),
+        "takens_min_dim": 2 * min_suf + 1,
+        "n_traj_averaged": n_fnn_traj,
+    }
+    # Use first trajectory as reference for correlation dimension
+    ref_traj = trajectories[0]
     logger.info(
         "  FNN 最小充分维度 = %d (FNN 比例: %s)",
         min_suf,
-        ", ".join(f"{v:.3f}" for v in fnn_results["fnn_fractions"]),
+        ", ".join(f"{v:.3f}" for v in mean_fracs),
     )
 
     # ── 2. Correlation dimension (on single trajectory) ───────────────────────

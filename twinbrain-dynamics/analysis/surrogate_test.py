@@ -84,9 +84,11 @@ def phase_randomize_surrogate(
 
         # Number of unique positive-frequency bins (excluding DC and Nyquist)
         n_freq = len(fx)
-        # Random phases for all bins including DC (DC phase → 0 to keep mean)
+        # Allocate phases for all bins; DC (index 0) is forced to 0 to preserve
+        # the mean, and the Nyquist bin (last bin for even-length signals) is
+        # also forced to 0 so that irfft produces a real-valued output.
         phases = rng.uniform(0.0, 2.0 * np.pi, size=n_freq)
-        phases[0] = 0.0  # preserve mean (DC component)
+        phases[0] = 0.0  # preserve mean (DC component must be real)
         if T % 2 == 0:
             phases[-1] = 0.0  # Nyquist component must be real
 
@@ -337,8 +339,13 @@ def run_surrogate_test(
         gen_fn = _generators[surr_type]
         surr_lles: List[float] = []
 
+        # Deterministic per-type seed offset — avoids hash() variability across
+        # Python sessions (PYTHONHASHSEED randomises str hashes by default).
+        _TYPE_SEED_OFFSET = {"phase_randomize": 0, "shuffle": 1, "ar": 2}
+        type_seed = _TYPE_SEED_OFFSET.get(surr_type, 3)
+
         for s_idx in range(n_surrogates):
-            s_rng = np.random.default_rng([seed, hash(surr_type) & 0xFFFF, s_idx])
+            s_rng = np.random.default_rng([seed, type_seed, s_idx])
             # Average LLE over sampled trajectories for this surrogate instance
             s_lles_traj: List[float] = []
             for k in range(use_n):

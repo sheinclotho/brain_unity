@@ -614,7 +614,9 @@ def run(cfg: dict) -> dict:
             raise ValueError(
                 f"请求的 modality='{modality_cfg}' 不在图缓存节点类型中。\n"
                 f"图缓存节点类型: {available_modalities}\n"
-                f"请检查 --graph 文件，或将 modality 改为 'both' 自动选择可用模态。"
+                f"本模块支持 'fmri' 和 'eeg' 两种模态（或 'both' 同时运行）。\n"
+                f"其他节点类型（如 {[m for m in available_modalities if m not in ('fmri','eeg')]}）"
+                f"暂不支持作为分析模态，请检查 --graph 文件是否正确。"
             )
         modalities_to_run = [modality_cfg]
 
