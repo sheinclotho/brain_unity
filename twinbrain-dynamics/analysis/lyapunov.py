@@ -490,7 +490,10 @@ def rosenstein_lyapunov(
                 if not ib_j.any():
                     break  # all remaining lags will also be out of bounds
 
-                ri_j_s = np.clip(ri_j, 0, T_sub - 1)   # safe for advanced indexing
+                # Clip is required for safe NumPy advanced indexing: out-of-bounds
+                # indices that are NOT in ib_j would raise IndexError without it.
+                # The ib_j mask then zeros out the corresponding invalid results.
+                ri_j_s = np.clip(ri_j, 0, T_sub - 1)
                 ni_j_s = np.clip(ni_j, 0, T_sub - 1)
 
                 diff_j = traj_sub[ri_j_s] - traj_sub[ni_j_s]  # (K, N)
@@ -978,7 +981,7 @@ def run_lyapunov_analysis(
                 i = wolf_futs[fut]
                 val, lg0 = fut.result()
                 values[i] = val if np.isfinite(val) else float("nan")
-                all_log_growth.append((i, lg0))  # keep (i, lg) for sorting later
+                all_log_growth.append((i, lg0))
 
             for fut in as_completed(ftle_futs):
                 i = ftle_futs[fut]
@@ -993,7 +996,11 @@ def run_lyapunov_analysis(
                 if not run_wolf and not run_ftle:
                     values[i] = rosenstein_values[i]
 
-        # Sort log_growth list by trajectory index and extract arrays
+        # Sort-and-unpack indexed log-growth tuples from the parallel Wolf path.
+        # The sequential path appends raw ndarray objects directly, so only
+        # the parallel path (where each entry is a (trajectory_index, lg) tuple)
+        # needs unpacking.  The two paths are mutually exclusive, so the list
+        # will never contain a mixture of tuples and arrays.
         if all_log_growth and isinstance(all_log_growth[0], tuple):
             all_log_growth.sort(key=lambda x: x[0])
             all_log_growth = [lg for _, lg in all_log_growth]  # type: ignore[assignment]
