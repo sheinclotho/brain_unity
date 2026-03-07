@@ -41,6 +41,13 @@ logger = logging.getLogger(__name__)
 # represents a physiologically strong but not extreme perturbation.
 _STIM_AMP_TO_LATENT_SIGMA: float = 2.0
 
+# Default fMRI TR (seconds) when sampling_rate is not stored in the graph cache.
+# Standard TR for most whole-brain fMRI acquisitions.
+_DEFAULT_FMRI_TR: float = 2.0
+
+# Guard added to per-channel std to prevent division-by-zero during z-normalisation.
+_STD_GUARD: float = 1e-8
+
 
 def _resolve_device(device: str) -> str:
     """Resolve ``"auto"`` to the actual device string (``"cuda"`` or ``"cpu"``)."""
@@ -228,6 +235,14 @@ class BrainDynamicsSimulator:
     TwinBrainDigitalTwin 实例。若提供 None 将立即抛出 ValueError。
     """
 
+    # Modalities directly supported by the simulator.
+    # - "fmri" / "eeg" : single-modality mode (one prediction stream)
+    # - "joint"         : both fMRI and EEG predicted jointly in a single
+    #                     predict_future() call; their z-normalised outputs are
+    #                     concatenated into a joint state vector for dynamics
+    #                     analysis.
+    _VALID_MODALITIES = ("fmri", "eeg", "joint")
+
     def __init__(
         self,
         model,
@@ -239,16 +254,30 @@ class BrainDynamicsSimulator:
     ):
         """
         Args:
-            model:         TwinBrainDigitalTwin 实例（必须）。
-            base_graph:    HeteroData 图缓存（必须）。
-            modality:      分析模态（``"fmri"`` 或 ``"eeg"``）。
+            model:          TwinBrainDigitalTwin 实例（必须）。
+            base_graph:     HeteroData 图缓存（必须）。
+            modality:       分析模态（``"fmri"``、``"eeg"`` 或 ``"joint"``）。
+
+                            ``"joint"`` 模式：单次 ``predict_future()`` 调用同时
+                            获取 fMRI 和 EEG 预测，各自按通道 z-score 归一化后
+                            拼接为联合状态向量 ``[z_fmri | z_eeg]``，用于联合动
+                            力学分析（单一 Lyapunov 指数）。需要 base_graph 同时
+                            含有 ``'fmri'`` 和 ``'eeg'`` 节点。
+
             fmri_subsample: fMRI 下采样倍率（保留兼容性，当前未实现子采样）。
             seed:           随机种子（用于 sample_random_state）。
-            device:        计算设备（``"auto"`` → CUDA if available）。
+            device:         计算设备（``"auto"`` → CUDA if available）。
 
         Raises:
             ValueError: model 为 None，或 model 不是 TwinBrainDigitalTwin，
-                        或 base_graph 缺少指定 modality。
+                        或 base_graph 缺少指定 modality，或 modality 不在
+                        ``_VALID_MODALITIES`` 中。
+
+        **时间分辨率说明**:
+            TwinBrainDigitalTwin 的所有预测步长均以 fMRI TR 为单位（通常 2 s）。
+            EEG 节点被预测在同一步长分辨率下，而非 EEG 原生采样率（通常 250 Hz）。
+            因此无论选择哪种模态，``dt`` 均为 fMRI TR。若图缓存中存有
+            ``sampling_rate`` 属性则从中推断；否则默认 2.0 s/TR。
         """
         if model is None:
             raise ValueError(
@@ -266,10 +295,22 @@ class BrainDynamicsSimulator:
                 "使用 TwinBrainDigitalTwin 时必须提供 base_graph。\n"
                 "请使用 load_graph_for_inference() 加载图缓存文件。"
             )
-        if modality not in base_graph.node_types:
+
+        # ── Validate modality ─────────────────────────────────────────────────
+        if modality not in self._VALID_MODALITIES:
+            raise ValueError(
+                f"modality 必须是 {self._VALID_MODALITIES} 之一，得到 '{modality}'。"
+            )
+        if modality == "joint":
+            if "fmri" not in base_graph.node_types or "eeg" not in base_graph.node_types:
+                raise ValueError(
+                    "modality='joint' 需要 base_graph 同时包含 'fmri' 和 'eeg' 节点。\n"
+                    f"当前可用节点类型: {list(base_graph.node_types)}"
+                )
+        elif modality not in base_graph.node_types:
             raise ValueError(
                 f"base_graph 中不含模态 '{modality}'。\n"
-                f"可用模态: {base_graph.node_types}"
+                f"可用模态: {list(base_graph.node_types)}"
             )
 
         self.seed = seed
@@ -282,18 +323,92 @@ class BrainDynamicsSimulator:
         # Always twin mode
         self._is_twin = True
 
-        # Infer n_regions and dt from the graph
-        self.n_regions = int(base_graph[modality].x.shape[0])
-        sr = getattr(base_graph[modality], "sampling_rate", None)
-        self.dt = 1.0 / float(sr) if sr else 0.004  # default 0.004s when SR not stored
+        # ── Infer effective prediction dt ─────────────────────────────────────
+        # TwinBrainDigitalTwin predicts ALL modalities at fMRI TR resolution
+        # regardless of each modality's native sampling rate.  Using the native
+        # EEG sampling rate (e.g. 250 Hz → dt=0.004 s) for the time axis would
+        # produce a wrong time axis (50 steps × 0.004 s = 0.2 s vs. the correct
+        # 50 × 2.0 s = 100 s for a typical TR).
+        #
+        # The fMRI TR is used as the single authoritative step size for all
+        # modalities.  Fall back to 2.0 s (standard 0.5 Hz TR) when the graph
+        # cache does not carry a sampling_rate attribute.
+        _fmri_sr = (
+            getattr(base_graph["fmri"], "sampling_rate", None)
+            if "fmri" in base_graph.node_types else None
+        )
+        _pred_dt: float = 1.0 / float(_fmri_sr) if _fmri_sr else _DEFAULT_FMRI_TR
+
+        # ── Per-modality initialisation ───────────────────────────────────────
+        if modality == "joint":
+            # Joint mode: fMRI + EEG predicted together, outputs z-normalised
+            # and concatenated into a single state vector.
+            self.n_fmri_regions: int = int(base_graph["fmri"].x.shape[0])
+            self.n_eeg_regions:  int = int(base_graph["eeg"].x.shape[0])
+            self.n_regions = self.n_fmri_regions + self.n_eeg_regions
+            self.dt = _pred_dt
+            self.native_sampling_rate: Optional[float] = None
+
+            # Pre-compute per-channel normalisation statistics from base_graph
+            # for z-normalising joint trajectories (and reversing the
+            # normalisation when injecting x0 back into raw context).
+            _fmri_x = base_graph["fmri"].x.squeeze(-1)  # [N_fmri, T]
+            self._fmri_mean = _fmri_x.mean(dim=1).cpu().numpy().astype(np.float32)
+            self._fmri_std  = _fmri_x.std(dim=1).cpu().numpy().astype(np.float32) + _STD_GUARD
+            _eeg_x = base_graph["eeg"].x.squeeze(-1)    # [N_eeg, T]
+            self._eeg_mean  = _eeg_x.mean(dim=1).cpu().numpy().astype(np.float32)
+            self._eeg_std   = _eeg_x.std(dim=1).cpu().numpy().astype(np.float32) + _STD_GUARD
+
+        elif modality == "eeg":
+            self.n_regions = int(base_graph["eeg"].x.shape[0])
+            _eeg_sr = getattr(base_graph["eeg"], "sampling_rate", None)
+            self.native_sampling_rate = float(_eeg_sr) if _eeg_sr else None
+            # Use fMRI TR as effective dt (model predicts EEG at TR resolution)
+            self.dt = _pred_dt
+            if _eeg_sr and abs(_pred_dt - 1.0 / float(_eeg_sr)) > 1e-3:
+                logger.warning(
+                    "EEG 时间分辨率说明：TwinBrainDigitalTwin 以 fMRI TR 为时间单位"
+                    "预测所有模态，EEG 预测步长 = %.4f s（fMRI TR），"
+                    "而非 EEG 原生采样率 %.1f Hz（%.4f s/样本）。"
+                    "时间轴 `times` 和所有分析参数均以 TR 为单位。",
+                    _pred_dt, float(_eeg_sr), 1.0 / float(_eeg_sr),
+                )
+
+        else:  # fmri
+            self.n_regions = int(base_graph["fmri"].x.shape[0])
+            _fmri_sr_local = getattr(base_graph["fmri"], "sampling_rate", None)
+            self.native_sampling_rate = float(_fmri_sr_local) if _fmri_sr_local else None
+            self.dt = 1.0 / float(_fmri_sr_local) if _fmri_sr_local else _pred_dt
 
         logger.info(
             "BrainDynamicsSimulator: TwinBrainDigitalTwin 模式 "
-            "(modality=%s, n_regions=%d, dt=%.4f s, device=%s)",
+            "(modality=%s, n_regions=%d, dt=%.4f s [fMRI TR], device=%s)",
             modality, self.n_regions, self.dt, self.device,
         )
 
     # ── Core API ───────────────────────────────────────────────────────────────
+
+    @property
+    def state_bounds(self) -> Optional[Tuple[float, float]]:
+        """
+        State-space bounds used by Wolf/FTLE Lyapunov analysis for clipping
+        perturbed states after each renormalisation period.
+
+        - Single-modality (fMRI / EEG): returns ``(0.0, 1.0)``.
+          The graph cache stores normalised values that are treated as bounded
+          in ``[0, 1]`` for the purposes of Wolf-Benettin renormalisation
+          (preserves physical realism of the perturbed state).
+
+        - Joint mode: returns ``None``.
+          Joint trajectories are z-score normalised (values roughly in
+          ``[−3, 3]`` with no hard bound).  Clipping z-scores to ``[0, 1]``
+          would introduce an artificial attractor at 0 and must be avoided.
+          Lyapunov analysis in joint mode should use the Rosenstein method
+          (which does not require clipping) rather than Wolf-Benettin.
+        """
+        if self.modality == "joint":
+            return None
+        return (0.0, 1.0)
 
     def rollout(
         self,
@@ -333,9 +448,16 @@ class BrainDynamicsSimulator:
             trajectory: shape (steps, n_regions)，每步的脑状态。
             times:      shape (steps,)，以秒为单位的时间轴。
         """
-        return self._rollout_with_twin(
-            steps=steps, stimulus=stimulus, x0=x0,
-            context_window_idx=context_window_idx,
+        return (
+            self._rollout_multi_stim_joint(
+                steps=steps,
+                stimuli=[stimulus] if stimulus is not None else [],
+                x0=x0,
+                context_window_idx=context_window_idx,
+            ) if self.modality == "joint" else self._rollout_with_twin(
+                steps=steps, stimulus=stimulus, x0=x0,
+                context_window_idx=context_window_idx,
+            )
         )
 
     def rollout_multi_stim(
@@ -359,6 +481,8 @@ class BrainDynamicsSimulator:
             trajectory: shape (steps, n_regions)。
             times:      shape (steps,)。
         """
+        if self.modality == "joint":
+            return self._rollout_multi_stim_joint(steps=steps, stimuli=stimuli, x0=x0)
         if stimuli is None:
             stimuli = []
         return self._rollout_multi_stim_with_twin(steps=steps, stimuli=stimuli, x0=x0)
@@ -398,6 +522,31 @@ class BrainDynamicsSimulator:
         """
         return self._wolf_pair_twin(x_base, x_pert, steps, wolf_context)
 
+    def _z_normalise_joint(
+        self, fmri_pred: "torch.Tensor", eeg_pred: "torch.Tensor"
+    ) -> np.ndarray:
+        """
+        Z-normalise and concatenate fMRI + EEG prediction tensors.
+
+        Each modality is normalised per-channel using statistics pre-computed
+        from ``base_graph`` in ``__init__``.  The result is a joint state chunk
+        ``[z_fmri | z_eeg]`` with shape ``(T, N_fmri + N_eeg)`` where every
+        dimension has comparable z-score units — required for distance-based
+        dynamics metrics (Lyapunov exponents, FNN embedding dimension).
+
+        Args:
+            fmri_pred: ``[N_fmri, T, 1]`` tensor from ``predict_future``/``perturbed``.
+            eeg_pred:  ``[N_eeg,  T, 1]`` tensor.
+
+        Returns:
+            ``float32`` array of shape ``(T, N_fmri + N_eeg)``.
+        """
+        fmri_np = fmri_pred.squeeze(-1).detach().cpu().numpy().T  # [T, N_fmri]
+        eeg_np  = eeg_pred.squeeze(-1).detach().cpu().numpy().T   # [T, N_eeg]
+        fmri_z  = (fmri_np - self._fmri_mean) / self._fmri_std
+        eeg_z   = (eeg_np  - self._eeg_mean)  / self._eeg_std
+        return np.concatenate([fmri_z, eeg_z], axis=1)
+
     def _wolf_predict(
         self,
         context: HeteroData,
@@ -427,14 +576,23 @@ class BrainDynamicsSimulator:
             req_steps = min(chunk_size, remaining)
 
             pred_dict = self.model.predict_future(ctx, num_steps=req_steps)
-            if self.modality not in pred_dict:
-                raise RuntimeError(
-                    f"模型未返回模态 '{self.modality}' 的预测 (_wolf_predict)。\n"
-                    f"可用模态: {list(pred_dict.keys())}"
-                )
 
-            pred = pred_dict[self.modality]  # [N, req_steps, 1]
-            chunk_np = pred.squeeze(-1).detach().cpu().numpy().T  # [req_steps, N]
+            if self.modality == "joint":
+                fmri_pred = pred_dict.get("fmri")
+                eeg_pred  = pred_dict.get("eeg")
+                if fmri_pred is None or eeg_pred is None:
+                    raise RuntimeError(
+                        "_wolf_predict: joint 模态缺少 fmri 或 eeg 预测。"
+                    )
+                chunk_np = self._z_normalise_joint(fmri_pred, eeg_pred)
+            else:
+                if self.modality not in pred_dict:
+                    raise RuntimeError(
+                        f"模型未返回模态 '{self.modality}' 的预测 (_wolf_predict)。\n"
+                        f"可用模态: {list(pred_dict.keys())}"
+                    )
+                pred = pred_dict[self.modality]  # [N, req_steps, 1]
+                chunk_np = pred.squeeze(-1).detach().cpu().numpy().T  # [req_steps, N]
             trajectory[t_offset: t_offset + req_steps] = chunk_np[:req_steps]
             t_offset += req_steps
 
@@ -654,8 +812,16 @@ class BrainDynamicsSimulator:
         all n_init rollouts would start from identical graph-cache values and
         produce identical trajectories.
 
-        The injection is in-place on ``context[self.modality].x``.  The caller
-        owns this tensor (it is a clone of ``base_graph``), so mutation is safe.
+        **Single-modality mode** (fMRI / EEG):
+            Writes ``x0`` into ``context[self.modality].x[:, -1, 0]``.
+
+        **joint mode**:
+            ``x0`` is a z-scored concatenated vector ``[z_fmri | z_eeg]`` from
+            ``sample_random_state()``.  Each half is un-z-scored using the
+            per-channel statistics pre-computed in ``__init__``, then written
+            into the last step of the respective modality's context.  This maps
+            the normalised joint state back to the raw representation stored in
+            the graph cache.
 
         Args:
             context: Trimmed HeteroData clone (already detached from base_graph).
@@ -672,6 +838,25 @@ class BrainDynamicsSimulator:
                 x0_np.shape, self.n_regions,
             )
             return
+
+        if self.modality == "joint":
+            # Split joint z-scored x0 into fMRI and EEG parts
+            fmri_x0_z = x0_np[:self.n_fmri_regions]  # z-score units
+            eeg_x0_z  = x0_np[self.n_fmri_regions:]
+
+            # Un-z-score to match the raw values stored in the graph context
+            fmri_x0_raw = torch.from_numpy(fmri_x0_z * self._fmri_std + self._fmri_mean)
+            eeg_x0_raw  = torch.from_numpy(eeg_x0_z  * self._eeg_std  + self._eeg_mean)
+
+            ctx_fmri = context["fmri"].x  # [N_fmri, T_ctx, 1]
+            if fmri_x0_raw.shape[0] == ctx_fmri.shape[0]:
+                ctx_fmri[:, -1, 0] = fmri_x0_raw
+            ctx_eeg = context["eeg"].x    # [N_eeg, T_ctx, 1]
+            if eeg_x0_raw.shape[0] == ctx_eeg.shape[0]:
+                ctx_eeg[:, -1, 0] = eeg_x0_raw
+            return
+
+        # Single-modality injection
         x0_t = torch.from_numpy(x0_np)
         ctx_x = context[self.modality].x  # [N, T_ctx, C], owned by clone
         if x0_t.shape[0] == ctx_x.shape[0]:
@@ -771,6 +956,112 @@ class BrainDynamicsSimulator:
 
         return trajectory, times
 
+    def _rollout_multi_stim_joint(
+        self,
+        steps: int,
+        stimuli: List[Stimulus],
+        x0: Optional[np.ndarray] = None,
+        context_window_idx: int = 0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Joint fMRI+EEG autoregressive rollout for ``modality='joint'``.
+
+        Handles both free dynamics (``stimuli=[]``) and any combination of
+        fMRI/EEG stimuli (``stimuli=[...]``).  ``rollout()`` delegates here by
+        wrapping a single ``Stimulus`` in a list.
+
+        **Joint state**: ``[z_fmri | z_eeg]`` shape ``(steps, N_fmri+N_eeg)``.
+        Each modality is per-channel z-normalised via ``_z_normalise_joint``
+        using statistics pre-computed from ``base_graph``.  This puts fMRI BOLD
+        and EEG on a common scale for distance-based analyses (Lyapunov, FNN).
+
+        **Stimulation routing** (joint node space):
+          - ``0 ≤ node < N_fmri``      → ``interventions={"fmri": ([node], δ)}``
+          - ``N_fmri ≤ node < N_joint`` → ``interventions={"eeg": ([node-N_fmri], δ)}``
+          - Multiple stimuli are partitioned into fMRI / EEG dicts and passed
+            as a single ``simulate_intervention()`` call (one forward pass).
+          - Out-of-range nodes raise ``ValueError`` immediately.
+
+        **Temporal context**: ``context_window_idx`` selects which historical
+        window from ``base_graph`` to use as the initial context, enabling
+        trajectory diversity for Lyapunov / Wolf analysis.
+        """
+        chunk_size: int = getattr(
+            getattr(self.model, "model", None), "prediction_steps", 50
+        )
+        context = self._get_context_for_window(context_window_idx)
+        self._inject_x0_into_context(context, x0)
+
+        trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
+        times = np.arange(steps, dtype=np.float32) * self.dt
+
+        t_offset = 0
+        while t_offset < steps:
+            remaining = steps - t_offset
+            req_steps = min(chunk_size, remaining)
+
+            # Partition active stimuli into fMRI / EEG intervention dicts.
+            fmri_node_deltas: Dict[int, float] = {}
+            eeg_node_deltas:  Dict[int, float] = {}
+
+            for stim in stimuli:
+                node = stim.node
+                if not (0 <= node < self.n_regions):
+                    raise ValueError(
+                        f"_rollout_multi_stim_joint: stimulus.node={node} 超出联合索引范围 "
+                        f"[0, {self.n_regions})。"
+                        f"fMRI: [0, {self.n_fmri_regions}), "
+                        f"EEG: [{self.n_fmri_regions}, {self.n_regions})。"
+                    )
+                for i in range(req_steps):
+                    if stim.is_active(t_offset + i):
+                        v = stim.value(t_offset + i) * _STIM_AMP_TO_LATENT_SIGMA
+                        if node < self.n_fmri_regions:
+                            fmri_node_deltas[node] = max(fmri_node_deltas.get(node, 0.0), v)
+                        else:
+                            eeg_ch = node - self.n_fmri_regions
+                            eeg_node_deltas[eeg_ch] = max(eeg_node_deltas.get(eeg_ch, 0.0), v)
+
+            interventions: Dict[str, Tuple[List[int], float]] = {}
+            if fmri_node_deltas:
+                interventions["fmri"] = (
+                    list(fmri_node_deltas.keys()),
+                    float(np.mean(list(fmri_node_deltas.values()))),
+                )
+            if eeg_node_deltas:
+                interventions["eeg"] = (
+                    list(eeg_node_deltas.keys()),
+                    float(np.mean(list(eeg_node_deltas.values()))),
+                )
+
+            if interventions:
+                result = self.model.simulate_intervention(
+                    baseline_data=context,
+                    interventions=interventions,
+                    num_prediction_steps=req_steps,
+                )
+                pred_dict = result["perturbed"]
+            else:
+                pred_dict = self.model.predict_future(context, num_steps=req_steps)
+
+            fmri_pred = pred_dict.get("fmri")
+            eeg_pred  = pred_dict.get("eeg")
+            if fmri_pred is None or eeg_pred is None:
+                raise RuntimeError(
+                    "joint 模态要求模型同时返回 'fmri' 和 'eeg' 预测。\n"
+                    f"实际返回: {list(pred_dict.keys())}\n"
+                    "请确认模型以多模态联合训练，且 base_graph 包含两种节点。"
+                )
+
+            joint_chunk = self._z_normalise_joint(fmri_pred, eeg_pred)
+            trajectory[t_offset: t_offset + req_steps] = joint_chunk[:req_steps]
+            t_offset += req_steps
+
+            if t_offset < steps:
+                context = _advance_context(context, pred_dict)
+
+        return trajectory, times
+
     def _rollout_multi_stim_with_twin(
         self,
         steps: int,
@@ -847,13 +1138,30 @@ class BrainDynamicsSimulator:
         self, rng: Optional[np.random.Generator] = None
     ) -> np.ndarray:
         """
-        采样随机初始脑状态：从 ``base_graph`` 数据的均值附近添加随机噪声，
-        以获取在生理范围内的初始状态。
+        采样随机初始脑状态。
 
-        ``rollout()`` 使用该状态作为初始上下文的最后一个时间步注入值。
+        **单模态模式 (fMRI / EEG)**：从 ``base_graph`` 数据的均值附近添加随机
+        噪声，结果 clip 到 [0, 1]，以 ``rollout()`` 注入初始上下文末步。
+
+        **joint 模式**：分别为 fMRI 和 EEG 部分各自采样，使用
+        ``_fmri_mean/std`` 和 ``_eeg_mean/std`` 对噪声缩放，再拼接成
+        z-score 归一化的联合状态向量 ``[z_fmri | z_eeg]``，形状
+        ``(n_fmri_regions + n_eeg_regions,)``。值域无 [0,1] 限制。
         """
         if rng is None:
             rng = np.random.default_rng(self.seed)
+
+        if self.modality == "joint":
+            # Sample z-scored state for fMRI part
+            fmri_noise = rng.normal(0.0, 0.1, self.n_fmri_regions).astype(np.float32)
+            fmri_x0_z = fmri_noise  # z-score ≈ mean_z + noise (mean_z ≈ 0 by definition)
+
+            # Sample z-scored state for EEG part
+            eeg_noise = rng.normal(0.0, 0.1, self.n_eeg_regions).astype(np.float32)
+            eeg_x0_z = eeg_noise
+
+            return np.concatenate([fmri_x0_z, eeg_x0_z])
+
         x_data = self.base_graph[self.modality].x  # [N, T, 1]
         mean_state = x_data.squeeze(-1).mean(dim=1).cpu().numpy()  # [N]
         noise = rng.normal(0, 0.05, self.n_regions).astype(np.float32)

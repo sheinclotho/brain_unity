@@ -96,21 +96,48 @@ def compute_response_matrix(
     context = simulator._trim_context(_clone_hetero_graph(simulator.base_graph))
     modality = simulator.modality
     delta = float(stim_amplitude) * _STIM_AMP_TO_LATENT_SIGMA
+    is_joint = (modality == "joint")
 
     logger.info(
-        "TwinBrain 响应矩阵: n_nodes=%d, delta=%.2f σ (amplitude=%.2f × %.1f)",
+        "TwinBrain 响应矩阵: n_nodes=%d, delta=%.2f σ (amplitude=%.2f × %.1f)%s",
         n_nodes, delta, stim_amplitude, _STIM_AMP_TO_LATENT_SIGMA,
+        " [joint 模式: 节点索引 0..N_fmri-1=fMRI, N_fmri..N_joint-1=EEG]" if is_joint else "",
     )
 
     for i in range(n_nodes):
-        result = simulator.model.simulate_intervention(
-            baseline_data=context,
-            interventions={modality: ([i], delta)},
-        )
-        effect = result["causal_effect"].get(modality)  # [N, steps, C]
-        if effect is not None:
-            # Mean over prediction steps; squeeze last dim (C=1 for fMRI).
-            R[i] = effect.detach().squeeze(-1).mean(dim=1).cpu().numpy()
+        if is_joint:
+            # Map joint node index to its physical modality and channel index.
+            # Joint node space: [0 .. N_fmri-1] = fMRI regions,
+            #                   [N_fmri .. N_fmri+N_eeg-1] = EEG channels.
+            if i < simulator.n_fmri_regions:
+                stim_mod = "fmri"
+                stim_node = i
+            else:
+                stim_mod = "eeg"
+                stim_node = i - simulator.n_fmri_regions
+            result = simulator.model.simulate_intervention(
+                baseline_data=context,
+                interventions={stim_mod: ([stim_node], delta)},
+            )
+            # Build joint z-normalised response from both modalities' causal effects
+            fmri_effect = result["causal_effect"].get("fmri")
+            eeg_effect  = result["causal_effect"].get("eeg")
+            if fmri_effect is not None and eeg_effect is not None:
+                fmri_vals = fmri_effect.detach().squeeze(-1).mean(dim=1).cpu().numpy()
+                eeg_vals  = eeg_effect.detach().squeeze(-1).mean(dim=1).cpu().numpy()
+                # Z-normalise each modality using simulator's pre-computed stats
+                fmri_z = (fmri_vals - simulator._fmri_mean) / simulator._fmri_std
+                eeg_z  = (eeg_vals  - simulator._eeg_mean)  / simulator._eeg_std
+                R[i]   = np.concatenate([fmri_z, eeg_z])
+        else:
+            result = simulator.model.simulate_intervention(
+                baseline_data=context,
+                interventions={modality: ([i], delta)},
+            )
+            effect = result["causal_effect"].get(modality)  # [N, steps, C]
+            if effect is not None:
+                # Mean over prediction steps; squeeze last dim (C=1 for fMRI).
+                R[i] = effect.detach().squeeze(-1).mean(dim=1).cpu().numpy()
 
         if (i + 1) % max(1, n_nodes // 10) == 0:
             logger.info("  %d/%d 节点完成", i + 1, n_nodes)

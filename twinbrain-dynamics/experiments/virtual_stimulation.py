@@ -170,7 +170,7 @@ def run_stimulation(
         rng = np.random.default_rng(0)
 
     if x0 is None:
-        x0 = rng.random(simulator.n_regions).astype(np.float32)
+        x0 = simulator.sample_random_state(rng=rng)
 
     # Build stimulus (onset = pre_steps, active during stim phase)
     stim = _build_stimulus(
@@ -240,7 +240,7 @@ def run_virtual_stimulation(
     for pattern in patterns:
         results_by_pattern[pattern] = []
         for node in target_nodes:
-            x0 = rng.random(simulator.n_regions).astype(np.float32)
+            x0 = simulator.sample_random_state(rng=rng)
             result = run_stimulation(
                 simulator=simulator,
                 node=node,

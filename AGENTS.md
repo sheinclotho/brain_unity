@@ -466,3 +466,27 @@ r ≈ 0 的两个神经生物学合理原因：
 - **规则**: Wolf LLE 扰动折叠到 0 时（r<1e-30）不记录该期 log-growth，直接重新扰动继续（避免大负值污染均值）
 
 *Last updated: 2026-03-06*
+
+### [2026-03-07] joint 模态 & dt 修复 & Wolf/FTLE 状态空间感知裁剪
+
+#### `dt` 错误修复
+- **问题**: `load_graph_for_inference` 从不写入 `sampling_rate` 属性，`BrainDynamicsSimulator` 在无 SR 时默认 `dt=0.004s`（EEG 250Hz），但模型所有预测均以 fMRI TR 为步长，导致时间轴错误（50步×0.004s=0.2s 而非 50×2.0s=100s）。
+- **修复**: EEG 模态也使用 fMRI TR（`1/fmri_sr` 或默认 `_DEFAULT_FMRI_TR=2.0s`）。新增常量 `_DEFAULT_FMRI_TR=2.0`、`_STD_GUARD=1e-8`。
+- **规则**: `dt` 永远等于 fMRI TR。无论分析哪种模态，预测步长由 fMRI TR 决定。
+
+#### Wolf/FTLE 状态空间感知裁剪
+- **问题**: Wolf/FTLE 中 `np.clip(x, 0, 1)` 假设有界状态空间，对 joint 模式（z-score 无界）会在 0 处产生虚假吸引点，污染 LLE 估计。
+- **修复**: 新增 `state_bounds` 属性——单模态返回 `(0.0, 1.0)`，joint 返回 `None`。lyapunov.py 3 处裁剪均改为 `if _bounds is not None` 判断。
+- **规则**: joint 模式必须使用 Rosenstein 方法（无状态边界假设），run_dynamics_analysis.py 自动切换。
+
+#### `modality='joint'` 联合模态
+- **设计**: 单次 `predict_future()` 调用同时获取 fMRI 和 EEG 预测；各自按 `base_graph` 统计量做 per-channel z-score 归一化后拼接为 `[z_fmri | z_eeg]` 状态向量（维度 N_fmri+N_eeg），输出单一动力学指标（单一 Lyapunov 指数）。
+- **联合节点索引映射**: `[0, N_fmri)` → fMRI 区域，`[N_fmri, N_joint)` → EEG 通道。越界节点显式 `ValueError`，无静默回退。
+- **核心方法**: `_rollout_multi_stim_joint(stimuli, x0, context_window_idx)` 同时处理自由动力学（`stimuli=[]`）和多刺激（`stimuli=[...]`），`rollout()` 通过 `[stimulus]` 包装委托。原 `_rollout_joint` 已删除（消除冗余）。
+- **新增辅助**: `_z_normalise_joint(fmri_pred, eeg_pred)` 集中 z-score+拼接逻辑（原来分散在3处）。
+- **虚拟刺激初始状态**: `virtual_stimulation.py` 改用 `simulator.sample_random_state()` 替代 `rng.random(n_regions)`，joint 模式得到正确 z-score 尺度的初始状态。
+- **响应矩阵**: `compute_response_matrix` 为 joint 模式添加节点→模态映射，提取双模态 causal_effect 并 z-score 归一化后拼接为联合响应行。
+- **CLI**: `--modality` choices 新增 `joint`；`both` 和 `joint` 文档明确区分。
+- **规则**: joint 模式所有操作均显式处理，无 fallback 至单模态行为。步骤 5/6（虚拟刺激/响应矩阵）完全支持 joint，步骤 9（Lyapunov）自动切换 rosenstein。
+
+*Last updated: 2026-03-07*

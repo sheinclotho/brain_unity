@@ -201,12 +201,23 @@ def wolf_largest_lyapunov(
     use_wolf_pair = hasattr(simulator, "wolf_rollout_pair")
     wolf_context = None  # opaque per-mode state carried between periods
 
+    # Respect the simulator's state-space bounds.
+    # - Bounded (fMRI / EEG): clip perturbed state to [0, 1].
+    # - Unbounded (joint mode: z-scored, no hard bound): do NOT clip.
+    #   Clipping z-scores to [0, 1] would introduce an artificial attractor at 0
+    #   and produce a misleading Wolf LLE.  In joint mode, use Rosenstein instead.
+    # Default (0.0, 1.0) ensures backward-compatibility with simulators that were
+    # created before the state_bounds property was added (all of which are bounded).
+    _bounds = getattr(simulator, "state_bounds", (0.0, 1.0))
+
     _float64_tiny = np.finfo(np.float64).tiny
 
     for _ in range(n_periods):
         # Perturbed initial point for this period
-        x_pert = np.clip(
-            x_cur + (epsilon * perturb).astype(np.float32), 0.0, 1.0
+        _perturbed = x_cur + (epsilon * perturb).astype(np.float32)
+        x_pert = (
+            np.clip(_perturbed, _bounds[0], _bounds[1])
+            if _bounds is not None else _perturbed
         )
 
         # ── Bounded-space correction ──────────────────────────────────────────
@@ -318,7 +329,11 @@ def ftle_lyapunov(
     # Random unit perturbation vector (fixed seed → reproducible per call)
     perturb = rng.standard_normal(n_regions).astype(np.float32)
     perturb /= (np.linalg.norm(perturb) + 1e-15)
-    x0_perturbed = np.clip(x0 + epsilon * perturb, 0.0, 1.0)
+    _bounds = getattr(simulator, "state_bounds", (0.0, 1.0))
+    _raw_pert = x0 + epsilon * perturb
+    x0_perturbed = (
+        np.clip(_raw_pert, _bounds[0], _bounds[1]) if _bounds is not None else _raw_pert
+    )
 
     traj_orig, _ = simulator.rollout(x0=x0, steps=T, stimulus=None)
     traj_pert, _ = simulator.rollout(x0=x0_perturbed, steps=T, stimulus=None)
@@ -524,12 +539,15 @@ def multi_direction_ftle(
     n = len(x0)
     ftle_list: List[float] = []
     traj_orig, _ = simulator.rollout(x0=x0, steps=trajectory_length, stimulus=None)
+    _bounds = getattr(simulator, "state_bounds", (0.0, 1.0))
 
     for _ in range(n_directions):
         perturb = rng.standard_normal(n).astype(np.float32)
         perturb /= (np.linalg.norm(perturb) + 1e-15)
-        x0_pert = np.clip(x0.astype(np.float32) + epsilon * perturb, 0.0, 1.0)
-
+        _raw_pert = x0.astype(np.float32) + epsilon * perturb
+        x0_pert = (
+            np.clip(_raw_pert, _bounds[0], _bounds[1]) if _bounds is not None else _raw_pert
+        )
         traj_pert, _ = simulator.rollout(x0=x0_pert, steps=trajectory_length, stimulus=None)
         dist = np.linalg.norm((traj_pert - traj_orig).astype(np.float64), axis=1)
         dist = np.maximum(dist, 1e-15)
