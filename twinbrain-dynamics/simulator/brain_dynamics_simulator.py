@@ -4,23 +4,13 @@ Brain Dynamics Simulator
 
 统一管理所有模拟过程的核心组件。
 
-支持两种运行模式：
-
-**模型模式**（推荐）
+**唯一支持的模式：TwinBrainDigitalTwin**
   ``BrainDynamicsSimulator(twin, base_graph)``
   使用 ``TwinBrainDigitalTwin`` 进行基于真实学习动力学的推断：
     - 自由演化：``twin.predict_future()`` 自回归滑窗预测
     - 受刺激演化：``twin.simulate_intervention()`` 潜空间扰动
 
-**Wilson-Cowan 模式**（独立基线，非回退）
-  ``BrainDynamicsSimulator(model=None, n_regions=N)``
-  偏差驱动漏积分器，仅供基线对比与单元测试使用。
-  当 ``model`` 被提供但无法前向推断时，**不会**自动切换到此模式，
-  而是直接抛出 ``RuntimeError``。
-
-时间尺度对齐原则（见计划书 §11）:
-  - 模型模式：dt = 1 / fmri_sampling_rate（通常 2 s per TR）
-  - WC 模式：dt = 0.004 s（EEG 采样率）
+时间尺度：dt = 1 / fmri_sampling_rate（通常 2 s per TR，从 base_graph 自动推断）
 
 所有实验均通过此接口进行：
   rollout(x0, steps, stimulus)          → 连续模拟轨迹
@@ -51,41 +41,12 @@ logger = logging.getLogger(__name__)
 # represents a physiologically strong but not extreme perturbation.
 _STIM_AMP_TO_LATENT_SIGMA: float = 2.0
 
-# Default GPU memory budget per chunk for batched rollout (in MB).
-# Tune down for GPUs with less VRAM (e.g. 256 for 4 GB cards).
-_DEFAULT_CHUNK_MEMORY_MiB: int = 512
-
 
 def _resolve_device(device: str) -> str:
     """Resolve ``"auto"`` to the actual device string (``"cuda"`` or ``"cpu"``)."""
     if device == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
     return device
-
-
-def _compute_chunk_steps(
-    n_batch: int,
-    n_regions: int,
-    max_memory_mib: int = _DEFAULT_CHUNK_MEMORY_MiB,
-) -> int:
-    """
-    Compute how many trajectory-steps fit within *max_memory_mib* of GPU memory.
-
-    The dominant allocation during a batched rollout chunk is the trajectory
-    storage tensor of shape ``(chunk_steps, n_batch, n_regions)`` in float32.
-    This helper keeps that tensor under the requested memory budget.
-
-    Args:
-        n_batch:        Number of parallel trajectories.
-        n_regions:      Number of brain regions.
-        max_memory_mib: Memory budget per chunk in MiB (default 512 MiB).
-
-    Returns:
-        chunk_steps: Maximum step count per chunk (≥ 1).
-    """
-    bytes_per_step = n_batch * n_regions * 4  # float32 = 4 bytes
-    chunk_steps = max(1, int(max_memory_mib * 1024 * 1024 // bytes_per_step))
-    return chunk_steps
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -242,120 +203,6 @@ class RampStimulus(Stimulus):
         progress = t_rel / max(self.duration - 1, 1)
         return self.amplitude * progress
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Wilson-Cowan standalone integrator (baseline / unit tests only)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _make_connectivity(n: int, seed: int = 0) -> np.ndarray:
-    """
-    生成合成连接矩阵（供 WC 模式使用）。
-
-    对角线为零，L1 归一化，随机稀疏连接。
-    """
-    rng = np.random.default_rng(seed)
-    W = rng.random((n, n)).astype(np.float32)
-    np.fill_diagonal(W, 0.0)
-    W = W / (W.sum(axis=1, keepdims=True) + 1e-8)
-    return W
-
-
-class _WilsonCowanIntegrator:
-    """
-    偏差驱动漏积分器（与 realtime_server._demo_simulate 一致）。
-
-    x(t+1) = x(t) + delta - leak
-    delta  = tanh(stim * 2.0 + (W @ deviation) * 0.35) * 0.04
-    leak   = deviation * 0.10
-    deviation = x(t) - x0     (x0 = 初始平衡状态)
-
-    固定点在 x0 处；无刺激时 deviation 保持为 0。
-
-    **用途**：仅作为独立基线模型与单元测试使用，不是真实模型的回退选项。
-    """
-
-    def __init__(self, n_regions: int, x0: np.ndarray, seed: int = 0):
-        self.n = n_regions
-        self.x0 = x0.copy()
-        self.W = _make_connectivity(n_regions, seed=seed)
-
-    def step(self, state: np.ndarray, stim: np.ndarray) -> np.ndarray:
-        dev = state - self.x0
-        net_dev = self.W @ dev
-        delta = np.tanh(stim * 2.0 + net_dev * 0.35) * 0.04
-        leak = dev * 0.10
-        new_state = state + delta - leak
-        return np.clip(new_state, 0.0, 1.0)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Batched GPU-accelerated Wilson-Cowan integrator
-# ══════════════════════════════════════════════════════════════════════════════
-
-class _WilsonCowanIntegratorBatched:
-    """
-    GPU-accelerated batched Wilson-Cowan integrator (PyTorch backend).
-
-    Processes **all trajectories in parallel** in a single matrix operation,
-    making GPU-accelerated free-dynamics experiments feasible even for large
-    ``n_init`` × ``steps`` configurations.
-
-    Dynamics are identical to ``_WilsonCowanIntegrator``::
-
-        dev   = state - x0          (deviation from per-trajectory equilibrium)
-        delta = tanh(stim·2 + W@dev·0.35) · 0.04
-        leak  = dev · 0.10
-        x(t+1) = clip(x(t) + delta − leak, 0, 1)
-
-    Shapes (n_batch = number of parallel trajectories, N = n_regions):
-        state  : ``(n_batch, N)``  — current brain state for every trajectory
-        stim   : ``(N,)``          — shared stimulus broadcast over the batch
-        output : ``(n_batch, N)``  — updated state for every trajectory
-    """
-
-    def __init__(
-        self,
-        n_regions: int,
-        x0_batch: np.ndarray,
-        seed: int = 0,
-        device: str = "cpu",
-    ):
-        """
-        Args:
-            n_regions:  Number of brain regions (N).
-            x0_batch:   Equilibrium states for each trajectory, shape ``(n_batch, N)``.
-            seed:       Random seed for the shared connectivity matrix.
-            device:     PyTorch device string (``"cpu"``, ``"cuda"``, ``"cuda:0"``…).
-        """
-        self._device = torch.device(_resolve_device(device))
-        W_np = _make_connectivity(n_regions, seed=seed)
-        self.W = torch.from_numpy(W_np).float().to(self._device)           # (N, N)
-        self.x0 = (
-            torch.from_numpy(x0_batch.astype(np.float32)).to(self._device)  # (n_batch, N)
-        )
-
-    def step(
-        self,
-        state: torch.Tensor,
-        stim: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Single parallel step for all trajectories.
-
-        Args:
-            state: ``(n_batch, N)`` current state tensor on the same device.
-            stim:  ``(N,)`` stimulus vector (broadcast over the batch).
-
-        Returns:
-            Updated state ``(n_batch, N)``.
-        """
-        dev_state = state - self.x0                          # (n_batch, N)
-        net_dev   = torch.matmul(dev_state, self.W.T)        # (n_batch, N)
-        delta     = torch.tanh(stim * 2.0 + net_dev * 0.35) * 0.04
-        leak      = dev_state * 0.10
-        return torch.clamp(state + delta - leak, 0.0, 1.0)
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # BrainDynamicsSimulator
 # ══════════════════════════════════════════════════════════════════════════════
@@ -364,7 +211,7 @@ class BrainDynamicsSimulator:
     """
     统一管理所有模拟过程的核心组件。
 
-    **模型模式**（``twin`` 为 ``TwinBrainDigitalTwin`` 实例）::
+    **唯一支持的模式：TwinBrainDigitalTwin**::
 
         twin = load_trained_model("outputs/exp/best_model.pt")
         base_graph = load_graph_for_inference("outputs/graph_cache/sub-01_notask_xx.pt")
@@ -377,182 +224,119 @@ class BrainDynamicsSimulator:
         stim = SinStimulus(node=42, freq=10.0, amp=0.5, duration=30, onset=10)
         traj, times = sim.rollout(steps=80, stimulus=stim)
 
-    **WC 模式**（``model=None``，仅用于基线对比）::
-
-        sim = BrainDynamicsSimulator(model=None, n_regions=200)
-        x0 = sim.sample_random_state()
-        traj, times = sim.rollout(x0, steps=1000)
-
-    重要：当 ``model`` 被提供但无法进行前向推断（``can_forward=False``），
-    将立即抛出 ``RuntimeError``，**不会**自动回退到 WC 模式。
+    ``model`` 是必须参数，且必须是实现了 ``predict_future`` 的
+    TwinBrainDigitalTwin 实例。若提供 None 将立即抛出 ValueError。
     """
 
     def __init__(
         self,
-        model=None,
-        n_regions: int = 200,
-        dt: float = 0.004,
+        model,
+        base_graph: HeteroData,
+        modality: str = "fmri",
         fmri_subsample: int = 25,
         seed: int = 0,
-        base_graph: Optional[HeteroData] = None,
-        modality: str = "fmri",
         device: str = "auto",
     ):
         """
         Args:
-            model:         ``TwinBrainDigitalTwin`` 实例（模型模式）或 ``None``（WC 模式）。
-            n_regions:     脑区数量，WC 模式下使用（模型模式从 ``base_graph`` 推断）。
-            dt:            内部时间步长（秒），WC 模式下使用（模型模式从采样率推断）。
-            fmri_subsample: fMRI 下采样倍率（仅供参考，当前未实现子采样记录）。
-            seed:           WC 模式下的随机种子。
-            base_graph:    ``HeteroData`` 上下文图（模型模式下必须提供）。
-            modality:      分析模态（``"fmri"`` 或 ``"eeg"``，模型模式下使用）。
-            device:        计算设备（``"cpu"``、``"cuda"``、``"auto"``）。
-                           ``"auto"`` 自动选择 CUDA（若可用）。
-                           WC 模式下用于 batched GPU rollout。
+            model:         TwinBrainDigitalTwin 实例（必须）。
+            base_graph:    HeteroData 图缓存（必须）。
+            modality:      分析模态（``"fmri"`` 或 ``"eeg"``）。
+            fmri_subsample: fMRI 下采样倍率（保留兼容性，当前未实现子采样）。
+            seed:           随机种子（用于 sample_random_state）。
+            device:        计算设备（``"auto"`` → CUDA if available）。
 
         Raises:
-            ValueError:  模型模式下未提供 ``base_graph``，
-                         或 ``base_graph`` 中不含指定 ``modality``。
-            RuntimeError: ``model`` 提供但 ``can_forward=False``（禁止无声回退）。
+            ValueError: model 为 None，或 model 不是 TwinBrainDigitalTwin，
+                        或 base_graph 缺少指定 modality。
         """
+        if model is None:
+            raise ValueError(
+                "BrainDynamicsSimulator 需要一个训练好的 TwinBrainDigitalTwin 模型。\n"
+                "请使用 loader.load_model.load_trained_model() 加载检查点。\n"
+                "Wilson-Cowan 模式已移除——此模块专用于测试训练好的模型。"
+            )
+        if not hasattr(model, "predict_future"):
+            raise ValueError(
+                f"model 必须是具有 predict_future() 方法的 TwinBrainDigitalTwin 实例。\n"
+                f"实际类型: {type(model).__name__}"
+            )
+        if base_graph is None:  # type: ignore[comparison-overlap]  # defensive for runtime callers
+            raise ValueError(
+                "使用 TwinBrainDigitalTwin 时必须提供 base_graph。\n"
+                "请使用 load_graph_for_inference() 加载图缓存文件。"
+            )
+        if modality not in base_graph.node_types:
+            raise ValueError(
+                f"base_graph 中不含模态 '{modality}'。\n"
+                f"可用模态: {base_graph.node_types}"
+            )
+
         self.seed = seed
         self.fmri_subsample = fmri_subsample
         self.modality = modality
         self.base_graph = base_graph
+        self.model = model
         self.device = _resolve_device(device)
 
-        if model is not None:
-            # Hard check: reject models that explicitly declare they cannot forward
-            if not getattr(model, "can_forward", True):
-                raise RuntimeError(
-                    "提供的模型 can_forward=False，无法进行前向推断。\n"
-                    "请使用 loader.load_model.load_trained_model() 加载正确的 TwinBrain V5 检查点，\n"
-                    "或使用 model=None 以启用独立的 Wilson-Cowan 模式。"
-                )
+        # Always twin mode
+        self._is_twin = True
 
-            self._use_model = True
-            self._is_twin = hasattr(model, "predict_future")
+        # Infer n_regions and dt from the graph
+        self.n_regions = int(base_graph[modality].x.shape[0])
+        sr = getattr(base_graph[modality], "sampling_rate", None)
+        self.dt = 1.0 / float(sr) if sr else 0.004  # default 0.004s when SR not stored
 
-            if self._is_twin:
-                if base_graph is None:
-                    raise ValueError(
-                        "使用 TwinBrainDigitalTwin 时必须提供 base_graph。\n"
-                        "请使用 load_graph_for_inference() 加载图缓存文件。"
-                    )
-                if modality not in base_graph.node_types:
-                    raise ValueError(
-                        f"base_graph 中不含模态 '{modality}'。\n"
-                        f"可用模态: {base_graph.node_types}"
-                    )
-                # Infer n_regions and dt from the graph
-                self.n_regions = int(base_graph[modality].x.shape[0])
-                sr = getattr(base_graph[modality], "sampling_rate", None)
-                self.dt = 1.0 / float(sr) if sr else dt
-            else:
-                # Plain nn.Module (rare, non-TwinBrain model)
-                self.n_regions = n_regions
-                self.dt = dt
-
-        else:
-            # WC mode: standalone, no real model
-            self._use_model = False
-            self._is_twin = False
-            self.n_regions = n_regions
-            self.dt = dt
-            logger.info(
-                "BrainDynamicsSimulator: Wilson-Cowan 独立模式 (n_regions=%d, device=%s)",
-                n_regions,
-                self.device,
-            )
-
-        self.model = model
+        logger.info(
+            "BrainDynamicsSimulator: TwinBrainDigitalTwin 模式 "
+            "(modality=%s, n_regions=%d, dt=%.4f s, device=%s)",
+            modality, self.n_regions, self.dt, self.device,
+        )
 
     # ── Core API ───────────────────────────────────────────────────────────────
-
-    def step(
-        self,
-        state: np.ndarray,
-        external_input: Optional[np.ndarray] = None,
-        _wc: Optional[_WilsonCowanIntegrator] = None,
-    ) -> np.ndarray:
-        """
-        单步动力学演化: x(t+1) = f(x(t), u(t))
-
-        **注意**：在模型模式（TwinBrainDigitalTwin）下，单步推理不被支持，
-        因为 TwinBrain 以整个上下文窗口为输入（而非单帧状态）。
-        请改用 ``rollout()``。
-
-        Args:
-            state:          当前脑状态，shape (n_regions,)，值域 [0, 1]。
-            external_input: 外部刺激向量，shape (n_regions,)。若为 None 则全零。
-            _wc:            Wilson-Cowan 积分器实例（由 rollout 传入）。
-
-        Returns:
-            新脑状态，shape (n_regions,)。
-
-        Raises:
-            NotImplementedError: TwinBrainDigitalTwin 模式下调用此方法时。
-        """
-        if self._is_twin:
-            raise NotImplementedError(
-                "TwinBrainDigitalTwin 不支持单步 step()。\n"
-                "请使用 rollout() 或 rollout_multi_stim() 进行轨迹预测。"
-            )
-
-        if external_input is None:
-            external_input = np.zeros(self.n_regions, dtype=np.float32)
-
-        if self._use_model:
-            return self._model_step(state, external_input)
-        else:
-            wc = _wc or _WilsonCowanIntegrator(self.n_regions, x0=state, seed=self.seed)
-            return wc.step(state, external_input)
 
     def rollout(
         self,
         x0: Optional[np.ndarray] = None,
         steps: int = 50,
         stimulus: Optional[Stimulus] = None,
+        context_window_idx: int = 0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        连续动力学模拟。
-
-        在**模型模式**下，使用 ``TwinBrainDigitalTwin`` 进行自回归滑窗预测。
-        图缓存（``base_graph``）仅用于 **初始化**：其最后 ``context_length`` 步
-        被截取为初始上下文窗口（见 ``_trim_context``），之后模型完全依赖自身预测
-        自迭代（计划书 §四）。
+        连续动力学模拟（TwinBrainDigitalTwin 自回归预测）。
 
         ``x0`` 注入机制：
             若提供 ``x0``，它将被写入初始上下文的最后一个时间步，覆盖图缓存中
             对应模态的原始数值。这样不同的 ``x0`` 会产生不同的初始脑状态，使
-            ``run_free_dynamics`` 中的 200 条轨迹真正从不同位置出发（计划书 §五）。
+            ``run_free_dynamics`` 中的多条轨迹真正从不同位置出发（计划书 §五）。
 
-        在 **WC 模式**下，逐步积分：``x0`` 为必须参数。
+        ``context_window_idx`` 时序窗口机制：
+            选择从 ``base_graph`` 时间序列的哪个历史窗口作为初始上下文。
+            当 ``base_graph[modality].x`` 的时间维度 ``T > context_length`` 时，
+            可使用不同的历史片段为不同轨迹提供真正不同的上下文，从而提升
+            轨迹多样性（解决所有轨迹共享同一历史导致的 Wolf 上下文稀释问题）。
+
+              context_window_idx=0 → 最近 context_length 步（默认行为）
+              context_window_idx=1 → 倒数第二个 context_length 步
+              context_window_idx=k → x[:, -(k+1)*L:-k*L, :] （L=context_length）
+
+            可用窗口数通过 ``simulator.n_temporal_windows`` 属性查询。
 
         Args:
-            x0:       初始脑状态，shape (n_regions,)。
-                      模型模式下：注入为初始上下文最后一步（可选，默认保留图缓存数据）。
-                      WC 模式下：必须提供，用作积分起点。
-            steps:    模拟步数（模型模式：fMRI TR 数；WC 模式：积分步数）。
-            stimulus: 刺激对象（实现 Stimulus.value(t)）；None → 自由演化。
+            x0:                 初始脑状态，shape (n_regions,)。
+                                注入为初始上下文最后一步（可选）。
+            steps:              模拟步数（fMRI TR 数）。
+            stimulus:           刺激对象（实现 Stimulus.value(t)）；None → 自由演化。
+            context_window_idx: 选择哪个时序窗口作为初始上下文（默认 0 = 最近窗口）。
 
         Returns:
             trajectory: shape (steps, n_regions)，每步的脑状态。
             times:      shape (steps,)，以秒为单位的时间轴。
         """
-        if self._is_twin:
-            return self._rollout_with_twin(steps=steps, stimulus=stimulus, x0=x0)
-
-        # WC / plain nn.Module mode
-        if x0 is None:
-            x0 = self.sample_random_state()
-        x0 = np.asarray(x0, dtype=np.float32).flatten()
-        if x0.shape[0] != self.n_regions:
-            raise ValueError(
-                f"x0 shape mismatch: expected ({self.n_regions},), got {x0.shape}"
-            )
-        return self._rollout_wc(x0, steps=steps, stimulus=stimulus)
+        return self._rollout_with_twin(
+            steps=steps, stimulus=stimulus, x0=x0,
+            context_window_idx=context_window_idx,
+        )
 
     def rollout_multi_stim(
         self,
@@ -561,16 +345,13 @@ class BrainDynamicsSimulator:
         stimuli: Optional[List[Stimulus]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        多脑区同时刺激的连续模拟。
+        多脑区同时刺激的连续模拟（TwinBrainDigitalTwin）。
 
-        在**模型模式**下，使用 ``TwinBrainDigitalTwin.simulate_intervention()``，
+        使用 ``TwinBrainDigitalTwin.simulate_intervention()``，
         同时将所有活跃刺激的脑区和幅度打包为 ``interventions`` 字典。
 
-        在 **WC 模式**下，逐步积分并叠加各刺激。
-
         Args:
-            x0:       初始脑状态；模型模式下注入为初始上下文最后一步（见 rollout）；
-                      WC 模式下为积分起点。
+            x0:       初始脑状态；注入为初始上下文最后一步（见 rollout）。
             steps:    模拟步数。
             stimuli:  多个 ``Stimulus`` 对象的列表（None → 自由演化，等同于 rollout）。
 
@@ -580,201 +361,9 @@ class BrainDynamicsSimulator:
         """
         if stimuli is None:
             stimuli = []
+        return self._rollout_multi_stim_with_twin(steps=steps, stimuli=stimuli, x0=x0)
 
-        if self._is_twin:
-            return self._rollout_multi_stim_with_twin(steps=steps, stimuli=stimuli, x0=x0)
-
-        if x0 is None:
-            x0 = self.sample_random_state()
-        x0 = np.asarray(x0, dtype=np.float32).flatten()
-        return self._rollout_multi_stim_wc(x0, steps=steps, stimuli=stimuli)
-
-    def rollout_batched(
-        self,
-        X0: np.ndarray,
-        steps: int = 50,
-        stimulus: Optional[Stimulus] = None,
-        device: Optional[str] = None,
-        chunk_steps: Optional[int] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        GPU-accelerated batched rollout: run *all* trajectories in parallel.
-
-        **WC 模式专用**：此方法仅在 Wilson-Cowan 模式（``model=None``）下工作。
-        TwinBrainDigitalTwin 自回归模式不支持批量并行（需要 context-graph 链接），
-        请使用 ``rollout()`` 进行序列化预测。
-
-        每条轨迹使用自己的均衡点 x0，所有轨迹共享同一连接矩阵 W（相同 seed）。
-        计算通过 PyTorch 矩阵运算向量化，可在 GPU 上高效执行。
-
-        内存管理：轨迹张量按 ``chunk_steps`` 分块写入 CPU，避免 GPU OOM。
-        自动块大小基于 :func:`_compute_chunk_steps`（默认每块 ≤512 MiB）。
-
-        Args:
-            X0:          初始脑状态，shape ``(n_batch, n_regions)``。
-            steps:       模拟步数（WC 积分步数）。
-            stimulus:    Stimulus 对象（所有轨迹共享同一刺激节点/幅度）；
-                         ``None`` → 自由演化。
-            device:      计算设备（``"cpu"``、``"cuda"``、``"auto"``）；
-                         ``None`` → 使用 ``self.device``。
-            chunk_steps: GPU 内存分块大小（步数）；
-                         ``None`` → 由 :func:`_compute_chunk_steps` 自动推断。
-
-        Returns:
-            trajectories: shape ``(n_batch, steps, n_regions)``，每条轨迹的状态序列。
-            times:        shape ``(steps,)``，以秒为单位的时间轴。
-
-        Raises:
-            NotImplementedError: 在模型模式（TwinBrainDigitalTwin）下调用时。
-            ValueError:          ``X0`` 形状不符合期望。
-        """
-        if self._is_twin or self._use_model:
-            raise NotImplementedError(
-                "rollout_batched() 仅支持 Wilson-Cowan 独立模式（model=None）。\n"
-                "TwinBrainDigitalTwin 模式请使用 rollout() 逐条预测。"
-            )
-
-        X0 = np.asarray(X0, dtype=np.float32)
-        if X0.ndim != 2 or X0.shape[1] != self.n_regions:
-            raise ValueError(
-                f"X0 形状错误: 期望 (n_batch, {self.n_regions})，"
-                f"实际 {X0.shape}"
-            )
-
-        _device = _resolve_device(device if device is not None else self.device)
-        return self._rollout_wc_batched(
-            X0=X0,
-            steps=steps,
-            stimulus=stimulus,
-            device=_device,
-            chunk_steps=chunk_steps,
-        )
-
-    # ── Private: WC rollout ────────────────────────────────────────────────────
-
-    def _rollout_wc(
-        self,
-        x0: np.ndarray,
-        steps: int,
-        stimulus: Optional[Stimulus],
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Wilson-Cowan step-by-step rollout."""
-        trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
-        times = np.arange(steps, dtype=np.float32) * self.dt
-
-        wc = _WilsonCowanIntegrator(self.n_regions, x0=x0, seed=self.seed)
-        state = x0.copy()
-
-        for t in range(steps):
-            u = np.zeros(self.n_regions, dtype=np.float32)
-            if stimulus is not None and stimulus.is_active(t):
-                node_idx = stimulus.node
-                if 0 <= node_idx < self.n_regions:
-                    u[node_idx] = stimulus.value(t)
-            state = self._step_internal(state, u, wc)
-            trajectory[t] = state
-
-        return trajectory, times
-
-    def _rollout_multi_stim_wc(
-        self,
-        x0: np.ndarray,
-        steps: int,
-        stimuli: List[Stimulus],
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Wilson-Cowan step-by-step rollout with multiple stimuli."""
-        trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
-        times = np.arange(steps, dtype=np.float32) * self.dt
-
-        wc = _WilsonCowanIntegrator(self.n_regions, x0=x0, seed=self.seed)
-        state = x0.copy()
-
-        for t in range(steps):
-            u = np.zeros(self.n_regions, dtype=np.float32)
-            for stim in stimuli:
-                if stim.is_active(t) and 0 <= stim.node < self.n_regions:
-                    u[stim.node] += stim.value(t)
-            state = self._step_internal(state, u, wc)
-            trajectory[t] = state
-
-        return trajectory, times
-
-    def _rollout_wc_batched(
-        self,
-        X0: np.ndarray,
-        steps: int,
-        stimulus: Optional[Stimulus],
-        device: str,
-        chunk_steps: Optional[int],
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Vectorised batched WC rollout on the given device.
-
-        All ``n_batch`` trajectories are processed in parallel using PyTorch
-        matrix operations.  GPU memory is managed by breaking the time axis
-        into ``chunk_steps``-step blocks: each block is computed on the
-        device and immediately transferred to CPU before the next block.
-
-        Args:
-            X0:          ``(n_batch, n_regions)`` initial states.
-            steps:       Total number of integration steps.
-            stimulus:    Shared stimulus for all trajectories (or None).
-            device:      Resolved PyTorch device string.
-            chunk_steps: Steps per GPU chunk; auto-computed if None.
-
-        Returns:
-            trajectories: ``(n_batch, steps, n_regions)`` float32 numpy array.
-            times:        ``(steps,)`` time axis in seconds.
-        """
-        n_batch = X0.shape[0]
-        _dev = torch.device(device)
-
-        # Shared batched integrator (one W, per-trajectory x0)
-        wc_batch = _WilsonCowanIntegratorBatched(
-            self.n_regions, x0_batch=X0, seed=self.seed, device=device
-        )
-        state = torch.from_numpy(X0).float().to(_dev)  # (n_batch, N)
-        times = np.arange(steps, dtype=np.float32) * self.dt
-
-        # Auto-size chunks to stay within GPU memory budget (default: 512 MiB).
-        # Tune _DEFAULT_CHUNK_MEMORY_MiB or pass chunk_steps explicitly for
-        # GPUs with less VRAM.
-        if chunk_steps is None:
-            chunk_steps = _compute_chunk_steps(n_batch, self.n_regions)
-
-        # Pre-compute stimulus values for all steps: (steps, N)
-        stim_all_np = np.zeros((steps, self.n_regions), dtype=np.float32)
-        if stimulus is not None:
-            for t in range(steps):
-                if stimulus.is_active(t) and 0 <= stimulus.node < self.n_regions:
-                    stim_all_np[t, stimulus.node] = stimulus.value(t)
-        stim_all = torch.from_numpy(stim_all_np).float().to(_dev)  # (steps, N)
-
-        all_chunks: List[np.ndarray] = []
-        t_offset = 0
-        while t_offset < steps:
-            actual_chunk = min(chunk_steps, steps - t_offset)
-
-            # Allocate trajectory buffer for this chunk on the device
-            chunk_traj = torch.empty(
-                (actual_chunk, n_batch, self.n_regions),
-                device=_dev,
-                dtype=torch.float32,
-            )
-
-            for k in range(actual_chunk):
-                u = stim_all[t_offset + k]  # (N,) — broadcast over batch
-                state = wc_batch.step(state, u)
-                chunk_traj[k] = state
-
-            # Permute to (n_batch, actual_chunk, N) and move to CPU
-            all_chunks.append(chunk_traj.permute(1, 0, 2).cpu().numpy())
-            t_offset += actual_chunk
-
-        trajectories = np.concatenate(all_chunks, axis=1)  # (n_batch, steps, N)
-        return trajectories, times
-
-    # ── Wolf-Benettin rollout pair (correct per-mode implementation) ────────────
+    # ── Wolf-Benettin rollout pair ────────────────────────────────────────────
 
     def wolf_rollout_pair(
         self,
@@ -787,90 +376,27 @@ class BrainDynamicsSimulator:
         Run one Wolf-Benettin period: evolve the (base, perturbed) pair for
         *steps* steps, returning the final states and the updated context.
 
-        This method correctly handles both WC mode and twin mode:
-
-        **WC mode**
-          ``wolf_context`` is a ``_WilsonCowanIntegrator`` with a *fixed*
-          equilibrium (the very first ``x_base`` value passed across all
-          periods).  The equilibrium does NOT change between periods — only
-          the starting state (``x_base``) moves.
-
-          Calling ``rollout(x0=x_cur)`` twice would instead re-use ``x_cur``
-          as the equilibrium every period.  Because the trajectory starts *at*
-          its own equilibrium, the deviation is always zero, the dynamics are
-          trivially frozen, and the Wolf algorithm returns LLE = 0 for all
-          trajectories.
-
-        **Twin mode**
-          ``wolf_context`` is the current ``HeteroData`` context window.  The
-          base rollout advances the context via ``_advance_context`` so that
-          subsequent Wolf periods are genuine continuations of the trajectory
-          rather than resets to ``base_graph``.
-
-          Calling ``rollout()`` twice would reset both rollouts to
-          ``base_graph`` every period.  After a few periods ``x_cur``
-          converges to the fixed point of the "inject → predict" map,
-          making all 200 trajectories yield the same biased LLE.
+        ``wolf_context`` is the current ``HeteroData`` context window.  The
+        base rollout advances the context via ``_advance_context`` so that
+        subsequent Wolf periods are genuine continuations of the trajectory
+        rather than resets to ``base_graph``.
 
         Args:
             x_base:       Base starting state, shape ``(n_regions,)``.
             x_pert:       Perturbed starting state, shape ``(n_regions,)``.
             steps:        Number of integration steps per Wolf period
                           (= ``renorm_steps`` in the caller).
-            wolf_context: Opaque state from the previous period; ``None``
-                          on the very first period (auto-initialised from
-                          the base state / base_graph).
+            wolf_context: ``HeteroData`` context from the previous period;
+                          ``None`` on the very first period (auto-initialised
+                          from base_graph).
 
         Returns:
             (x_after_base, x_after_pert, next_wolf_context):
               x_after_base:      Final base state, shape ``(n_regions,)``.
               x_after_pert:      Final perturbed state, shape ``(n_regions,)``.
-              next_wolf_context: Updated context for the next Wolf period.
+              next_wolf_context: Updated HeteroData for the next Wolf period.
         """
-        if self._is_twin:
-            return self._wolf_pair_twin(x_base, x_pert, steps, wolf_context)
-        return self._wolf_pair_wc(x_base, x_pert, steps, wolf_context)
-
-    def _wolf_pair_wc(
-        self,
-        x_base: np.ndarray,
-        x_pert: np.ndarray,
-        steps: int,
-        wolf_context: Optional[_WilsonCowanIntegrator],
-    ):
-        """
-        One Wolf period in WC mode.
-
-        Creates the integrator on the first call with ``x_base`` as the
-        *fixed* equilibrium.  Subsequent calls reuse the same integrator
-        (same connectivity matrix W, same equilibrium x0_eq), so the
-        deviation-driven dynamics remain non-trivial even as the current
-        base state moves away from the equilibrium.
-
-        Contrast with calling ``rollout(x0=x_cur)`` which recreates the
-        integrator every period using ``x_cur`` as the new equilibrium.
-        When ``state == equilibrium`` at the start, deviation = 0 → delta = 0
-        → the trajectory is frozen → LLE = 0 (trivially wrong).
-        """
-        if wolf_context is None:
-            # First period: fix the equilibrium at the initial base state.
-            wolf_context = _WilsonCowanIntegrator(
-                self.n_regions, x0=x_base, seed=self.seed
-            )
-        wc: _WilsonCowanIntegrator = wolf_context
-        zeros = np.zeros(self.n_regions, dtype=np.float32)
-
-        # Base trajectory
-        state_b = np.asarray(x_base, dtype=np.float32).copy()
-        for _ in range(steps):
-            state_b = wc.step(state_b, zeros)
-
-        # Perturbed trajectory — same fixed equilibrium, different start
-        state_p = np.asarray(x_pert, dtype=np.float32).copy()
-        for _ in range(steps):
-            state_p = wc.step(state_p, zeros)
-
-        return state_b, state_p, wc  # return integrator for reuse next period
+        return self._wolf_pair_twin(x_base, x_pert, steps, wolf_context)
 
     def _wolf_predict(
         self,
@@ -958,6 +484,98 @@ class BrainDynamicsSimulator:
         return traj_base[-1], traj_pert[-1], next_context
 
     # ── Private helpers ─────────────────────────────────────────────────────────
+
+    def _get_context_length(self) -> int:
+        """Return the predictor's context_length (defaults to 200 if not found).
+
+        200 is the standard context_length for the EnhancedMultiStepPredictor
+        in TwinBrain V5 (see API.md §4.3 and training config model.context_length).
+        Using it as the fallback keeps behaviour identical to the previous hard-coded
+        ``_trim_context`` logic, which also defaulted to 200.
+        """
+        _predictor = getattr(getattr(self.model, "model", None), "predictor", None)
+        return int(getattr(_predictor, "context_length", 200))
+
+    @property
+    def n_temporal_windows(self) -> int:
+        """
+        Number of non-overlapping ``context_length``-step windows available in
+        ``base_graph``.
+
+        Each window is a distinct historical segment of the stored fMRI/EEG time
+        series.  Using different windows as initial contexts gives trajectories
+        genuinely different histories (not just different last-step injections),
+        which resolves the Wolf context-dilution bias where all trajectories share
+        ``context_length − 1`` identical history steps.
+
+        Computed as ``min(T_nt // context_length)`` across all node types with a
+        temporal ``.x`` attribute.  Returns at least 1.
+
+        Example:
+            base_graph['fmri'].x has T=400, context_length=200
+            → n_temporal_windows = 2  (windows 0 and 1)
+        """
+        ctx_len = self._get_context_length()
+        min_windows = float("inf")
+        for nt in self.base_graph.node_types:
+            if not hasattr(self.base_graph[nt], "x"):
+                continue
+            T = int(self.base_graph[nt].x.shape[1])
+            min_windows = min(min_windows, T // ctx_len)
+        # Guard against float("inf") before int() conversion (no node types had .x)
+        if min_windows == float("inf"):
+            return 1
+        return max(1, int(min_windows))
+
+    def _get_context_for_window(self, window_idx: int = 0) -> HeteroData:
+        """
+        Return a cloned HeteroData using the specified temporal window as context.
+
+        Selects a ``context_length``-step slice from each node type's time series,
+        counting backwards from the end of ``base_graph``:
+
+          window_idx = 0  →  x[:, T-L:T, :]          (most recent, default)
+          window_idx = 1  →  x[:, T-2L:T-L, :]
+          window_idx = k  →  x[:, T-(k+1)L:T-kL, :]  (L = context_length)
+
+        When ``window_idx`` exceeds the available history for a node type, the
+        earliest feasible ``context_length``-step slice is used instead of raising
+        an error (graceful degradation).
+
+        Args:
+            window_idx: Non-negative integer selecting which historical window to
+                        use (0 = most recent = current default behaviour).
+
+        Returns:
+            Cloned ``HeteroData`` with every node type's ``.x`` set to the
+            requested window, ready for ``_inject_x0_into_context``.
+        """
+        ctx_len = self._get_context_length()
+        context = _clone_hetero_graph(self.base_graph)
+
+        for nt in list(context.node_types):
+            if not hasattr(context[nt], "x"):
+                continue
+            nt_x = context[nt].x   # [N, T, C]
+            T = int(nt_x.shape[1])
+            # Count backward from the end:
+            #   window 0 → [T-L:T], window 1 → [T-2L:T-L], ...
+            end = T - window_idx * ctx_len
+            start = end - ctx_len
+            if start < 0 or end <= 0:
+                # Requested window extends before the start of the recording;
+                # fall back to the oldest full-length window available.
+                start = 0
+                end = min(ctx_len, T)
+                if window_idx > 0:
+                    logger.debug(
+                        "_get_context_for_window: '%s' T=%d, window_idx=%d is "
+                        "out of range (need T≥%d); using earliest window [0:%d].",
+                        nt, T, window_idx, (window_idx + 1) * ctx_len, end,
+                    )
+            context[nt].x = nt_x[:, start:end, :]
+
+        return context
 
     def _trim_context(self, context: HeteroData) -> HeteroData:
         """
@@ -1068,43 +686,28 @@ class BrainDynamicsSimulator:
         steps: int,
         stimulus: Optional[Stimulus],
         x0: Optional[np.ndarray] = None,
+        context_window_idx: int = 0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Autoregressive rollout using TwinBrainDigitalTwin.
 
         Initialization (计划书 §四/§十三):
-            The base_graph is used **once** as the initial context.  All modalities
-            are trimmed to ``context_length`` timesteps (see ``_trim_context``),
-            capping peak encoder activation memory at O(context_length × N × H)
-            regardless of the original EEG sequence length.
+            ``_get_context_for_window(context_window_idx)`` selects the initial
+            context window from ``base_graph``.  ``window_idx=0`` reproduces the
+            original behaviour (last ``context_length`` steps).  Higher indices
+            select earlier historical segments, giving each trajectory a genuinely
+            different context history.  This resolves the Wolf context-dilution
+            bias where all trajectories shared the same ``context_length − 1``
+            history steps (see AGENTS.md §Wolf上下文稀释).
 
             If ``x0`` is provided, it is injected into the last time step of the
-            primary modality's context, overriding the graph-cache values.  This
-            lets ``run_free_dynamics`` start 200 trajectories from 200 genuinely
-            different brain states (计划书 §五: ``x0 = sample_random_state()``).
-
-        Self-iteration:
-            After each ``predict_future()`` call, **all** modalities present in
-            ``pred_dict`` are advanced together via ``_advance_context``.  This
-            keeps every modality's context window temporally aligned and ensures
-            the EEG context does not fall behind the fMRI context over long rollouts.
-
-        Stimulus handling:
-            When a stimulus is active in a chunk, ``simulate_intervention()`` is
-            called; its ``perturbed`` dict is used both for trajectory recording
-            and context advancement.
-
-        Memory (8 GB GPU):
-            After ``_trim_context``, every ``predict_future`` call encodes
-            context of shape ``[N, context_length, C]`` per modality.
-            Example: context_length=200, N_eeg=63, H=128 →
-            peak EEG activation ≈ 12.9 MB (vs 6.34 GB before the fix).
+            selected context window.
         """
         chunk_size: int = getattr(getattr(self.model, "model", None), "prediction_steps", 50)
 
-        # Clone base_graph and trim ALL modalities to context_length.
-        # This is the key memory fix: EEG goes from T=98500 to T=context_length.
-        context = self._trim_context(_clone_hetero_graph(self.base_graph))
+        # Select the requested temporal window from base_graph.
+        # window_idx=0 reproduces the previous _trim_context behaviour exactly.
+        context = self._get_context_for_window(context_window_idx)
 
         # Inject x0 as the "current brain state" (last time step override).
         # This ensures 200 rollouts start from 200 different initial conditions.
@@ -1238,56 +841,23 @@ class BrainDynamicsSimulator:
 
         return trajectory, times
 
-    # ── Private: plain nn.Module step (non-twin model mode) ────────────────────
-
-    def _step_internal(
-        self,
-        state: np.ndarray,
-        u: np.ndarray,
-        wc: _WilsonCowanIntegrator,
-    ) -> np.ndarray:
-        """Route to model or WC depending on mode."""
-        if self._use_model:
-            # Plain nn.Module path (not TwinBrainDigitalTwin)
-            return self._model_step(state, u)
-        return wc.step(state, u)
-
-    def _model_step(self, state: np.ndarray, u: np.ndarray) -> np.ndarray:
-        """
-        使用普通 nn.Module 进行单步演化（非 TwinBrainDigitalTwin 路径）。
-
-        注意：此接口假设模型接受 (1, N) 张量并返回相同形状的张量。
-        若模型接口不兼容（如需要 HeteroData），将抛出异常而非回退到 WC。
-        """
-        state_t = torch.from_numpy(state).float().unsqueeze(0)  # (1, N)
-        u_t = torch.from_numpy(u).float().unsqueeze(0)           # (1, N)
-        with torch.no_grad():
-            out = self.model(state_t + u_t)
-        return out.squeeze(0).cpu().numpy().astype(np.float32)
-
     # ── Convenience sampling ───────────────────────────────────────────────────
 
     def sample_random_state(
         self, rng: Optional[np.random.Generator] = None
     ) -> np.ndarray:
         """
-        采样随机初始脑状态。
+        采样随机初始脑状态：从 ``base_graph`` 数据的均值附近添加随机噪声，
+        以获取在生理范围内的初始状态。
 
-        - **WC 模式**：在 [0, 1]^n_regions 上均匀采样。
-        - **模型模式**：从 ``base_graph`` 数据的均值附近添加随机噪声，
-          以获取在生理范围内的初始状态（仅供参考，模型模式下 rollout 会忽略 x0）。
+        ``rollout()`` 使用该状态作为初始上下文的最后一个时间步注入值。
         """
         if rng is None:
             rng = np.random.default_rng(self.seed)
-
-        if self._is_twin and self.base_graph is not None:
-            # Use mean + small noise from the real data
-            x_data = self.base_graph[self.modality].x  # [N, T, 1]
-            mean_state = x_data.squeeze(-1).mean(dim=1).cpu().numpy()  # [N]
-            noise = rng.normal(0, 0.05, self.n_regions).astype(np.float32)
-            return np.clip(mean_state + noise, 0.0, 1.0)
-
-        return rng.random(self.n_regions).astype(np.float32)
+        x_data = self.base_graph[self.modality].x  # [N, T, 1]
+        mean_state = x_data.squeeze(-1).mean(dim=1).cpu().numpy()  # [N]
+        noise = rng.normal(0, 0.05, self.n_regions).astype(np.float32)
+        return np.clip(mean_state + noise, 0.0, 1.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

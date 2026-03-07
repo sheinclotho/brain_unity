@@ -137,7 +137,7 @@ _DEFAULTS = {
     },
     # Steps here mean fMRI prediction steps (not EEG samples).
     # With prediction_steps=50 (TR=2s), steps=50 → 100s of future prediction.
-    "free_dynamics": {"n_init": 10, "steps": 50, "seed": 42},
+    "free_dynamics": {"n_init": 10, "steps": 50, "seed": 42, "n_temporal_windows": None},
     "attractor_analysis": {
         "tail_steps": 10,
         "k_candidates": [2, 3, 4, 5, 6],
@@ -155,13 +155,8 @@ _DEFAULTS = {
         "patterns": ["sine"],
     },
     "response_matrix": {
-        "n_nodes": 10,         # Reduced default for model mode (full 200 is slow)
+        "n_nodes": 10,         # Number of source nodes to stimulate (full 200 is slow)
         "stim_amplitude": 0.5,
-        "stim_duration": 80,   # Long enough to reach WC steady-state (τ≈10 steps → 60+ steps)
-        "stim_frequency": 10.0,
-        "stim_pattern": "step",   # Step gives cleanest steady-state response (vs sine bell)
-        "measure_window": 30,     # Measure the plateau after skip_transient
-        "skip_transient": 20,     # Skip ramp-in / transient (StepStimulus ramp_steps=10)
     },
     "stability_analysis": {
         "convergence_tol": 1e-4,
@@ -322,9 +317,10 @@ def run(cfg: dict) -> dict:
     logger.info("=" * 60)
     logger.info("步骤 3/10  自由动力学实验")
     fd_cfg = cfg["free_dynamics"]
-    # In model mode, each rollout() call ignores x0 and uses base_graph context.
-    # n_init > 1 produces n_init independent rollout segments (identical context
-    # but the predictor may have stochastic components from dropout if enabled).
+    # Each rollout() injects a different random x0 into the LAST time step of the
+    # selected context window.  When base_graph has T > context_length, different
+    # historical windows are automatically used for different trajectories
+    # (trajectory i → window i % n_windows), giving truly diverse starting contexts.
     trajectories = run_free_dynamics(
         simulator=simulator,
         n_init=fd_cfg.get("n_init", 10),
@@ -332,6 +328,7 @@ def run(cfg: dict) -> dict:
         seed=fd_cfg.get("seed", 42),
         output_dir=output_dir if cfg["output"].get("save_trajectories") else None,
         device=device,
+        n_temporal_windows=fd_cfg.get("n_temporal_windows", None),
     )
     results["trajectories"] = trajectories
 
@@ -388,11 +385,6 @@ def run(cfg: dict) -> dict:
         simulator=simulator,
         n_nodes=n_nodes_rm,
         stim_amplitude=rm_cfg.get("stim_amplitude", 0.5),
-        stim_duration=rm_cfg.get("stim_duration", 80),
-        stim_frequency=rm_cfg.get("stim_frequency", 10.0),
-        stim_pattern=rm_cfg.get("stim_pattern", "step"),
-        measure_window=rm_cfg.get("measure_window", 30),
-        skip_transient=rm_cfg.get("skip_transient", None),
         output_dir=output_dir if cfg["output"].get("save_response_matrix") else None,
     )
     results["response_matrix"] = response_matrix
@@ -562,10 +554,20 @@ def _save_plots(results: dict, output_dir: Path, simulator) -> None:
             save_path=plots_dir / "lyapunov_histogram.png",
         )
         if len(lya_results.get("log_growth_curve", [])) > 0:
+            # Use the best (unbiased) LLE estimate for the plot annotation.
+            # When Wolf bias is detected, Rosenstein is the primary estimate;
+            # using the biased Wolf mean would mis-label the chart.
+            wolf_biased = lya_results.get("wolf_bias_warning", False)
+            rosen_val   = lya_results.get("mean_rosenstein")
+            best_lle = (
+                float(rosen_val)
+                if (wolf_biased and rosen_val is not None and np.isfinite(float(rosen_val)))
+                else float(lya_results["mean_lyapunov"])
+            )
             plot_lyapunov_growth(
                 lya_results["log_growth_curve"],
                 renorm_steps=lya_results.get("renorm_steps", 20),
-                mean_lle=lya_results["mean_lyapunov"],
+                mean_lle=best_lle,
                 chaos_regime=lya_results["chaos_regime"]["regime"],
                 save_path=plots_dir / "lyapunov_growth.png",
             )
