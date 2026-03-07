@@ -333,7 +333,7 @@ def _run_single_modality(
     from analysis.embedding_dimension import run_embedding_dimension_analysis
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    n_total_steps = 12
+    n_total_steps = 16
 
     # ── Step 2: Create simulator ──────────────────────────────────────────────
     logger.info("=" * 60)
@@ -593,6 +593,155 @@ def _run_single_modality(
             logger.warning("  嵌入维度分析失败 (%s)，跳过。", exc)
     else:
         logger.info("  嵌入维度分析已禁用，跳过。")
+
+    # ── Step 13: Power spectrum analysis ─────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 13/%d  功率谱分析（Power Spectrum）", n_total_steps)
+    ps_cfg = cfg.get("power_spectrum", {})
+    if ps_cfg.get("enabled", True):
+        try:
+            from analysis.power_spectrum import run_power_spectrum_analysis
+            ps_results = run_power_spectrum_analysis(
+                trajectories=trajectories,
+                dt=simulator.dt,
+                burnin=ps_cfg.get("burnin", 10),
+                output_dir=output_dir if cfg["output"].get("save_plots") else None,
+            )
+            results["power_spectrum"] = ps_results
+            dom_f = ps_results["band_analysis"]["dominant_freq_hz"]
+            dom_b = ps_results["band_analysis"]["dominant_freq_band"]
+            logger.info(
+                "  功率谱: 主导频率=%.4f Hz [%s], Nyquist=%.3f Hz",
+                dom_f, dom_b, ps_results["band_analysis"]["nyquist_hz"],
+            )
+        except Exception as exc:
+            logger.warning("  功率谱分析失败 (%s)，跳过。", exc)
+    else:
+        logger.info("  功率谱分析已禁用，跳过。")
+
+    # ── Step 14: Jacobian spectrum analysis ───────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 14/%d  Jacobian 谱分析（slow modes / Hopf 检测）", n_total_steps)
+    jac_cfg = cfg.get("jacobian_analysis", {})
+    if jac_cfg.get("enabled", False):   # disabled by default (expensive: 2N+1 calls/state)
+        try:
+            from analysis.jacobian_analysis import run_jacobian_analysis
+            jac_results = run_jacobian_analysis(
+                simulator=simulator,
+                trajectories=trajectories,
+                tail_steps=jac_cfg.get("tail_steps", 20),
+                n_states=jac_cfg.get("n_states", 3),
+                epsilon=jac_cfg.get("epsilon", 1e-4),
+                seed=fd_cfg.get("seed", 42),
+                output_dir=output_dir if cfg["output"].get("save_plots") else None,
+            )
+            results["jacobian_analysis"] = jac_results
+            logger.info(
+                "  Jacobian 谱: ρ=%.4f, n_slow=%d, n_Hopf=%d, dominant_osc=%.4f Hz/step",
+                jac_results["spectral_radius"],
+                jac_results["n_slow_modes"],
+                jac_results["n_hopf_pairs"],
+                jac_results["dominant_oscillation_hz"],
+            )
+        except Exception as exc:
+            logger.warning("  Jacobian 谱分析失败 (%s)，跳过。", exc)
+    else:
+        logger.info(
+            "  Jacobian 谱分析已禁用（计算量大，每状态需 2N+1 次模型调用）。\n"
+            "  启用方式：在配置中设置 jacobian_analysis.enabled: true。"
+        )
+
+    # ── Step 15: Lyapunov spectrum + Kaplan-Yorke dimension ───────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 15/%d  Lyapunov 谱 + Kaplan–Yorke 维度", n_total_steps)
+    lys_cfg = cfg.get("lyapunov_spectrum", {})
+    if lys_cfg.get("enabled", False):   # disabled by default (expensive: k×n_periods calls)
+        try:
+            from analysis.lyapunov import run_lyapunov_spectrum_analysis
+            lys_results = run_lyapunov_spectrum_analysis(
+                trajectories=trajectories,
+                simulator=simulator,
+                n_exponents=lys_cfg.get("n_exponents", 10),
+                renorm_steps=lys_cfg.get("renorm_steps", 50),
+                epsilon=lys_cfg.get("epsilon", 1e-6),
+                seed=fd_cfg.get("seed", 42),
+                n_traj_sample=lys_cfg.get("n_traj_sample", 3),
+                output_dir=output_dir if cfg["output"].get("save_plots") else None,
+            )
+            results["lyapunov_spectrum"] = lys_results
+            logger.info(
+                "  Lyapunov 谱: λ₁=%.5f, D_KY=%.2f, n_positive=%d, 分类=[%s]",
+                lys_results["lambda1"],
+                lys_results["kaplan_yorke_dim"],
+                lys_results["n_positive"],
+                lys_results["classification"],
+            )
+        except Exception as exc:
+            logger.warning("  Lyapunov 谱分析失败 (%s)，跳过。", exc)
+    else:
+        logger.info(
+            "  Lyapunov 谱已禁用（每条轨迹需 k×(T/renorm) 次额外调用）。\n"
+            "  启用方式：在配置中设置 lyapunov_spectrum.enabled: true。"
+        )
+
+    # ── Step 16: Energy constraint experiment ─────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("步骤 16/%d  能量约束实验（Energy Constraint）", n_total_steps)
+    ec_cfg = cfg.get("energy_constraint", {})
+    if ec_cfg.get("enabled", False):   # disabled by default (n_alpha × n_init rollouts)
+        try:
+            from experiments.energy_constraint import (
+                run_energy_constraint_scan,
+                run_dynamic_energy_experiment,
+            )
+            ec_results: dict = {}
+
+            # Experiment A: α scan
+            if ec_cfg.get("run_alpha_scan", True):
+                ec_scan = run_energy_constraint_scan(
+                    simulator=simulator,
+                    alpha_min=ec_cfg.get("alpha_min", 0.5),
+                    alpha_max=ec_cfg.get("alpha_max", 1.5),
+                    alpha_step=ec_cfg.get("alpha_step", 0.1),
+                    n_init=ec_cfg.get("n_init", 5),
+                    steps=ec_cfg.get("steps", 200),
+                    warmup=ec_cfg.get("warmup", 50),
+                    seed=fd_cfg.get("seed", 42),
+                    output_dir=output_dir if cfg["output"].get("save_plots") else None,
+                )
+                ec_results["alpha_scan"] = ec_scan
+                logger.info(
+                    "  能量 α 扫描: critical_α=%.2f, bifurcation=%s",
+                    ec_scan["critical_alpha"], ec_scan["bifurcation_found"],
+                )
+
+            # Experiment B: dynamic energy variable
+            if ec_cfg.get("run_dynamic_energy", True):
+                ec_dynamic = run_dynamic_energy_experiment(
+                    simulator=simulator,
+                    alpha=ec_cfg.get("energy_alpha", 0.5),
+                    beta=ec_cfg.get("energy_beta", 0.5),
+                    E_ref=ec_cfg.get("E_ref", 1.0),
+                    steps=ec_cfg.get("steps", 300),
+                    n_init=ec_cfg.get("n_init", 5),
+                    seed=fd_cfg.get("seed", 42),
+                    output_dir=output_dir if cfg["output"].get("save_plots") else None,
+                )
+                ec_results["dynamic_energy"] = ec_dynamic
+                logger.info(
+                    "  动态能量: E_稳态=%.4f±%.4f, 稳态=%s",
+                    ec_dynamic["E_mean"], ec_dynamic["E_std"],
+                    ec_dynamic["homeostasis_achieved"],
+                )
+
+            results["energy_constraint"] = ec_results
+        except Exception as exc:
+            logger.warning("  能量约束实验失败 (%s)，跳过。", exc)
+    else:
+        logger.info(
+            "  能量约束实验已禁用。\n"
+            "  启用方式：在配置中设置 energy_constraint.enabled: true。"
+        )
 
     # ── Visualisations ────────────────────────────────────────────────────────
     if cfg["output"].get("save_plots"):

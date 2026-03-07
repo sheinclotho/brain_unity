@@ -70,14 +70,30 @@ def plot_trajectory_norms(
 def plot_pca_trajectories(
     trajectories: np.ndarray,
     max_show: int = 50,
+    burnin: int = 0,
     save_path: Optional[Path] = None,
 ) -> None:
     """
-    用 PCA 将高维轨迹投影到 2D，并绘制轨迹路径。
+    用 PCA 将高维轨迹投影到低维，绘制四联图：
+
+    ┌──────────────────────────┬──────────────────────────┐
+    │  2D PCA（时间渐变色）     │  2D 密度热图              │
+    │  蓝→红显示时间方向        │  所有访问状态的 KDE        │
+    ├──────────────────────────┼──────────────────────────┤
+    │  3D PCA（PC1-PC2-PC3）   │  PC 解释方差曲线           │
+    │  吸引子三维结构            │  线性维度估计              │
+    └──────────────────────────┴──────────────────────────┘
+
+    各子图含义：
+    - **时间渐变色**：轨迹颜色从蓝（开始）→红（结束），直观显示动力学方向
+    - **密度热图**：热力图揭示吸引子位置，越亮越集中
+    - **3D 投影**：观察是否存在螺旋/环状/混沌吸引子结构
+    - **方差曲线**：确认前 k 个 PC 覆盖多少动力学方差
 
     Args:
         trajectories: shape (n_init, steps, n_regions)。
-        max_show:     最多显示轨迹数。
+        max_show:     2D/3D 子图最多显示的轨迹数（避免遮挡，默认 50）。
+        burnin:       跳过每条轨迹前几步（消除瞬态，默认 0）。
         save_path:    保存路径；None → 显示。
     """
     if not _MPL_AVAILABLE:
@@ -90,28 +106,186 @@ def plot_pca_trajectories(
         return
 
     n_traj, steps, n_regions = trajectories.shape
-    all_states = trajectories.reshape(-1, n_regions)  # (n_init*steps, n_regions)
 
-    pca = PCA(n_components=2)
+    # ── Fit PCA on all post-burnin states ─────────────────────────────────────
+    traj_use = trajectories[:, burnin:, :]            # (n_traj, T, N)
+    T = traj_use.shape[1]
+    n_components = min(3, n_regions, T, n_traj)
+    all_states = traj_use.reshape(-1, n_regions)       # (n_traj*T, N)
+
+    pca = PCA(n_components=n_components, random_state=42)
     pca.fit(all_states)
-    var_ratio = pca.explained_variance_ratio_
+    var_ratio = pca.explained_variance_ratio_          # (n_components,)
 
-    indices = np.linspace(0, n_traj - 1, min(max_show, n_traj), dtype=int)
-    cmap = plt.get_cmap("plasma", len(indices))
+    # Cumulative variance for all components up to min(20, n_regions)
+    n_full = min(20, n_regions, T, n_traj)
+    pca_full = PCA(n_components=n_full, random_state=42)
+    pca_full.fit(all_states)
+    var_full = pca_full.explained_variance_ratio_
+    var_cumsum = np.cumsum(var_full)
 
-    fig, ax = plt.subplots(figsize=(8, 7))
+    # ── Select trajectories to show ───────────────────────────────────────────
+    show_n = min(max_show, n_traj)
+    # Evenly sample across trajectory indices for diversity
+    idx_show = np.linspace(0, n_traj - 1, show_n, dtype=int)
 
-    for k, idx in enumerate(indices):
-        traj_2d = pca.transform(trajectories[idx])  # (steps, 2)
-        ax.plot(traj_2d[:, 0], traj_2d[:, 1], alpha=0.5, color=cmap(k), linewidth=0.7)
-        ax.scatter(traj_2d[0, 0], traj_2d[0, 1], color=cmap(k), marker="o", s=10, zorder=5)
-        ax.scatter(traj_2d[-1, 0], traj_2d[-1, 1], color=cmap(k), marker="*", s=20, zorder=5)
+    # ── Project all shown trajectories ────────────────────────────────────────
+    # proj2d: list of (T, 2), proj3d: list of (T, 3)
+    proj2d = [pca.transform(traj_use[i])[:, :2] for i in idx_show]
+    proj3d = ([pca.transform(traj_use[i])[:, :3] for i in idx_show]
+              if n_components >= 3 else None)
 
-    ax.set_xlabel(f"PC1 ({var_ratio[0]:.1%} var)")
-    ax.set_ylabel(f"PC2 ({var_ratio[1]:.1%} var)")
-    ax.set_title("Free Dynamics in PCA Space (○ start, ★ end)")
-    ax.grid(True, alpha=0.3)
+    # ── Build time-gradient colormap segments ─────────────────────────────────
+    # Each trajectory segment is colored by normalised time (0=blue, 1=red)
+    cmap_time = plt.get_cmap("coolwarm")   # blue → red
 
+    # ── Figure layout ─────────────────────────────────────────────────────────
+    has_3d = proj3d is not None
+    if has_3d:
+        fig = plt.figure(figsize=(16, 13))
+        ax_2d   = fig.add_subplot(2, 2, 1)
+        ax_den  = fig.add_subplot(2, 2, 2)
+        ax_3d   = fig.add_subplot(2, 2, 3, projection="3d")
+        ax_var  = fig.add_subplot(2, 2, 4)
+    else:
+        fig = plt.figure(figsize=(16, 6))
+        ax_2d  = fig.add_subplot(1, 3, 1)
+        ax_den = fig.add_subplot(1, 3, 2)
+        ax_var = fig.add_subplot(1, 3, 3)
+        ax_3d  = None
+
+    pc1_lbl = f"PC1 ({var_ratio[0]:.1%} var)"
+    pc2_lbl = f"PC2 ({var_ratio[1]:.1%} var)" if n_components > 1 else "PC2"
+    pc3_lbl = (f"PC3 ({var_ratio[2]:.1%} var)"
+               if n_components > 2 else "PC3")
+
+    # ── Panel 1: 2D PCA with time-gradient coloring ───────────────────────────
+    for traj_2d in proj2d:
+        # Draw each consecutive segment with a colour from the time gradient
+        n_seg = len(traj_2d) - 1
+        for s in range(n_seg):
+            t_norm = s / max(n_seg - 1, 1)
+            color = cmap_time(t_norm)
+            ax_2d.plot(
+                traj_2d[s:s + 2, 0], traj_2d[s:s + 2, 1],
+                color=color, alpha=0.45, linewidth=0.7,
+            )
+        # Start marker (large circle, blue)
+        ax_2d.scatter(traj_2d[0, 0], traj_2d[0, 1],
+                      color=cmap_time(0.0), s=18, zorder=6,
+                      marker="o", edgecolors="white", linewidths=0.4)
+        # End marker (star, red)
+        ax_2d.scatter(traj_2d[-1, 0], traj_2d[-1, 1],
+                      color=cmap_time(1.0), s=30, zorder=6,
+                      marker="*", edgecolors="white", linewidths=0.4)
+
+    # Colorbar for time axis
+    sm = plt.cm.ScalarMappable(cmap=cmap_time,
+                               norm=plt.Normalize(vmin=0, vmax=T))
+    sm.set_array([])
+    cb = fig.colorbar(sm, ax=ax_2d, fraction=0.046, pad=0.04)
+    cb.set_label("Time step", fontsize=8)
+    ax_2d.set_xlabel(pc1_lbl, fontsize=9)
+    ax_2d.set_ylabel(pc2_lbl, fontsize=9)
+    ax_2d.set_title("PCA Trajectories\n(blue=start → red=end)", fontsize=10)
+    ax_2d.grid(True, alpha=0.25)
+
+    # ── Panel 2: Density heatmap of all visited states ────────────────────────
+    all_2d = np.vstack(proj2d)               # (show_n*T, 2)
+    # 2D histogram as density proxy
+    x_range = (all_2d[:, 0].min(), all_2d[:, 0].max())
+    y_range = (all_2d[:, 1].min(), all_2d[:, 1].max())
+    bins = min(60, max(20, T // 5))
+    h, xedges, yedges = np.histogram2d(
+        all_2d[:, 0], all_2d[:, 1],
+        bins=bins,
+        range=[x_range, y_range],
+    )
+    # Smooth the histogram for visual clarity
+    try:
+        from scipy.ndimage import gaussian_filter
+        h_smooth = gaussian_filter(h.T, sigma=1.5)
+    except ImportError:
+        h_smooth = h.T
+    ax_den.imshow(
+        h_smooth,
+        origin="lower",
+        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+        aspect="auto",
+        cmap="hot",
+        interpolation="bilinear",
+    )
+    # Overlay end-points (attractor region)
+    ends_2d = np.array([traj_2d[-1] for traj_2d in proj2d])
+    ax_den.scatter(ends_2d[:, 0], ends_2d[:, 1],
+                   c="cyan", s=14, zorder=5, alpha=0.7,
+                   marker="*", label="Final states")
+    ax_den.set_xlabel(pc1_lbl, fontsize=9)
+    ax_den.set_ylabel(pc2_lbl, fontsize=9)
+    ax_den.set_title("State Density Heatmap\n(bright = attractor)", fontsize=10)
+    ax_den.legend(fontsize=7, loc="upper left")
+
+    # ── Panel 3: 3D PCA ───────────────────────────────────────────────────────
+    if ax_3d is not None:
+        for traj_3d in proj3d:
+            n_seg = len(traj_3d) - 1
+            for s in range(n_seg):
+                t_norm = s / max(n_seg - 1, 1)
+                color = cmap_time(t_norm)
+                ax_3d.plot(
+                    traj_3d[s:s + 2, 0],
+                    traj_3d[s:s + 2, 1],
+                    traj_3d[s:s + 2, 2],
+                    color=color, alpha=0.35, linewidth=0.6,
+                )
+            ax_3d.scatter(*traj_3d[0], color=cmap_time(0.0),
+                          s=15, marker="o", zorder=5)
+            ax_3d.scatter(*traj_3d[-1], color=cmap_time(1.0),
+                          s=20, marker="*", zorder=5)
+        ax_3d.set_xlabel(pc1_lbl, fontsize=7, labelpad=2)
+        ax_3d.set_ylabel(pc2_lbl, fontsize=7, labelpad=2)
+        ax_3d.set_zlabel(pc3_lbl, fontsize=7, labelpad=2)  # type: ignore[attr-defined]
+        ax_3d.set_title("3D PCA Attractor\n(PC1–PC3)", fontsize=10)
+        ax_3d.tick_params(labelsize=6)
+
+    # ── Panel 4: Explained variance curve ─────────────────────────────────────
+    ranks = np.arange(1, n_full + 1)
+    ax_var.bar(ranks, var_full * 100, color="steelblue", alpha=0.7,
+               label="Per-PC variance")
+    ax_var_r = ax_var.twinx()
+    ax_var_r.plot(ranks, var_cumsum * 100, "r-o", ms=3, lw=1.5,
+                  label="Cumulative")
+    # Mark 90% threshold
+    idx_90 = int(np.searchsorted(var_cumsum, 0.90))
+    if idx_90 < n_full:
+        ax_var_r.axhline(90, color="gray", ls="--", lw=0.8, alpha=0.7)
+        ax_var_r.axvline(idx_90 + 1, color="gray", ls=":", lw=0.8, alpha=0.7)
+        ax_var_r.text(idx_90 + 1.2, 91,
+                      f"90% @ PC{idx_90 + 1}", fontsize=7, color="gray")
+    ax_var.set_xlabel("Principal Component", fontsize=9)
+    ax_var.set_ylabel("Variance (%)", fontsize=9, color="steelblue")
+    ax_var_r.set_ylabel("Cumulative Variance (%)", fontsize=9, color="red")
+    ax_var_r.set_ylim(0, 105)
+    ax_var.set_title("Explained Variance\n(linear dynamics estimate)", fontsize=10)
+    ax_var.set_xlim(0.5, n_full + 0.5)
+    # Merge legends
+    h1, l1 = ax_var.get_legend_handles_labels()
+    h2, l2 = ax_var_r.get_legend_handles_labels()
+    ax_var.legend(h1 + h2, l1 + l2, fontsize=7, loc="center right")
+    ax_var.grid(True, alpha=0.25)
+
+    # ── Overall title ─────────────────────────────────────────────────────────
+    n_pc90 = idx_90 + 1 if idx_90 < n_full else n_full
+    cum2 = float(var_cumsum[min(1, n_full - 1)] * 100)
+    fig.suptitle(
+        f"Free Dynamics — PCA Analysis  "
+        f"[{n_traj} trajectories × {steps} steps, N={n_regions} regions]\n"
+        f"PC1+PC2 = {cum2:.1f}% var  |  90% var @ PC{n_pc90}  |  "
+        f"showing {show_n} trajectories",
+        fontsize=11, y=1.01,
+    )
+
+    fig.tight_layout()
     _save_or_show(fig, save_path)
 
 

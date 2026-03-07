@@ -835,3 +835,329 @@ class TestPCAAttractor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# B: Lyapunov Spectrum + Kaplan-Yorke Dimension
+# ══════════════════════════════════════════════════════════════════════════════
+
+from spectral_dynamics.b_lyapunov_spectrum import (
+    compute_lyapunov_spectrum,
+    kaplan_yorke_dimension,
+    run_lyapunov_spectrum,
+)
+
+
+class TestKaplanYorkeDimension(unittest.TestCase):
+    def test_all_negative_returns_zero(self):
+        self.assertAlmostEqual(kaplan_yorke_dimension(np.array([-0.1, -0.5])), 0.0)
+
+    def test_all_positive_returns_n(self):
+        # Conservative / Hamiltonian: all partial sums >= 0
+        self.assertEqual(kaplan_yorke_dimension(np.array([0.3, 0.2, 0.1])), 3.0)
+
+    def test_limit_cycle(self):
+        # λ₁=0, rest negative → D_KY in [1, 2)
+        spec = np.array([0.0, -0.1, -0.3])
+        dky = kaplan_yorke_dimension(spec)
+        self.assertGreaterEqual(dky, 1.0)
+        self.assertLess(dky, 2.0)
+
+    def test_chaotic_fractal_dim(self):
+        # λ₁ > 0, sum goes negative → non-integer D_KY
+        spec = np.array([0.5, -0.2, -0.8])
+        dky = kaplan_yorke_dimension(spec)
+        self.assertGreater(dky, 1.0)
+        self.assertLess(dky, 3.0)
+        self.assertNotAlmostEqual(dky % 1, 0.0, places=4)
+
+    def test_single_positive(self):
+        spec = np.array([0.1, -1.0])
+        dky = kaplan_yorke_dimension(spec)
+        self.assertGreater(dky, 1.0)
+        self.assertLess(dky, 2.0)
+
+    def test_descending_sort_invariant(self):
+        spec = np.array([-0.8, 0.5, -0.2])   # unsorted
+        spec_sorted = np.sort(spec)[::-1]
+        self.assertAlmostEqual(
+            kaplan_yorke_dimension(spec),
+            kaplan_yorke_dimension(spec_sorted),
+        )
+
+
+class TestLyapunovSpectrum(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        rng = np.random.default_rng(99)
+        N = 20
+        W = rng.standard_normal((N, N)).astype(np.float32) * 0.3
+        trajs = np.empty((10, 80, N), dtype=np.float32)
+        for i in range(10):
+            x = rng.random(N).astype(np.float32)
+            for t in range(80):
+                trajs[i, t] = x
+                x = np.clip(np.tanh(0.85 * (W @ x)), 0.0, 1.0)
+        cls.trajs = trajs
+        cls.N = N
+
+    def test_spectrum_length(self):
+        result = compute_lyapunov_spectrum(self.trajs, burnin=5)
+        self.assertEqual(len(result["spectrum"]), self.N)
+
+    def test_spectrum_descending(self):
+        result = compute_lyapunov_spectrum(self.trajs, burnin=5)
+        spec = result["spectrum"]
+        # Allow tiny floating-point violations
+        self.assertTrue(np.all(np.diff(spec) <= 1e-8))
+
+    def test_kaplan_yorke_in_result(self):
+        result = compute_lyapunov_spectrum(self.trajs, burnin=5)
+        self.assertIn("kaplan_yorke_dim", result)
+        dky = result["kaplan_yorke_dim"]
+        self.assertGreaterEqual(dky, 0.0)
+        self.assertLessEqual(dky, self.N)
+
+    def test_classification_present(self):
+        result = compute_lyapunov_spectrum(self.trajs, burnin=5)
+        self.assertIn(result["classification"],
+                      ["fixed_point", "limit_cycle", "quasi_periodic",
+                       "weakly_chaotic", "strongly_chaotic"])
+
+    def test_n_pairs_positive(self):
+        result = compute_lyapunov_spectrum(self.trajs, burnin=5)
+        self.assertGreater(result["n_pairs"], 0)
+
+    def test_run_lyapunov_spectrum_saves_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_lyapunov_spectrum(self.trajs, burnin=5,
+                                  output_dir=Path(tmpdir), label="test")
+            self.assertTrue((Path(tmpdir) / "lyapunov_spectrum_test.json").exists())
+
+    def test_run_lyapunov_spectrum_saves_png(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_lyapunov_spectrum(self.trajs, burnin=5,
+                                  output_dir=Path(tmpdir), label="test")
+            self.assertTrue((Path(tmpdir) / "lyapunov_spectrum_test.png").exists())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# H: Power Spectrum
+# ══════════════════════════════════════════════════════════════════════════════
+
+from spectral_dynamics.h_power_spectrum import run_power_spectrum
+
+
+class TestPowerSpectrum(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        rng = np.random.default_rng(77)
+        N = 20
+        T = 64
+        # Sine wave at f=0.1 Hz, dt=2s → period=10 steps
+        t_axis = np.arange(T, dtype=np.float32)
+        freq = 0.1
+        dt = 2.0
+        base = np.sin(2 * np.pi * freq * dt * t_axis)  # (T,)
+        trajs = np.empty((5, T, N), dtype=np.float32)
+        for i in range(5):
+            noise = rng.standard_normal((T, N)).astype(np.float32) * 0.05
+            trajs[i] = (base[:, None] + noise).astype(np.float32)
+        cls.trajs = trajs
+        cls.dt = dt
+        cls.expected_freq = freq
+
+    def test_returns_freqs_and_psd(self):
+        result = run_power_spectrum(self.trajs, dt=self.dt, burnin=0)
+        self.assertIn("freqs", result)
+        self.assertIn("mean_psd", result)
+        self.assertIn("region_psd", result)
+
+    def test_freqs_shape(self):
+        result = run_power_spectrum(self.trajs, dt=self.dt, burnin=0)
+        T_use = self.trajs.shape[1]
+        self.assertEqual(len(result["freqs"]), T_use // 2 + 1)
+
+    def test_dominant_freq_near_expected(self):
+        result = run_power_spectrum(self.trajs, dt=self.dt, burnin=0)
+        dom_f = result["band_analysis"]["dominant_freq_hz"]
+        # Allow ±2× frequency resolution
+        freq_res = 1.0 / (self.trajs.shape[1] * self.dt)
+        self.assertAlmostEqual(dom_f, self.expected_freq, delta=3 * freq_res)
+
+    def test_band_analysis_keys(self):
+        result = run_power_spectrum(self.trajs, dt=self.dt, burnin=0)
+        ba = result["band_analysis"]
+        for key in ("dominant_freq_hz", "dominant_freq_band",
+                    "total_power", "band_powers", "band_power_fractions",
+                    "nyquist_hz", "bands_used"):
+            self.assertIn(key, ba)
+
+    def test_spatial_modes_peak_regions(self):
+        result = run_power_spectrum(self.trajs, dt=self.dt, burnin=0)
+        sm = result["spatial_modes"]
+        self.assertIn("peak_region_per_band", sm)
+        for pk in sm["peak_region_per_band"].values():
+            self.assertGreaterEqual(pk, 0)
+            self.assertLess(pk, self.trajs.shape[2])
+
+    def test_saves_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_power_spectrum(self.trajs, dt=self.dt, burnin=0,
+                               output_dir=Path(tmpdir), label="test")
+            self.assertTrue(
+                (Path(tmpdir) / "power_spectrum_test.json").exists()
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# I: Energy Constraint
+# ══════════════════════════════════════════════════════════════════════════════
+
+from spectral_dynamics.i_energy_constraint import (
+    run_energy_alpha_scan,
+    run_dynamic_energy,
+)
+
+
+class TestEnergyConstraint(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        N = 15
+        rng = np.random.default_rng(11)
+        W = rng.standard_normal((N, N)).astype(np.float32) * 0.25
+        eigvals = np.linalg.eigvals(W.astype(np.float64))
+        rho = float(np.abs(eigvals).max())
+        cls.W = (W * 0.9 / max(rho, 1e-6)).astype(np.float32)
+        cls.N = N
+
+    def test_alpha_scan_keys(self):
+        result = run_energy_alpha_scan(
+            self.W, alpha_min=0.8, alpha_max=1.2, alpha_step=0.2,
+            n_traj=3, steps=50, warmup=10, seed=0,
+        )
+        for key in ("alpha_values", "lles", "osc_amplitudes",
+                    "mean_activities", "critical_alpha", "bifurcation_found",
+                    "rho_W"):
+            self.assertIn(key, result)
+
+    def test_alpha_scan_lengths_match(self):
+        result = run_energy_alpha_scan(
+            self.W, alpha_min=0.8, alpha_max=1.2, alpha_step=0.2,
+            n_traj=3, steps=50, warmup=10, seed=0,
+        )
+        n = len(result["alpha_values"])
+        self.assertEqual(len(result["lles"]), n)
+        self.assertEqual(len(result["osc_amplitudes"]), n)
+        self.assertEqual(len(result["mean_activities"]), n)
+
+    def test_alpha_scan_saves_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_energy_alpha_scan(
+                self.W, alpha_min=0.8, alpha_max=1.2, alpha_step=0.2,
+                n_traj=3, steps=50, warmup=10, seed=0,
+                output_dir=Path(tmpdir), label="test",
+            )
+            self.assertTrue(
+                (Path(tmpdir) / "energy_alpha_scan_test.json").exists()
+            )
+            self.assertTrue(
+                (Path(tmpdir) / "energy_alpha_scan_test.png").exists()
+            )
+
+    def test_dynamic_energy_keys(self):
+        result = run_dynamic_energy(
+            self.W, alpha=0.4, beta=0.4, E_ref=1.0,
+            steps=80, n_traj=3, seed=0,
+        )
+        for key in ("E_mean", "E_std", "activity_mean",
+                    "homeostasis_achieved", "alpha", "beta", "E_ref"):
+            self.assertIn(key, result)
+
+    def test_dynamic_energy_E_positive(self):
+        result = run_dynamic_energy(
+            self.W, alpha=0.4, beta=0.4, E_ref=1.0,
+            steps=80, n_traj=3, seed=0,
+        )
+        self.assertGreaterEqual(result["E_mean"], 0.0)
+
+    def test_dynamic_energy_saves_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dynamic_energy(
+                self.W, alpha=0.4, beta=0.4, E_ref=1.0,
+                steps=80, n_traj=3, seed=0,
+                output_dir=Path(tmpdir), label="test",
+            )
+            self.assertTrue(
+                (Path(tmpdir) / "energy_dynamic_E_test.json").exists()
+            )
+            self.assertTrue(
+                (Path(tmpdir) / "energy_dynamic_E_test.png").exists()
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# run_all integration: new experiments B_LYA, H, I
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRunAllNewExperiments(unittest.TestCase):
+    """Integration test: run_all correctly executes B_LYA, H, I."""
+
+    @classmethod
+    def setUpClass(cls):
+        W, trajs, R = _make_synthetic_data(n_regions=N, n_traj=8, steps=60)
+        cls.W = W
+        cls.trajs = trajs
+        cls.R = R
+
+    def test_b_lya_in_run_all(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary = run_all(
+                trajectories=self.trajs,
+                response_matrix=self.R,
+                output_dir=Path(tmpdir),
+                experiments=["B_LYA"],
+            )
+            self.assertIn("B_LYA", summary["results"])
+            dky = summary["results"]["B_LYA"].get("kaplan_yorke_dim")
+            self.assertIsNotNone(dky)
+            self.assertGreaterEqual(dky, 0.0)
+
+    def test_h_in_run_all(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary = run_all(
+                trajectories=self.trajs,
+                response_matrix=self.R,
+                output_dir=Path(tmpdir),
+                experiments=["H"],
+            )
+            self.assertIn("H", summary["results"])
+            dom_f = summary["results"]["H"].get("dominant_freq_hz")
+            self.assertIsNotNone(dom_f)
+
+    def test_i_in_run_all(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary = run_all(
+                trajectories=self.trajs,
+                response_matrix=self.R,
+                output_dir=Path(tmpdir),
+                experiments=["I"],
+            )
+            self.assertIn("I", summary["results"])
+            self.assertIn("alpha_scan", summary["results"]["I"])
+            self.assertIn("dynamic_energy", summary["results"]["I"])
+
+    def test_h5_hypothesis_populated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary = run_all(
+                trajectories=self.trajs,
+                response_matrix=self.R,
+                output_dir=Path(tmpdir),
+                experiments=["I"],
+            )
+            hyp = summary["hypotheses"]
+            self.assertIn("H5_energy_constraint_criticality", hyp)
+            self.assertIn("bifurcation_found",
+                          hyp["H5_energy_constraint_criticality"])
+
+
