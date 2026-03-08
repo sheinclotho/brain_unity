@@ -133,6 +133,9 @@ random_comparison:
   n_init: 200             # Random initial states for random model
   steps: 1000             # Steps for random model trajectories
   spectral_radius: 0.9    # Target spectral radius of random weight matrix
+  # Multiple radii: tanh chaos boundary is ρ≈1.5 for n≈190 (not linear ρ=1)
+  spectral_radii: [0.9, 1.5, 2.0]   # stable / near-critical / chaotic
+  n_seeds: 5              # Independent weight matrices per spectral radius
 
 # Output configuration
 output:
@@ -142,6 +145,38 @@ output:
   save_response_matrix: true
   save_stability_metrics: true
   save_plots: true
+
+# Surrogate test — nonlinearity significance check (Step 11)
+# 19 surrogates → rank-based p < 0.05; 99 surrogates → p < 0.01.
+# Runtime: n_surrogates × n_traj_sample × rosenstein calls (pure NumPy).
+surrogate_test:
+  enabled: true
+  n_surrogates: 19              # 19 surrogates → p < 0.05 (rank test)
+  surrogate_types:              # Which surrogate methods to run
+    - phase_randomize           # Destroys nonlinearity, preserves power spectrum
+    - shuffle                   # Destroys all temporal structure
+    - ar                        # Autoregressive surrogate (preserves linear structure)
+  ar_order: 1                   # AR(p) order for ar_surrogate
+  rosenstein_max_lag: 30        # Max lag for Rosenstein LLE in surrogate test
+  rosenstein_min_sep: 10        # Min temporal separation for NN search
+  n_traj_sample: 5              # Trajectories used (speed vs. precision trade-off)
+
+# Embedding dimension & data leakage checks (Step 12)
+# Controls intrinsic dimensionality estimation (FNN, D₂) and leakage warnings.
+# Key params for EEG:
+#   fnn_max_dim  — upper bound on FNN dimension scan (raise if FNN not saturating)
+#   check_leakage — whether to run normalisation + PCA leakage checks
+#   train_fraction — fraction of trajectories used as "training" reference for leakage tests
+embedding_dimension:
+  enabled: true
+  fnn_max_dim: 8                # Max embedding dimension to test via FNN
+  fnn_tau: 1                    # Delay lag for FNN (prediction steps)
+  corr_dim: true                # Compute Grassberger-Procaccia correlation dimension D₂
+  check_leakage: true           # Run normalisation + PCA leakage checks
+  # Fraction of trajectories treated as "train" when checking leakage.
+  # The remaining (1-train_fraction) trajectories are the "test" set.
+  # A higher value reduces leakage risk but gives fewer test trajectories.
+  train_fraction: 0.7           # 70% train / 30% test split for leakage estimation
 
 # Power spectrum analysis (Step 13)
 power_spectrum:

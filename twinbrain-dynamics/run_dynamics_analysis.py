@@ -646,6 +646,7 @@ def _run_single_modality(
                 n_states=jac_cfg.get("n_states", 3),
                 epsilon=jac_cfg.get("epsilon", 1e-4),
                 seed=jac_cfg.get("seed", fd_cfg.get("seed", 42)),
+            )
             logger.info(
                 "  Jacobian 谱: ρ=%.4f, n_slow=%d, n_Hopf=%d, dominant_osc=%.4f Hz/step",
                 jac_results["spectral_radius"],
