@@ -121,6 +121,15 @@ def _merge_config(defaults: dict, overrides: dict) -> dict:
     return result
 
 
+# ── Power-spectrum burnin policy ──────────────────────────────────────────────
+# Minimum burnin (in trajectory steps) for PSD analysis.  Trajectory length
+# divided by this fraction gives the adaptive burnin (T // _PS_BURNIN_FRACTION).
+# The hard minimum ensures at least this many steps are discarded even for very
+# short trajectories, allowing the autoregressive model to warm up from the
+# injected initial state before frequency content is measured.
+_PS_BURNIN_MIN: int = 20       # minimum steps regardless of trajectory length
+_PS_BURNIN_FRACTION: int = 10  # adaptive = T // 10  (10 % of trajectory length)
+
 # ── Default configuration ─────────────────────────────────────────────────────
 
 _DEFAULTS = {
@@ -614,10 +623,19 @@ def _run_single_modality(
     if ps_cfg.get("enabled", True):
         try:
             from analysis.power_spectrum import run_power_spectrum_analysis
+            # Default burnin: _PS_BURNIN_FRACTION % of trajectory length, min
+            # _PS_BURNIN_MIN steps.  A small burnin is insufficient for removing
+            # transient artefacts that arise when sample_random_state() generates
+            # initial states far from the model's natural operating range.  Even
+            # after fixing sample_random_state (z-score aware), _PS_BURNIN_MIN
+            # steps is a conservative minimum to discard the first few
+            # autoregressive prediction chunks before the model fully "warms up".
+            _T_steps = int(trajectories.shape[1]) if trajectories.ndim >= 2 else 0
+            _default_burnin = max(_PS_BURNIN_MIN, _T_steps // _PS_BURNIN_FRACTION)
             ps_results = run_power_spectrum_analysis(
                 trajectories=trajectories,
                 dt=simulator.dt,
-                burnin=ps_cfg.get("burnin", 10),
+                burnin=ps_cfg.get("burnin", _default_burnin),
                 output_dir=output_dir if cfg["output"].get("save_plots") else None,
             )
             results["power_spectrum"] = ps_results
@@ -968,6 +986,7 @@ def _save_plots(results: dict, output_dir: Path, simulator) -> None:
         plot_pca_trajectories(
             trajs,
             save_path=plots_dir / "pca_trajectories.png",
+            burnin=max(0, trajs.shape[1] // 10),
         )
         plot_region_heatmap(
             trajs[0],

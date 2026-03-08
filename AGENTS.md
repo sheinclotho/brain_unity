@@ -538,3 +538,42 @@ r ≈ 0 的两个神经生物学合理原因：
 - 若直接 `torch.load` 后发现响应矩阵退化为对角线，立即检查 `graph.edge_types` 是否缺少同模态边。
 
 *Last updated: 2026-03-07*
+
+### [2026-03-08] `sample_random_state` z-score 初始状态裁剪错误 & `state_bounds` 单模态失效
+
+#### 根因
+- V5 图缓存中 fMRI 和 EEG 均以 **z-score 归一化**存储（均值 ≈ 0，标准差 ≈ 1，值域约 ±3σ）。
+- 旧版 `sample_random_state` 对单模态路径（fmri/eeg）执行 `np.clip(mean + noise, 0, 1)`。
+  - `mean_state` ≈ 0（z-score 后均值接近零），`noise = N(0, 0.05)`→ x0 ≈ [0, 0.05]。
+  - 将 [0, 0.05] 注入上下文末步，而上下文历史值约为 ±3σ，产生巨大跳跃。
+  - 效果：刺激前期出现大幅振荡（振幅 ±0.7 AU），如 Image 4（刺激响应图）所示；
+    PCA 密度图（Image 2）的 Final states 散点与亮斑中心不一致。
+- 旧版 `state_bounds` 对单模态无条件返回 `(0.0, 1.0)`，对 z-scored 数据 Wolf/FTLE
+  分析中将扰动状态错误裁剪至 [0,1]，引入 0 处虚假吸引子，偏置 Lyapunov 估计。
+
+#### 修复（twinbrain-dynamics/simulator/brain_dynamics_simulator.py）
+
+1. **`__init__` 新增 `_state_bounds` 属性**：检测 `base_graph[modality].x.min() < -0.1`：
+   - z-scored 数据（min < -0.1）→ `self._state_bounds = None`（不裁剪）
+   - [0,1] 归一化数据（min ≥ -0.1，旧格式兼容）→ `self._state_bounds = (0.0, 1.0)`
+   - joint 模式 → 始终 `None`（拼接 z-score 无界）
+
+2. **`state_bounds` property**：改为直接返回 `self._state_bounds`，移除硬编码 `(0.0, 1.0)`。
+
+3. **`sample_random_state` 修复**：
+   - 计算每通道均值 `mean_state` 和标准差 `std_state`（使用 `_STD_GUARD` 保护）
+   - 噪声缩放：`noise = N(0, 0.3)`，`x0 = mean + noise * std_state`（0.3σ 扰动，在自然分布内）
+   - 仅当 `_state_bounds is not None`（旧格式）时才执行 clip
+
+#### 附带修复（run_dynamics_analysis.py）
+
+4. **PSD burnin 自适应**：Step 13 的默认 burnin 从固定 10 改为 `max(20, T // 10)`（轨迹长度的 10%，最少 20 步），移除初始瞬态对功率谱空间拓扑图的条纹污染（Image 1）。
+
+5. **PCA burnin 默认化**：`plot_pca_trajectories` 调用增加 `burnin=max(0, T // 10)`，PCA 密度图不再包含初始瞬态帧（Image 2 改善）。
+
+#### 规则
+- `sample_random_state` 在单模态路径下必须检测数据是否 z-scored，**禁止**对 z-scored 数据执行 `clip(0, 1)`。判据：`base_graph[modality].x.min() < -0.1`。
+- `state_bounds` 对 z-scored 单模态数据必须返回 `None`，使 Wolf/FTLE 不裁剪扰动状态。
+- PSD burnin 必须与轨迹长度正比（10%），不得使用小于 20 步的固定值。
+
+*Last updated: 2026-03-08*
