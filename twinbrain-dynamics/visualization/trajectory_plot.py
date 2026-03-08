@@ -71,6 +71,7 @@ def plot_pca_trajectories(
     trajectories: np.ndarray,
     max_show: int = 50,
     burnin: int = 0,
+    train_fraction: float = 0.7,
     save_path: Optional[Path] = None,
 ) -> None:
     """
@@ -91,10 +92,13 @@ def plot_pca_trajectories(
     - **方差曲线**：确认前 k 个 PC 覆盖多少动力学方差
 
     Args:
-        trajectories: shape (n_init, steps, n_regions)。
-        max_show:     2D/3D 子图最多显示的轨迹数（避免遮挡，默认 50）。
-        burnin:       跳过每条轨迹前几步（消除瞬态，默认 0）。
-        save_path:    保存路径；None → 显示。
+        trajectories:   shape (n_init, steps, n_regions)。
+        max_show:       2D/3D 子图最多显示的轨迹数（避免遮挡，默认 50）。
+        burnin:         跳过每条轨迹前几步（消除瞬态，默认 0）。
+        train_fraction: PCA 拟合时使用的参考轨迹比例（默认 70%）。
+                        仅在参考（训练）轨迹上拟合 PCA，其余轨迹投影到
+                        该子空间，避免测试集信息泄漏到主成分方向。
+        save_path:      保存路径；None → 显示。
     """
     if not _MPL_AVAILABLE:
         return
@@ -107,20 +111,27 @@ def plot_pca_trajectories(
 
     n_traj, steps, n_regions = trajectories.shape
 
-    # ── Fit PCA on all post-burnin states ─────────────────────────────────────
+    # ── Fit PCA on reference (training) set only — avoids test-set leakage ────
+    # Principal components are determined solely by the training trajectories;
+    # all trajectories (including test ones) are then projected onto that
+    # subspace.  This matches the recommendation from check_pca_leakage().
+    # When n_traj < 2 (single trajectory), n_ref == n_traj and the split is
+    # effectively bypassed — PCA is fitted on the only available trajectory.
     traj_use = trajectories[:, burnin:, :]            # (n_traj, T, N)
     T = traj_use.shape[1]
-    n_components = min(3, n_regions, n_traj * T)
-    all_states = traj_use.reshape(-1, n_regions)       # (n_traj*T, N)
+    n_ref = max(1, int(n_traj * train_fraction))
+    ref_states = traj_use[:n_ref].reshape(-1, n_regions)   # training set only
+    all_states = traj_use.reshape(-1, n_regions)            # used for density plot
 
+    n_components = min(3, n_regions, len(ref_states) - 1)
     pca = PCA(n_components=n_components, random_state=42)
-    pca.fit(all_states)
+    pca.fit(ref_states)                                # fit on training set only
     var_ratio = pca.explained_variance_ratio_          # (n_components,)
 
     # Cumulative variance for all components up to min(20, n_regions)
-    n_full = min(20, n_regions, n_traj * T)
+    n_full = min(20, n_regions, len(ref_states) - 1)
     pca_full = PCA(n_components=n_full, random_state=42)
-    pca_full.fit(all_states)
+    pca_full.fit(ref_states)                           # fit on training set only
     var_full = pca_full.explained_variance_ratio_
     var_cumsum = np.cumsum(var_full)
 
@@ -281,7 +292,7 @@ def plot_pca_trajectories(
         f"Free Dynamics — PCA Analysis  "
         f"[{n_traj} trajectories × {steps} steps, N={n_regions} regions]\n"
         f"PC1+PC2 = {cum2:.1f}% var  |  90% var @ PC{n_pc90}  |  "
-        f"showing {show_n} trajectories",
+        f"showing {show_n} trajectories  |  PCA fitted on ref ({n_ref}/{n_traj} traj)",
         fontsize=11, y=1.01,
     )
 
