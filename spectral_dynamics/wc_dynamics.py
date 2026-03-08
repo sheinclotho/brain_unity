@@ -1,23 +1,50 @@
 """
-Wilson-Cowan Dynamics Utilities
-================================
+Wilson-Cowan Matrix Dynamics Utilities
+=======================================
 
-Canonical implementation of matrix-driven Wilson-Cowan (WC) utilities shared
-between ``twinbrain-dynamics`` and ``spectral_dynamics``.
+This module belongs to **spectral_dynamics** — the matrix-driven analysis
+layer that is completely independent of the TwinBrain GNN model.
 
-This module eliminates the duplicated WC helper code that previously existed
-independently in:
+Background
+----------
+The ``spectral_dynamics`` experiments (E4, E5, I) use Wilson-Cowan (WC)
+dynamics as a *matrix-proxy* to study how properties of the connectivity
+matrix affect brain-like dynamics without requiring the full GNN model:
 
-* ``spectral_dynamics/e4_structural_perturbation.py``  — ``_wc_step``,
-  ``_rosenstein_lle_on_wc``, ``_simple_lle``
-* ``spectral_dynamics/e5_phase_diagram.py`` — ``_wc_trajectories``,
-  ``_rosenstein_from_twinbrain``, ``_simple_rosenstein``
-* ``spectral_dynamics/i_energy_constraint.py`` — ``_rosenstein``,
-  ``_project_energy_wc``
+* **E4** — structural perturbation: does WC-LLE change when the matrix is
+  shuffled / rewired / truncated?
+* **E5** — phase diagram: scan coupling strength ``g`` to find the edge-of-chaos
+  transition point.
+* **I** — energy constraint: how does an L1 energy budget alter WC dynamics?
 
-All three ``spectral_dynamics`` modules (e4, e5, i) now import from here.
-Module ``h_power_spectrum`` is unrelated — it delegates to
-``analysis.power_spectrum`` (canonical FFT implementation).
+These experiments are distinct from twinbrain-dynamics which uses the actual
+``GraphNativeBrainModel`` (ST-GCN encoder + GNN propagator + decoder). WC is
+the simple proxy for matrix analysis; the GNN is the real model.
+
+Architecture note
+-----------------
+This file lives in ``spectral_dynamics/`` because WC dynamics are exclusively
+a tool of the spectral analysis layer. The ``twinbrain-dynamics/`` package
+deals only with the GNN-based model and must not contain WC code.
+
+The Rosenstein LLE helper calls ``analysis.lyapunov.rosenstein_lyapunov`` from
+``twinbrain-dynamics`` when it is available on ``sys.path`` (which
+``spectral_dynamics/__init__._ensure_twinbrain_path()`` arranges at package
+import time), and falls back to :func:`wolf_benettin_lle` otherwise.
+
+Previously duplicated code (now consolidated here)
+---------------------------------------------------
++------------------------------------------+---------------------------------+
+| 旧位置（已删除）                          | 新统一位置                        |
++==========================================+=================================+
+| e4._wc_step                              | wc_dynamics.wc_step             |
+| e5._wc_trajectories                      | wc_dynamics.wc_simulate         |
+| e4._rosenstein_lle_on_wc / _simple_lle   | wc_dynamics.rosenstein_lle_on_wc|
+| e5._rosenstein_from_twinbrain /          |                                 |
+|   _simple_rosenstein                     | wc_dynamics.rosenstein_lle_on_wc|
+| i._rosenstein                            | wc_dynamics.rosenstein_lle_on_wc|
+| i._project_energy_wc                     | wc_dynamics.project_energy_l1_bounded |
++------------------------------------------+---------------------------------+
 
 Public API
 ----------
@@ -26,18 +53,12 @@ Public API
 ``rosenstein_lle_on_wc(W, ...)``        — LLE via Rosenstein method
 ``project_energy_l1_bounded(y, E)``     — L1-ball energy projection (bounded)
 ``wolf_benettin_lle(traj)``             — Wolf-Benettin fallback (rarely needed)
-
-Note on ``project_energy_l1_bounded`` vs ``_project_energy`` in
-``energy_constraint.py``:
-  ``_project_energy`` handles both bounded (fMRI) and unbounded (joint/EEG)
-  state spaces.  The bounded-only version here is used by the WC simulations
-  in ``spectral_dynamics`` which always run in [0, 1]^N.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Tuple
 
 import numpy as np
 
@@ -128,9 +149,10 @@ def rosenstein_lle_on_wc(
     method.
 
     Generates ``n_traj`` trajectories with :func:`wc_simulate` and calls the
-    canonical ``rosenstein_lyapunov`` from ``analysis.lyapunov``.  Falls back
-    to a lightweight Wolf-Benettin implementation when the canonical module is
-    not importable.
+    canonical ``rosenstein_lyapunov`` from
+    ``twinbrain-dynamics/analysis/lyapunov`` (available when
+    ``spectral_dynamics._ensure_twinbrain_path()`` has been called).  Falls
+    back to :func:`wolf_benettin_lle` otherwise.
 
     Args:
         W:        Connectivity matrix (N, N).
@@ -172,11 +194,11 @@ def wolf_benettin_lle(
     eps: float = 1e-6,
 ) -> float:
     """
-    Lightweight Wolf-Benettin LLE on a pre-computed trajectory.
+    Lightweight Wolf-Benettin LLE on a pre-computed WC trajectory.
 
     Used only when ``analysis.lyapunov.rosenstein_lyapunov`` is not available.
-    This is the *single canonical fallback*; all former per-file copies have
-    been removed.
+    This is the single canonical fallback for WC-based LLE estimation; the
+    duplicate copies that previously lived in e4, e5, and i have been removed.
 
     Args:
         traj:          shape (T, N), float32/64.
@@ -215,7 +237,7 @@ def wolf_benettin_lle(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# L1-ball energy projection (bounded state space)
+# L1-ball energy projection (bounded WC state space [0, 1]^N)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def project_energy_l1_bounded(
@@ -225,20 +247,15 @@ def project_energy_l1_bounded(
     """
     Project WC output ``y ∈ [0, 1]^N`` onto ``{z : mean(z) ≤ E_budget}``.
 
-    This is the bounded (non-negative) specialisation of the general
-    ``_project_energy`` in ``experiments/energy_constraint.py``.  It is used
-    by ``spectral_dynamics/i_energy_constraint.py`` which always operates in
-    the ``[0, 1]^N`` state space of the WC model.
+    This is the bounded (non-negative) specialisation used by the WC energy
+    constraint experiment (``spectral_dynamics/i_energy_constraint.py``).
 
-    The general version (which also handles unbounded z-score joint states)
+    The general version — which also handles unbounded z-score joint states —
     lives in ``twinbrain-dynamics/experiments/energy_constraint._project_energy``
-    and should be preferred when the state space may be negative.
+    and should be used when the state space may be negative.
 
     Projection solution (soft-threshold, 50-iteration bisection):
       ``x_i = max(y_i - λ*, 0)``  where ``λ*`` makes ``mean(x) = E_budget``.
-
-    Winner-takes-all effect: weak activations are zeroed out; strong ones are
-    preserved (slightly reduced).
 
     Args:
         y:         WC output, shape (N,), values in [0, 1].
@@ -246,7 +263,7 @@ def project_energy_l1_bounded(
 
     Returns:
         (x_projected, constraint_was_active):
-            x_projected:         shape (N,), float32.
+            x_projected:           shape (N,), float32.
             constraint_was_active: True if the constraint was binding.
 
     Cost: O(50 × N) per call — < 0.1 ms for N = 190.
