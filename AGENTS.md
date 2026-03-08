@@ -576,4 +576,23 @@ r ≈ 0 的两个神经生物学合理原因：
 - `state_bounds` 对 z-scored 单模态数据必须返回 `None`，使 Wolf/FTLE 不裁剪扰动状态。
 - PSD burnin 必须与轨迹长度正比（10%），不得使用小于 20 步的固定值。
 
+### [2026-03-08] Jacobian DMD 替换有限差分 & 功率谱线性去趋势 & 能量约束重构
+
+#### Jacobian 谱分析 ρ=0 根因：TwinBrainDigitalTwin 上下文稀释
+- **问题**: `estimate_jacobian_at_point` 用 `rollout(x0, steps=1)` 做有限差分，将 x0 注入 200 步上下文窗口的最后一步。Conv1d+注意力编码器对全部 200 步加权平均，单步扰动 ε=1e-4 被稀释为 ≈5×10⁻⁷，在 float32 精度下 `f_fwd - f_bwd = 0` → J=0 → ρ=0。
+- **修复**: 删除 `estimate_jacobian_at_point`，用 **Dynamic Mode Decomposition (DMD)** 替代：从自由动力学轨迹提取时序对 (x_t, x_{t+1})，用 Tikhonov 正则化最小二乘拟合最优线性转移算子 A = (X₁ᵀX₀)(X₀ᵀX₀ + αI)⁻¹。**零额外模型调用**，直接复用步骤 3 的轨迹。
+- **验证**: 对已知谱半径 0.85 的合成系统，DMD 恢复谱半径 0.8515（误差 < 2%）；对角线系统特征值误差 < 0.01。
+- **规则**: TwinBrainDigitalTwin 的 Jacobian **必须**使用 DMD，**禁止**使用 `rollout(steps=1)` 有限差分（上下文稀释）。函数签名保持向后兼容（`n_states`、`epsilon` 参数保留但不使用）。
+
+#### 功率谱 dominant_freq=0.0005 Hz 根因：仅去均值未去趋势
+- **问题**: `compute_trajectory_psd` 注释写"Detrend (remove linear trend per channel)"，但代码只做 `seg - seg.mean()`（仅去 DC）。从随机初态收敛到吸引子的轨迹存在强线性趋势，FFT 功率集中在最低频率（T=1000, dt=2s → 0.0005 Hz），掩盖真实振荡。
+- **修复**: 改用 `scipy.signal.detrend(seg, axis=0, type='linear')`（有 scipy）或矢量化 OLS 回归（无 scipy），逐通道去除仿射趋势后再加窗。
+- **验证**: 含强线性漂移 + 0.05 Hz 振荡的合成轨迹，去趋势后主导频率正确恢复为 0.05 Hz（而非近 DC）。
+- **规则**: 功率谱分析**必须**在 FFT 前做完整线性去趋势（`type='linear'`），不允许仅做均值去除（`type='constant'`）。
+
+#### 能量约束实验重构：删除非存在函数，用 `run_energy_budget_analysis` 替代
+- **问题**: Step 16 导入 `run_energy_constraint_scan`（α 扫描 x(t+1)=α·F(x(t))）和 `run_dynamic_energy_experiment` 均不存在。α 扫描科学上也是错误的（等比缩放不改变拓扑）。
+- **修复**: 添加 `run_energy_budget_analysis(trajectories, state_bounds, output_dir)` — 零额外模型调用，从已有轨迹计算 E*=mean(|x|)，给出 tight(0.4E*)/moderate(0.7E*)/natural(E*)/relaxed(1.3E*) 四档建议值，保存 JSON+PNG。更新 Step 16 使用该函数，更新 `dynamics_config.yaml` 删除废弃的 `run_alpha_scan`/`run_dynamic_energy` 字段。
+- **规则**: 真正的能量约束对比用 `--energy-budget X` 重新运行完整管线实现，Step 16 **不应**在单次运行内执行任何额外的 rollout。
+
 *Last updated: 2026-03-08*

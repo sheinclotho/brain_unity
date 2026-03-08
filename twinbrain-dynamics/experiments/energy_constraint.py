@@ -87,12 +87,20 @@ Energy Constraint Experiment
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Budget multipliers relative to the natural energy E*
+_TIGHT_FACTOR:    float = 0.4   # strong suppression, ~80% of states zeroed
+_MODERATE_FACTOR: float = 0.7   # moderate suppression, ~50% of time active
+_NATURAL_FACTOR:  float = 1.0   # no effective constraint (boundary at E*)
+_RELAXED_FACTOR:  float = 1.3   # slight relaxation, almost unconstrained
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,3 +338,153 @@ class EnergyConstrainedSimulator:
             f"n_regions={self.n_regions}, "
             f"modality={self.modality!r})"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 16 helper: energy budget analysis (no scan, no extra model calls)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_energy_budget_analysis(
+    trajectories: np.ndarray,
+    state_bounds=None,
+    output_dir: Optional[Path] = None,
+) -> Dict:
+    """
+    从已有自由动力学轨迹统计能量分布，为 ``--energy-budget`` 提供参考。
+
+    *不需要额外的模型调用*——直接从步骤 3 的轨迹计算。
+
+    能量定义
+    --------
+    E(t) = mean(|x(t)|)，即当前状态的平均绝对活动值。
+
+    对于 [0,1] 归一化数据：典型 E* ≈ 0.2–0.5。
+    对于 z-scored 数据（state_bounds=None）：典型 E* ≈ 0.4–0.8（|z-score| 均值）。
+
+    建议的 E_budget 参考值（相对于 E*）
+    ------------------------------------
+    - tight_constraint (0.4 × E*)：强约束，~80% 激活被稀疏化，系统趋向固定点
+    - moderate_constraint (0.7 × E*)：中等约束，约 50% 时间约束激活
+    - natural (1.0 × E*)：无实际约束（E_budget 等于典型能量，刚好在边界）
+    - relaxed (1.3 × E*)：放宽约束，几乎不影响动力学
+
+    设计原则（为什么不需要"扫描"）
+    --------------------------------
+    能量约束实验的正确流程是：
+      1. 运行本函数，获得 E* 和建议值
+      2. 选择不同的 E_budget（tight / moderate / natural）
+      3. 每次以 ``--energy-budget X`` 重新运行完整管线
+      4. 比较不同 E_budget 下的 Lyapunov λ 和 PCA 轨迹
+
+    这等价于真正的"扫描"，但各点结果保存在独立目录，便于对比分析。
+    在单次管线运行中做扫描（调用 n_alpha × n_init 次 rollout）的方法
+    本质上是重复执行多个完整管线，效率低且难以可视化。
+
+    Args:
+        trajectories: 自由动力学轨迹，shape (n_traj, T, N)。
+        state_bounds: (lo, hi) 或 None；None 表示 z-scored 无界数据。
+        output_dir:   结果保存目录；None → 不保存。
+
+    Returns:
+        dict 包含：
+          E_mean               — 所有轨迹的平均能量 E*
+          E_std                — 轨迹间能量标准差
+          E_median             — 能量中位数
+          E_per_region         — 各脑区平均能量，shape (N,)
+          recommended_budgets  — 建议值字典
+          n_traj, n_steps_used, burnin
+    """
+    n_traj, T, N = trajectories.shape
+    burnin = max(10, T // 10)
+    traj_valid = trajectories[:, burnin:, :]   # (n_traj, T-burnin, N)
+
+    # Per-trajectory mean energy
+    E_traj = np.abs(traj_valid).mean(axis=(1, 2))   # (n_traj,)
+    E_mean   = float(E_traj.mean())
+    E_std    = float(E_traj.std())
+    E_median = float(np.median(E_traj))
+
+    # Per-region mean energy
+    E_per_region = np.abs(traj_valid).mean(axis=(0, 1))   # (N,)
+
+    recommended = {
+        "tight_constraint":    round(_TIGHT_FACTOR    * E_mean, 6),
+        "moderate_constraint": round(_MODERATE_FACTOR * E_mean, 6),
+        "natural":             round(_NATURAL_FACTOR  * E_mean, 6),
+        "relaxed":             round(_RELAXED_FACTOR  * E_mean, 6),
+    }
+
+    logger.info(
+        "能量分析: E* = %.4f ± %.4f（中位数 %.4f）",
+        E_mean, E_std, E_median,
+    )
+    logger.info(
+        "  建议 E_budget: 紧=%.4f, 中等=%.4f, 自然=%.4f",
+        recommended["tight_constraint"],
+        recommended["moderate_constraint"],
+        recommended["natural"],
+    )
+
+    result: Dict = {
+        "E_mean":              E_mean,
+        "E_std":               E_std,
+        "E_median":            E_median,
+        "E_per_region":        E_per_region.tolist(),
+        "recommended_budgets": recommended,
+        "n_traj":              n_traj,
+        "n_steps_used":        int(T - burnin),
+        "burnin":              burnin,
+        "state_bounds":        list(state_bounds) if state_bounds is not None else None,
+    }
+
+    if output_dir is not None:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        report_path = out / "energy_budget_report.json"
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(result, fh, indent=2, ensure_ascii=False)
+        logger.info("  → 保存能量预算报告: %s", report_path)
+        _try_plot_energy_budget(result, out)
+
+    return result
+
+
+def _try_plot_energy_budget(result: Dict, output_dir: Path) -> None:
+    """绘制每脑区能量分布柱状图和建议 E_budget 参考线。"""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    E_per_region = np.array(result["E_per_region"])
+    recommended  = result["recommended_budgets"]
+    E_mean       = result["E_mean"]
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.bar(range(len(E_per_region)), E_per_region, color="steelblue", alpha=0.7, width=1.0)
+
+    # Derive colors from a fixed palette; fall back to a default colour for
+    # any key not listed, so the plot stays correct even if key names change.
+    _palette = ["red", "orange", "green", "purple", "brown", "grey"]
+    for idx, (label, val) in enumerate(recommended.items()):
+        color = _palette[idx % len(_palette)]
+        ax.axhline(val, color=color, linestyle="--", lw=1.2,
+                   label=f"E_budget={val:.4f} ({label})")
+
+    ax.set_xlabel("Brain Region Index")
+    ax.set_ylabel("Mean |activity|")
+    ax.set_title(
+        f"Energy Distribution per Region\n"
+        f"E* = {E_mean:.4f} ± {result['E_std']:.4f}  |  "
+        f"N={len(E_per_region)} regions, {result['n_steps_used']} steps"
+    )
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    fig.tight_layout()
+    save_path = output_dir / "energy_budget.png"
+    fig.savefig(save_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("  → 保存能量预算图: %s", save_path)

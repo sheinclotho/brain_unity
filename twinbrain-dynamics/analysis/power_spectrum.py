@@ -47,6 +47,15 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Attempt to import scipy.signal.detrend once at module load time.
+# When available it provides a correct O(N·T) per-channel linear detrend;
+# the vectorised NumPy fallback below is equivalent but kept as a safeguard.
+try:
+    from scipy.signal import detrend as _scipy_detrend
+    _HAS_SCIPY_DETREND: bool = True
+except ImportError:
+    _HAS_SCIPY_DETREND = False
+
 # fMRI 频段定义（Hz）—— 当 dt≈2s（TR=2s）时适用
 _FMRI_BANDS: List[Tuple[str, float, float]] = [
     ("infraslow", 0.0,   0.027),
@@ -119,8 +128,22 @@ def compute_trajectory_psd(
 
     for i in range(n_traj):
         seg = trajectories[i, burnin:, :].astype(np.float64)   # (T_use, N)
-        # Detrend (remove linear trend per channel)
-        seg = seg - seg.mean(axis=0, keepdims=True)
+        # Detrend: remove per-channel linear trend (not just mean).
+        # Reason: trajectories initialised from random states converge to the
+        # attractor over hundreds of steps; the resulting slow ramp dominates
+        # the FFT and pushes the dominant frequency to near-DC (infraslow)
+        # even when the true oscillatory dynamics are at much higher frequencies.
+        # Standard practice (scipy.signal.detrend, type='linear') removes the
+        # best-fit affine function from each channel before windowing + FFT.
+        if _HAS_SCIPY_DETREND:
+            seg = _scipy_detrend(seg, axis=0, type="linear")
+        else:
+            # Vectorised fallback: subtract per-channel linear fit
+            t_c = np.arange(T_use, dtype=np.float64) - (T_use - 1) / 2.0
+            t_var = float((t_c ** 2).sum())
+            slopes = (t_c @ seg) / t_var          # (N,)
+            seg -= t_c[:, None] * slopes[None, :]  # remove slope
+            seg -= seg.mean(axis=0, keepdims=True)  # remove mean
         # Apply window: (T_use, N) * (T_use, 1)
         seg_w = seg * win[:, None]
         # FFT: shape (n_freqs, N)

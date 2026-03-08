@@ -203,21 +203,14 @@ lyapunov_spectrum:
   epsilon: 1.0e-6  # perturbation magnitude
   n_traj_sample: 3 # number of trajectories to average spectrum over
 
-# Energy constraint experiment (Step 16) — moderate cost: n_alpha × n_init rollouts
-# Experiment A (α scan): n_alpha=11 × n_init=5 × steps=200 = 11000 rollout(steps=1) calls.
-# Experiment B (dynamic E): n_init=5 × steps=300 = 1500 calls.
+# Energy constraint experiment (Step 16) — zero extra model calls
+# Analyses the energy distribution of the already-computed trajectories and
+# recommends E_budget values for re-running the pipeline with
+# --energy-budget X.  Does NOT run any additional simulations.
+#
+# Scientific rationale: the "correct" energy-constraint experiment is to run
+# the full pipeline with different --energy-budget values and compare LLE /
+# PCA across runs.  Scanning inside a single run would require n_alpha×n_init
+# extra rollouts and is therefore intentionally NOT implemented here.
 energy_constraint:
-  enabled: false        # set true to enable
-  # Experiment A: x(t+1) = α · F(x(t)) bifurcation scan
-  run_alpha_scan: true
-  alpha_min: 0.5
-  alpha_max: 1.5
-  alpha_step: 0.1
-  n_init: 5             # trajectories per alpha value
-  steps: 200            # steps per trajectory
-  warmup: 50            # discard first warmup steps
-  # Experiment B: dynamic energy E(t)
-  run_dynamic_energy: true
-  energy_alpha: 0.5     # energy supply rate
-  energy_beta: 0.5      # metabolic consumption coefficient
-  E_ref: 1.0            # energy reference (g=0.5 at E=E_ref)
+  enabled: false   # set true to characterise E* from the current trajectories

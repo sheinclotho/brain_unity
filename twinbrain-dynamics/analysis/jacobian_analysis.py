@@ -1,33 +1,47 @@
 """
-Jacobian Spectrum Analysis
-===========================
+Jacobian Spectrum Analysis — Dynamic Mode Decomposition (DMD)
+==============================================================
 
-在吸引子附近估计系统的 **数值 Jacobian** J = ∂F/∂x，并对其谱结构做完整分析：
+从自由动力学轨迹估计系统的线性化转移算子 A（DMD 算子），并对其谱结构做完整分析：
 
   1. 特征值分布（复平面散点图）
-  2. Slow modes：Re(λ) ≈ 0 的方向 → 系统在哪些方向上"几乎不收缩也不扩张"
-  3. Hopf 分岔检测：是否存在复共轭对 λ = a ± ib（ib 对应振荡频率）
+  2. Slow modes：|λ| ≈ 1 的方向 → 系统在哪些方向上"几乎不收缩也不扩张"
+  3. Hopf 分岔检测：是否存在复共轭对 λ = |r|e^{±iθ}（θ 对应振荡频率）
   4. 空间本征模：每个主要模态对应哪些脑区（特征向量的空间权重）
 
-方法：有限差分数值 Jacobian
----------------------------
-对吸引子状态 x*，沿每个方向 eᵢ 施加小扰动：
+为什么不用有限差分数值 Jacobian？（设计决策，AGENTS.md 记录）
+------------------------------------------------------------------
+TwinBrainDigitalTwin 使用上下文窗口（通常 200 步）的 Conv1d + 注意力机制编码器。
+`rollout(x0, steps=1)` 将 x0 注入上下文的**最后一步**，模型编码时对全部
+200 步做加权平均，单步扰动 ε=1e-4 被 199 步历史稀释：
 
-  J[:,i] ≈ (F(x* + ε·eᵢ) − F(x*)) / ε
+    f_fwd - f_bwd ≈ O(ε / context_length)
 
-其中 F 为 TwinBrainDigitalTwin 的一步预测 ``rollout(x0, steps=1)``。
-对 N=190 个方向共需 N+1 次模型调用（1 次基准 + N 次扰动）。
+在 float32 精度下（~1e-7 相对精度），对 context_length=200 的模型，ε=1e-4
+产生的输出差异 ≈ 5e-7，低于 float32 的机器精度 × 输出幅值，导致所有有限差分
+列为零 → J=0 → 谱半径 ρ=0（实测结果）。
 
-计算成本（每个吸引子状态）：
-  N+1 次 ``simulator.rollout(steps=1)`` 调用。
-  N=190 → 191 次调用/状态；推荐在 n_states=3–5 个吸引子状态上取平均。
+正确方法：Dynamic Mode Decomposition (DMD)
+------------------------------------------
+从自由动力学轨迹 {x(t), x(t+1)} 构建时序对，拟合最优线性转移算子：
+
+    A = argmin ‖X₁ − A X₀‖_F
+
+其中 X₀, X₁ 是从已有轨迹中提取的时序对矩阵（形状 M×N，M≫N）。
+A 的特征值正是系统的离散时间 DMD 模态。
+
+优势：
+  - 不需要任何额外模型调用（复用步骤 3 的轨迹）
+  - 绕过上下文稀释问题（直接从真实输出序列推断）
+  - 数值稳定：正规方程 + Tikhonov 正则化，避免过拟合
+  - 科学标准算法（Schmid 2010 JFM；Brunton & Kutz 2022 "Data-Driven Science"）
 
 输出文件
 --------
-  jacobian_eigenvalues.npy       — shape (n_states, N), 复数特征值（均值谱）
-  jacobian_report.json           — 所有数值指标
-  jacobian_complex_plane.png     — 复平面特征值散点图
-  jacobian_slow_modes.png        — 慢模态空间权重（脑区 × 模态热图）
+  jacobian_dmd.npy             — shape (N, N)，DMD 算子 A
+  jacobian_eigenvalues.npy     — shape (N,)，复数特征值
+  jacobian_report.json         — 所有数值指标
+  jacobian_spectrum.png        — 复平面特征值图 + 慢模态空间权重热图
 """
 
 from __future__ import annotations
@@ -41,85 +55,103 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# 慢模态阈值：|Re(λ)| < this → slow mode
+# 慢模态阈值：|Re(λ_ct)| < this → slow mode（连续时间，1/s 单位）
 _SLOW_MODE_RE_THRESH: float = 0.05
-# Hopf 检测：振荡频率 Im(λ)/(2π) 的最小阈值（nats/step）
+# Hopf 检测：振荡频率 Im(λ_ct)/(2π) 的最小阈值（Hz）
 _HOPF_IM_THRESH: float = 0.01
 # 显示的顶部空间模态数量
 _N_TOP_MODES: int = 6
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Core: numerical Jacobian estimation
+# Core: DMD-based transition operator estimation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def estimate_jacobian_at_point(
-    simulator,
-    x_star: np.ndarray,
-    epsilon: float = 1e-4,
+def estimate_jacobian_dmd(
+    trajectories: np.ndarray,
+    burnin: int = 0,
+    reg_alpha: float = 1e-6,
 ) -> np.ndarray:
     """
-    在给定状态 x* 处用中心差分估计单步 Jacobian J = ∂F/∂x。
+    从自由动力学轨迹用 DMD 估计最优线性转移算子 A（= 经验 Jacobian）。
 
-    J[:, i] ≈ (F(x* + ε·eᵢ) − F(x* − ε·eᵢ)) / (2ε)
+    对所有轨迹中的连续时间步对 (x(t), x(t+1)) 求解 Tikhonov 正则化最小二乘：
 
-    中心差分比前向差分精度高一阶（O(ε²) 而非 O(ε)），在 ε=1e-4 时足以
-    区分局部展开与收缩方向。
+        A = argmin ‖X₁ − A X₀‖_F + α ‖A‖_F
+
+    其中：
+        X₀: 所有时步 t   的状态，形状 (M, N)
+        X₁: 所有时步 t+1 的状态，形状 (M, N)
+        M = n_traj × (T − burnin − 1)
+
+    正规方程求解（数值稳定，不需要 SVD 截断）：
+
+        (X₀ᵀX₀ + αI) Aᵀ = X₀ᵀX₁
+        A = solve(...).T
 
     Args:
-        simulator: BrainDynamicsSimulator 实例（TwinBrainDigitalTwin 模式）。
-        x_star:    吸引子状态，shape (N,)。
-        epsilon:   扰动幅度（推荐 1e-4 ~ 1e-3 以平衡精度和数值稳定性）。
+        trajectories: shape (n_traj, T, N)。
+        burnin:       每条轨迹跳过的初始步数（去除瞬态）。
+        reg_alpha:    Tikhonov 正则化系数（相对于 trace(X₀ᵀX₀)/N）。
+                      默认 1e-6，在 M≫N 时几乎不改变结果。
 
     Returns:
-        J: shape (N, N)，float64 Jacobian 矩阵。
-           J[j, i] = ∂F_j / ∂x_i。
+        A: shape (N, N)，float64，DMD 转移矩阵。
+           A[j, i] = 状态 i 对状态 j 的下一步贡献权重。
     """
-    N = len(x_star)
-    _bounds = getattr(simulator, "state_bounds", (0.0, 1.0))
+    n_traj, T, N = trajectories.shape
+    T_eff = T - burnin
+    if T_eff < 3:
+        raise ValueError(
+            f"burnin={burnin} 后有效步数 T_eff={T_eff} < 3，"
+            "无法构建时序对矩阵（至少需要 2 个 (x_t, x_{t+1}) 对，即 T_eff ≥ 3）。"
+            " 请减小 burnin 或增加 steps。"
+        )
 
-    # Baseline F(x*)
-    traj_base, _ = simulator.rollout(
-        x0=x_star.astype(np.float32), steps=1
+    # Collect consecutive-step pairs from all trajectories
+    X0_list: List[np.ndarray] = []
+    X1_list: List[np.ndarray] = []
+    for k in range(n_traj):
+        seg = trajectories[k, burnin:, :].astype(np.float64)  # (T_eff, N)
+        X0_list.append(seg[:-1])   # (T_eff-1, N)
+        X1_list.append(seg[1:])    # (T_eff-1, N)
+
+    X0 = np.vstack(X0_list)  # (M, N)
+    X1 = np.vstack(X1_list)  # (M, N)
+    M = X0.shape[0]
+
+    logger.info(
+        "DMD 转移算子估计: M=%d 时步对, N=%d 维, burnin=%d",
+        M, N, burnin,
     )
-    f_base = traj_base[0].astype(np.float64)  # (N,)
 
-    J = np.zeros((N, N), dtype=np.float64)
-
-    for i in range(N):
-        # Forward perturbation
-        x_fwd = x_star.copy().astype(np.float64)
-        x_fwd[i] += epsilon
-        if _bounds is not None:
-            x_fwd = np.clip(x_fwd, _bounds[0], _bounds[1])
-
-        # Backward perturbation
-        x_bwd = x_star.copy().astype(np.float64)
-        x_bwd[i] -= epsilon
-        if _bounds is not None:
-            x_bwd = np.clip(x_bwd, _bounds[0], _bounds[1])
-
-        traj_fwd, _ = simulator.rollout(
-            x0=x_fwd.astype(np.float32), steps=1
-        )
-        traj_bwd, _ = simulator.rollout(
-            x0=x_bwd.astype(np.float32), steps=1
+    # Normal equations: (X0.T @ X0 + alpha*I) @ A.T = X0.T @ X1
+    XTX = X0.T @ X0                       # (N, N)
+    XTY = X0.T @ X1                       # (N, N)
+    alpha = float(np.trace(XTX)) / N * reg_alpha
+    try:
+        A_T = np.linalg.solve(XTX + alpha * np.eye(N), XTY)   # (N, N)
+    except np.linalg.LinAlgError:
+        logger.warning("DMD: np.linalg.solve 失败，改用 lstsq（可能存在奇异性）。")
+        A_T, _, _, _ = np.linalg.lstsq(
+            XTX + alpha * np.eye(N), XTY, rcond=None
         )
 
-        f_fwd = traj_fwd[0].astype(np.float64)
-        f_bwd = traj_bwd[0].astype(np.float64)
+    A = A_T.T   # (N, N), convention: x1 = A @ x0
+    return A
 
-        # Effective step using signed difference (avoids masking asymmetric clipping).
-        # When both fwd and bwd are clipped the same way, the sign is preserved and
-        # the Jacobian estimate degrades gracefully rather than silently dividing by
-        # the wrong magnitude.
-        h = float(x_fwd[i] - x_bwd[i])
-        if abs(h) < 1e-30:
-            # Both clipped to the same boundary; skip this column
-            continue
-        J[:, i] = (f_fwd - f_bwd) / h
 
-    return J
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON serialisation helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _to_json_serialisable(v):
+    """Convert numpy arrays (real or complex) to JSON-serialisable types."""
+    if isinstance(v, np.ndarray):
+        if np.iscomplexobj(v):
+            return {"real": v.real.tolist(), "imag": v.imag.tolist()}
+        return v.tolist()
+    return v
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,69 +279,60 @@ def run_jacobian_analysis(
     output_dir: Optional[Path] = None,
 ) -> Dict:
     """
-    在多个吸引子状态上估计 Jacobian 并做谱分析。
+    用 DMD（Dynamic Mode Decomposition）从自由动力学轨迹估计线性化转移算子，
+    并对其谱结构做完整分析。
 
     流程：
-      1. 从 ``trajectories`` 末尾 ``tail_steps`` 步提取吸引子状态（均值）。
-      2. 随机选 ``n_states`` 个状态，每个状态估计数值 Jacobian。
-      3. 对所有 Jacobian 取均值，做完整谱分析。
+      1. 计算 burnin = tail_steps（跳过每条轨迹的初始瞬态）。
+      2. 从所有轨迹的 burnin 之后部分构建时序对矩阵 (X0, X1)。
+      3. Tikhonov 正则化最小二乘拟合转移算子 A（= DMD 算子）。
+      4. 对 A 做完整谱分析（特征值、慢模态、Hopf 对、空间模态）。
 
-    计算成本：n_states × (2N+1) 次 simulator.rollout(steps=1) 调用。
-    N=190, n_states=3 → 1143 次调用（约 2–5 分钟 CPU）。
+    注意：此函数不再调用 simulator.rollout()（零额外模型调用）。
+    ``n_states`` 和 ``epsilon`` 参数保留但不使用，仅为向后兼容。
 
     Args:
-        simulator:   BrainDynamicsSimulator 实例。
+        simulator:    BrainDynamicsSimulator 实例（仅用于读取 dt）。
         trajectories: shape (n_traj, T, N)。
-        tail_steps:  从末尾取多少步均值作为吸引子状态（默认 20）。
-        n_states:    评估 Jacobian 的吸引子状态数量（默认 3）。
-        epsilon:     有限差分步长（默认 1e-4）。
-        seed:        随机种子。
-        output_dir:  结果保存目录；None → 不保存。
+        tail_steps:   用作 burnin 的步数（跳过初始瞬态）。
+        n_states:     保留参数（兼容旧配置），不再使用。
+        epsilon:      保留参数（兼容旧配置），不再使用。
+        seed:         保留参数（兼容旧配置），不再使用。
+        output_dir:   结果保存目录；None → 不保存。
 
     Returns:
         dict 包含 Jacobian 谱分析结果（同 analyze_jacobian_spectrum）
-        加上 mean_J（均值 Jacobian）。
+        加上 dmd_A（DMD 算子矩阵）和 method="dmd"。
     """
     n_traj, T, N = trajectories.shape
-    rng = np.random.default_rng(seed)
+    burnin = max(0, min(tail_steps, T // 2))
 
-    # Extract attractor states from trajectory tails
-    tail = trajectories[:, -tail_steps:, :].mean(axis=1)   # (n_traj, N)
-    sample_idx = rng.choice(n_traj, size=min(n_states, n_traj), replace=False)
-
-    J_list: List[np.ndarray] = []
-    for i, idx in enumerate(sample_idx):
-        x_star = tail[idx].astype(np.float64)
-        logger.info("Jacobian 估计: 状态 %d/%d (traj=%d)", i + 1, len(sample_idx), idx)
-        try:
-            J_i = estimate_jacobian_at_point(simulator, x_star, epsilon=epsilon)
-            J_list.append(J_i)
-        except Exception as exc:
-            logger.warning("  状态 %d Jacobian 估计失败: %s", idx, exc)
-
-    if not J_list:
-        raise RuntimeError("所有吸引子状态的 Jacobian 估计均失败。")
-
-    mean_J = np.mean(np.stack(J_list, axis=0), axis=0)   # (N, N)
+    dmd_A = estimate_jacobian_dmd(trajectories, burnin=burnin)
 
     dt = getattr(simulator, "dt", 1.0)
-    spec_result = analyze_jacobian_spectrum(mean_J, dt=dt)
-    spec_result["mean_J"] = mean_J
-    spec_result["n_states_used"] = len(J_list)
+    spec_result = analyze_jacobian_spectrum(dmd_A, dt=dt)
+    spec_result["dmd_A"] = dmd_A
+    spec_result["mean_J"] = dmd_A        # backward-compatible alias
+    spec_result["n_states_used"] = n_traj
+    spec_result["method"] = "dmd"
+    spec_result["burnin_used"] = burnin
 
     if output_dir is not None:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
-        np.save(out / "jacobian_mean.npy", mean_J)
+        np.save(out / "jacobian_dmd.npy", dmd_A)
         np.save(out / "jacobian_eigenvalues.npy",
                 spec_result["eigenvalues"])
 
-        # JSON-serialisable report (no arrays)
+        # JSON-serialisable report (no arrays).
+        # Complex arrays (eigenvalues, eigenvalues_ct) must be split into
+        # separate real and imaginary lists; json.dump does not handle Python
+        # complex objects.
         report = {
-            k: (v.tolist() if isinstance(v, np.ndarray) else v)
+            k: _to_json_serialisable(v)
             for k, v in spec_result.items()
-            if k not in ("eigenvectors", "mean_J", "top_mode_weights")
+            if k not in ("eigenvectors", "dmd_A", "mean_J", "top_mode_weights")
         }
         report["dt"] = dt
         with open(out / "jacobian_report.json", "w", encoding="utf-8") as fh:

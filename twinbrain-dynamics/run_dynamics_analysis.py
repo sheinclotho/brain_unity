@@ -718,57 +718,34 @@ def _run_single_modality(
     ec_cfg = cfg.get("energy_constraint", {})
     if ec_cfg.get("enabled", False):   # disabled by default (n_alpha × n_init rollouts)
         try:
-            from experiments.energy_constraint import (
-                run_energy_constraint_scan,
-                run_dynamic_energy_experiment,
+            from experiments.energy_constraint import run_energy_budget_analysis
+            ec_budget_result = run_energy_budget_analysis(
+                trajectories=trajectories,
+                state_bounds=simulator.state_bounds,
+                output_dir=output_dir if cfg["output"].get("save_plots") else None,
             )
-            ec_results: dict = {}
-
-            # Experiment A: α scan
-            if ec_cfg.get("run_alpha_scan", True):
-                ec_scan = run_energy_constraint_scan(
-                    simulator=simulator,
-                    alpha_min=ec_cfg.get("alpha_min", 0.5),
-                    alpha_max=ec_cfg.get("alpha_max", 1.5),
-                    alpha_step=ec_cfg.get("alpha_step", 0.1),
-                    n_init=ec_cfg.get("n_init", 5),
-                    steps=ec_cfg.get("steps", 200),
-                    warmup=ec_cfg.get("warmup", 50),
-                    seed=ec_cfg.get("seed", fd_cfg.get("seed", 42)),
-                    output_dir=output_dir if cfg["output"].get("save_plots") else None,
-                )
-                ec_results["alpha_scan"] = ec_scan
-                logger.info(
-                    "  能量 α 扫描: critical_α=%.2f, bifurcation=%s",
-                    ec_scan["critical_alpha"], ec_scan["bifurcation_found"],
-                )
-
-            # Experiment B: dynamic energy variable
-            if ec_cfg.get("run_dynamic_energy", True):
-                ec_dynamic = run_dynamic_energy_experiment(
-                    simulator=simulator,
-                    alpha=ec_cfg.get("energy_alpha", 0.5),
-                    beta=ec_cfg.get("energy_beta", 0.5),
-                    E_ref=ec_cfg.get("E_ref", 1.0),
-                    steps=ec_cfg.get("steps", 300),
-                    n_init=ec_cfg.get("n_init", 5),
-                    seed=ec_cfg.get("seed", fd_cfg.get("seed", 42)),
-                    output_dir=output_dir if cfg["output"].get("save_plots") else None,
-                )
-                ec_results["dynamic_energy"] = ec_dynamic
-                logger.info(
-                    "  动态能量: E_稳态=%.4f±%.4f, 稳态=%s",
-                    ec_dynamic["E_mean"], ec_dynamic["E_std"],
-                    ec_dynamic["homeostasis_achieved"],
-                )
-
-            results["energy_constraint"] = ec_results
+            results["energy_budget"] = ec_budget_result
+            logger.info(
+                "  能量预算: E*=%.4f ± %.4f，建议: "
+                "紧约束=%.4f / 中等约束=%.4f / 自然=%.4f",
+                ec_budget_result["E_mean"],
+                ec_budget_result["E_std"],
+                ec_budget_result["recommended_budgets"]["tight_constraint"],
+                ec_budget_result["recommended_budgets"]["moderate_constraint"],
+                ec_budget_result["recommended_budgets"]["natural"],
+            )
+            logger.info(
+                "  用法: python run_dynamics_analysis.py "
+                "--energy-budget %.4f（中等约束）可重新运行带约束的完整分析。",
+                ec_budget_result["recommended_budgets"]["moderate_constraint"],
+            )
         except Exception as exc:
             logger.warning("  能量约束实验失败 (%s)，跳过。", exc)
     else:
         logger.info(
             "  能量约束实验已禁用。\n"
-            "  启用方式：在配置中设置 energy_constraint.enabled: true。"
+            "  启用方式：在配置中设置 energy_constraint.enabled: true\n"
+            "  或使用 --energy-budget X 直接约束当前运行。"
         )
 
     # ── Visualisations ────────────────────────────────────────────────────────
