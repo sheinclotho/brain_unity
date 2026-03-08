@@ -1393,3 +1393,332 @@ def run_lyapunov_analysis(
         logger.info("  → 已保存: %s/lyapunov_report.json", output_dir)
 
     return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Lyapunov Spectrum (all exponents) + Kaplan–Yorke Dimension
+# ══════════════════════════════════════════════════════════════════════════════
+
+def kaplan_yorke_dimension(spectrum: np.ndarray) -> float:
+    """
+    从有序 Lyapunov 谱（降序）计算 Kaplan–Yorke（Lyapunov）维度。
+
+      D_KY = j + (Σᵢ₌₁ʲ λᵢ) / |λ_{j+1}|
+
+    其中 j 是使前 j 个指数之和 ≥ 0 的最大整数（降序排列）。
+
+    物理含义：
+    - D_KY = 0          → 固定点（所有 λ < 0）
+    - 1 ≤ D_KY < 2      → 极限环（λ₁ ≈ 0）
+    - D_KY >> 1         → 奇异吸引子 / 混沌
+
+    Args:
+        spectrum: 降序排列的 Lyapunov 指数数组（nats/step 或 1/s 均可，
+                  只要单位一致）。
+
+    Returns:
+        D_KY: Kaplan–Yorke 维度（float）。若谱为空返回 0.0。
+    """
+    spectrum = np.asarray(spectrum, dtype=np.float64)
+    spectrum = np.sort(spectrum)[::-1]   # ensure descending
+    N = len(spectrum)
+    if N == 0 or spectrum[0] < 0.0:
+        return 0.0
+
+    cumsum = np.cumsum(spectrum)
+    # j = number of terms for which cumsum is still non-negative
+    j = int(np.sum(cumsum >= 0.0))
+    if j >= N:
+        return float(N)          # conservative / Hamiltonian system
+    if j == 0:
+        return 0.0
+
+    lam_next = float(spectrum[j])
+    if abs(lam_next) < 1e-20:
+        return float(j)
+
+    return float(j) + float(cumsum[j - 1]) / abs(lam_next)
+
+
+def lyapunov_spectrum_wolf(
+    simulator,
+    trajectory: np.ndarray,
+    n_exponents: int = 10,
+    renorm_steps: int = 50,
+    epsilon: float = 1e-6,
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    用 Gram-Schmidt 正交化的 Wolf-Benettin 方法计算前 k 个 Lyapunov 指数。
+
+    原理
+    ----
+    维护 k 个正交扰动向量 Q[:, i]，每个重归一化周期：
+      1. 对每个扰动向量 eᵢ 运行 ``simulator.rollout``（使用当前轨迹状态作为
+         基准），估计 J·eᵢ ≈ (x(t+τ|x₀+ε·eᵢ) − x(t+τ|x₀)) / ε。
+      2. 对更新后的扰动向量矩阵做 QR 分解（Gram-Schmidt 等价）。
+      3. 累积 log|Rᵢᵢ|（对角元的对数 = 第 i 个方向的增长率）。
+    最终：λᵢ = Σ log|Rᵢᵢ| / (n_valid_periods × renorm_steps)
+
+    计算成本（每次 ``predict_future`` 调用 = 1 次）：
+      k × n_periods 次额外调用，外加 1 次基准轨迹调用/周期。
+      n_periods = (len(trajectory) − 1) // renorm_steps
+      例：k=10, T=1000, renorm_steps=50 → 10 × 20 = 200 次额外调用。
+
+    Args:
+        simulator:    ``BrainDynamicsSimulator`` 实例（TwinBrainDigitalTwin 模式）。
+        trajectory:   预计算基准轨迹，shape (T, N)，用于提供基准状态 x(t)。
+                      注意：此函数会在轨迹各采样点重新运行 rollout 获取 x(t+τ)，
+                      而不是直接使用 trajectory[t+τ]——这是为了同时演化扰动轨迹。
+        n_exponents:  要计算的指数数量 k（默认 10；最大 n_regions）。
+        renorm_steps: 每个 Wolf 周期的步数（默认 50）。
+        epsilon:      扰动幅度（默认 1e-6）。
+        seed:         随机种子，用于初始正交扰动矩阵。
+
+    Returns:
+        spectrum: shape (k,)，降序排列的 Lyapunov 指数（nats/step）。
+                  若可用周期数不足，返回全 NaN。
+    """
+    T, N = trajectory.shape
+    k = min(n_exponents, N)
+    _bounds = getattr(simulator, "state_bounds", (0.0, 1.0))
+
+    rng = np.random.default_rng(seed)
+
+    # Initialise k orthonormal perturbation vectors via QR decomposition
+    Q_raw = rng.standard_normal((N, k)).astype(np.float64)
+    Q, _ = np.linalg.qr(Q_raw)     # Q: (N, k), orthonormal columns
+
+    log_sum = np.zeros(k, dtype=np.float64)
+    n_periods = 0
+
+    t = 0
+    while t + renorm_steps < T:
+        x_base = trajectory[t].astype(np.float64)
+
+        # Baseline: run renorm_steps from x_base
+        traj_base, _ = simulator.rollout(
+            x0=x_base.astype(np.float32), steps=renorm_steps
+        )
+        x_base_end = traj_base[-1].astype(np.float64)
+
+        # Evolved perturbation vectors
+        evolved = np.zeros((N, k), dtype=np.float64)
+        for i in range(k):
+            x_pert_raw = (x_base + epsilon * Q[:, i]).astype(np.float32)
+            if _bounds is not None:
+                x_pert_raw = np.clip(x_pert_raw, _bounds[0], _bounds[1])
+            # Actual applied perturbation (may be clipped near boundary)
+            eps_actual = float(np.linalg.norm(
+                x_pert_raw.astype(np.float64) - x_base
+            )) + 1e-30
+
+            traj_pert, _ = simulator.rollout(
+                x0=x_pert_raw, steps=renorm_steps
+            )
+            x_pert_end = traj_pert[-1].astype(np.float64)
+            delta = (x_pert_end - x_base_end) / eps_actual
+            evolved[:, i] = delta
+
+        # Gram-Schmidt via thin QR: Q_new columns = normalised orthogonal basis
+        Q_new, R = np.linalg.qr(evolved)
+
+        # log|Rᵢᵢ| = log growth of i-th direction
+        r_diag = np.abs(np.diag(R))
+        r_diag = np.maximum(r_diag, 1e-30)
+        log_sum += np.log(r_diag)
+
+        Q = Q_new
+        n_periods += 1
+        t += renorm_steps
+
+    if n_periods < 1:
+        logger.warning("Lyapunov 谱：可用周期数不足（T=%d, renorm_steps=%d），返回 NaN。",
+                       T, renorm_steps)
+        return np.full(k, float("nan"))
+
+    spectrum = log_sum / (n_periods * renorm_steps)   # nats / step, descending
+    # Sort descending (QR preserves rough ordering but not guaranteed)
+    spectrum = np.sort(spectrum)[::-1]
+
+    logger.info(
+        "Lyapunov 谱（Wolf-GS）: k=%d, periods=%d, "
+        "λ₁=%.5f, λₖ=%.5f, D_KY=%.2f",
+        k, n_periods, float(spectrum[0]), float(spectrum[-1]),
+        kaplan_yorke_dimension(spectrum),
+    )
+    return spectrum
+
+
+def run_lyapunov_spectrum_analysis(
+    trajectories: np.ndarray,
+    simulator,
+    n_exponents: int = 10,
+    renorm_steps: int = 50,
+    epsilon: float = 1e-6,
+    seed: int = 42,
+    n_traj_sample: int = 5,
+    output_dir: Optional[Path] = None,
+) -> Dict:
+    """
+    在多条轨迹上估计 Lyapunov 谱并计算 Kaplan–Yorke 维度。
+
+    从 ``trajectories`` 中随机抽取 ``n_traj_sample`` 条轨迹，对每条调用
+    ``lyapunov_spectrum_wolf``，然后对谱取均值，计算 D_KY。
+
+    计算成本提示：
+      每条轨迹 k × (T // renorm_steps) 次额外模型调用。
+      建议仅在 ``n_traj_sample=3–5`` 时使用，避免过长运行时间。
+
+    Args:
+        trajectories:    shape (n_traj, T, N)。
+        simulator:       ``BrainDynamicsSimulator`` 实例。
+        n_exponents:     要估计的 Lyapunov 指数数量（默认 10）。
+        renorm_steps:    Wolf 周期步数（默认 50）。
+        epsilon:         扰动幅度（默认 1e-6）。
+        seed:            随机种子。
+        n_traj_sample:   从 trajectories 中随机采样的轨迹数（默认 5）。
+        output_dir:      结果保存目录；None → 不保存。
+
+    Returns:
+        dict 包含:
+          mean_spectrum       : np.ndarray (k,)，多轨迹平均谱（降序）
+          all_spectra         : np.ndarray (n_traj_sample, k)，各轨迹谱
+          kaplan_yorke_dim    : float，D_KY（基于均值谱）
+          lambda1             : float，最大 Lyapunov 指数
+          n_positive          : int，λ > 0.01 的数量
+          sum_positive        : float，正指数之和（KS 熵估计）
+          classification      : str，动力学分类（与 classify_chaos_regime 一致）
+    """
+    n_traj, T, N = trajectories.shape
+    k = min(n_exponents, N)
+    rng = np.random.default_rng(seed)
+
+    # Sample trajectories to compute spectrum for
+    sample_idx = rng.choice(n_traj, size=min(n_traj_sample, n_traj), replace=False)
+    all_spectra: List[np.ndarray] = []
+
+    for i, idx in enumerate(sample_idx):
+        logger.info("Lyapunov 谱分析: 轨迹 %d/%d (traj_idx=%d)",
+                    i + 1, len(sample_idx), idx)
+        try:
+            spec = lyapunov_spectrum_wolf(
+                simulator=simulator,
+                trajectory=trajectories[idx],
+                n_exponents=k,
+                renorm_steps=renorm_steps,
+                epsilon=epsilon,
+                seed=seed + i,
+            )
+            if np.any(np.isfinite(spec)):
+                all_spectra.append(spec)
+        except Exception as exc:
+            logger.warning("  轨迹 %d 谱估计失败: %s", idx, exc)
+
+    if not all_spectra:
+        raise RuntimeError("所有轨迹的 Lyapunov 谱估计均失败。")
+
+    spectra_arr = np.vstack(all_spectra)             # (n_valid, k)
+    # Average spectrum (NaN-safe)
+    mean_spec = np.nanmean(spectra_arr, axis=0)      # (k,)
+    mean_spec = np.sort(mean_spec)[::-1]             # ensure descending
+
+    dky = kaplan_yorke_dimension(mean_spec)
+    l1 = float(mean_spec[0])
+    ks_entropy = float(mean_spec[mean_spec > 0].sum())
+    n_pos = int((mean_spec > 0.01).sum())
+
+    chaos_info = classify_chaos_regime(l1)
+    classification = chaos_info["regime"]
+
+    result: Dict = {
+        "mean_spectrum": mean_spec,
+        "all_spectra": spectra_arr,
+        "kaplan_yorke_dim": round(dky, 4),
+        "lambda1": round(l1, 6),
+        "n_positive": n_pos,
+        "sum_positive": round(ks_entropy, 6),
+        "classification": classification,
+        "n_traj_used": len(all_spectra),
+    }
+
+    if output_dir is not None:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        np.save(out / "lyapunov_spectrum.npy", mean_spec)
+        np.save(out / "lyapunov_spectra_all.npy", spectra_arr)
+
+        json_result = {k2: (v.tolist() if isinstance(v, np.ndarray) else v)
+                       for k2, v in result.items()}
+        with open(out / "lyapunov_spectrum_report.json", "w", encoding="utf-8") as fh:
+            json.dump(json_result, fh, indent=2, ensure_ascii=False)
+
+        logger.info("  → 保存 Lyapunov 谱: %s/lyapunov_spectrum_report.json", out)
+        _try_plot_spectrum(mean_spec, spectra_arr, dky, out / "lyapunov_spectrum.png")
+
+    return result
+
+
+def _try_plot_spectrum(
+    mean_spec: np.ndarray,
+    all_spectra: np.ndarray,
+    dky: float,
+    output_path: Path,
+) -> None:
+    """绘制 Lyapunov 谱排名图（含逐轨迹谱 + 均值谱 + 累积和 + D_KY 标注）。"""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    k = len(mean_spec)
+    ranks = np.arange(1, k + 1)
+    cumsum = np.cumsum(mean_spec)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Left: spectrum bars with per-trajectory shading
+    ax = axes[0]
+    # Per-trajectory lines (light, behind)
+    for spec in all_spectra:
+        spec_s = np.sort(spec)[::-1]
+        ax.plot(ranks, spec_s, color="gray", alpha=0.25, linewidth=0.8)
+    # Mean spectrum bars
+    pos_mask = mean_spec > 0
+    ax.bar(ranks[pos_mask], mean_spec[pos_mask], color="tomato", alpha=0.8,
+           label="λ > 0 (expanding)")
+    ax.bar(ranks[~pos_mask], mean_spec[~pos_mask], color="steelblue", alpha=0.8,
+           label="λ ≤ 0 (contracting)")
+    ax.axhline(0, color="black", lw=0.8, ls="--")
+    ax.set_xlabel("Rank  i")
+    ax.set_ylabel("λᵢ  (nats / step)")
+    ax.set_title(f"Lyapunov Spectrum  [k={k}]\n"
+                 f"λ₁={float(mean_spec[0]):.4f}  D_KY={dky:.2f}")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.25)
+
+    # Right: cumulative sum with D_KY annotation
+    ax2 = axes[1]
+    ax2.plot(ranks, cumsum, "k-o", ms=3, lw=1.5)
+    ax2.axhline(0, color="red", lw=0.8, ls="--", label="Σλ = 0")
+    ax2.fill_between(ranks, cumsum, 0, where=(cumsum >= 0),
+                     alpha=0.15, color="tomato")
+    ax2.fill_between(ranks, cumsum, 0, where=(cumsum < 0),
+                     alpha=0.15, color="steelblue")
+    # Mark D_KY on x-axis
+    if 0 < dky <= k:
+        ax2.axvline(dky, color="purple", lw=1.2, ls=":",
+                    label=f"D_KY = {dky:.2f}")
+    ax2.set_xlabel("Rank  i")
+    ax2.set_ylabel("Σᵢ₌₁ⁱ λ")
+    ax2.set_title("Cumulative Lyapunov Sum\n"
+                  "D_KY = where cumsum crosses zero")
+    ax2.legend(fontsize=8)
+    ax2.grid(True, alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("  → 保存谱图: %s", output_path)

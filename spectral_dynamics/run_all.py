@@ -101,12 +101,18 @@ from .a_connectivity_visualization import run_connectivity_visualization
 from .c_community_structure import run_community_structure
 from .d_hierarchical_structure import run_hierarchical_structure
 from .f_pca_attractor import run_pca_attractor
+# New analyses (B_LYA, H, I)
+from .b_lyapunov_spectrum import run_lyapunov_spectrum
+from .h_power_spectrum import run_power_spectrum
+from .i_energy_constraint import run_energy_constraint_wc
 
-_ALL_EXPERIMENTS = ["A", "B_E1", "C", "D", "E2E3", "E4", "E5", "E6", "F"]
+_ALL_EXPERIMENTS = ["A", "B_E1", "C", "D", "E2E3", "E4", "E5", "E6", "F",
+                    "B_LYA", "H", "I"]
 # Aliases so old E1/B keys still work
 _EXPERIMENT_ALIASES: dict = {
-    "E1": "B_E1",
-    "B":  "B_E1",
+    "E1":   "B_E1",
+    "B":    "B_E1",
+    "LYA":  "B_LYA",
 }
 
 
@@ -420,6 +426,106 @@ def run_all(
     elif "F" in experiments:
         logger.warning("F 跳过：未提供轨迹数据。")
 
+    # ── B_LYA: Lyapunov spectrum + Kaplan-Yorke dimension ────────────────────
+    if "B_LYA" in experiments and trajectories is not None:
+        t0 = time.time()
+        logger.info("═══ B_LYA: Lyapunov 谱 + Kaplan–Yorke 维度 ═══")
+        try:
+            rLYA = run_lyapunov_spectrum(
+                trajectories, dt=1.0, burnin=burnin,
+                output_dir=output_dir, label=W_label,
+            )
+            run_summary["results"]["B_LYA"] = {
+                k: (v.tolist() if hasattr(v, "tolist") else v)
+                for k, v in rLYA.items()
+            }
+            run_summary["hypotheses"].setdefault(
+                "H2_low_dimensional_dynamics", {}
+            ).update({
+                "kaplan_yorke_dim": rLYA["kaplan_yorke_dim"],
+                "lambda1": rLYA["lambda1"],
+                "n_positive_exponents": rLYA["n_positive"],
+                "lya_classification": rLYA["classification"],
+            })
+            logger.info(
+                "B_LYA 完成 (%.1fs): λ₁=%.4f, D_KY=%.2f, 分类=[%s]",
+                time.time() - t0, rLYA["lambda1"],
+                rLYA["kaplan_yorke_dim"], rLYA["classification"],
+            )
+        except Exception as exc:
+            logger.warning("B_LYA 失败: %s", exc)
+    elif "B_LYA" in experiments:
+        logger.warning("B_LYA 跳过：未提供轨迹数据。")
+
+    # ── H: Power spectrum + spatial oscillation modes ─────────────────────────
+    if "H" in experiments and trajectories is not None:
+        t0 = time.time()
+        logger.info("═══ H: 功率谱 + 空间振荡模态 ═══")
+        try:
+            rH = run_power_spectrum(
+                trajectories, dt=1.0, burnin=burnin,
+                output_dir=output_dir, label=W_label,
+            )
+            band_info = rH.get("band_analysis", {})
+            run_summary["results"]["H"] = {
+                "dominant_freq_hz": band_info.get("dominant_freq_hz"),
+                "dominant_freq_band": band_info.get("dominant_freq_band"),
+                "band_power_fractions": band_info.get("band_power_fractions"),
+                "nyquist_hz": band_info.get("nyquist_hz"),
+                "peak_region_per_band": rH.get("spatial_modes", {}).get(
+                    "peak_region_per_band", {}
+                ),
+            }
+            run_summary["hypotheses"].setdefault(
+                "H4_neural_oscillations", {}
+            ).update({
+                "dominant_freq_hz": band_info.get("dominant_freq_hz"),
+                "dominant_band": band_info.get("dominant_freq_band"),
+                "band_fractions": band_info.get("band_power_fractions", {}),
+            })
+            logger.info(
+                "H 完成 (%.1fs): dominant_freq=%.4f Hz [%s]",
+                time.time() - t0,
+                band_info.get("dominant_freq_hz", 0),
+                band_info.get("dominant_freq_band", "?"),
+            )
+        except Exception as exc:
+            logger.warning("H 失败: %s", exc)
+    elif "H" in experiments:
+        logger.warning("H 跳过：未提供轨迹数据。")
+
+    # ── I: Energy constraint experiment ───────────────────────────────────────
+    if "I" in experiments and W_main is not None:
+        t0 = time.time()
+        logger.info("═══ I: 能量约束实验（L1 投影 vs 无约束对比）═══")
+        try:
+            rI = run_energy_constraint_wc(
+                W_main,
+                E_budget_values=[None, 0.5, 0.35, 0.20],
+                n_traj=10, steps=200, warmup=50,
+                seed=seed, output_dir=output_dir, label=W_label,
+            )
+            run_summary["results"]["I"] = rI
+            run_summary["hypotheses"].setdefault(
+                "H5_energy_constraint_criticality", {}
+            ).update({
+                "hypothesis_supported": rI["hypothesis_supported"],
+                "E_star": rI.get("E_star"),
+                "rho_W": rI.get("rho_W"),
+                "h5_supported": rI["hypothesis_supported"],
+                "bifurcation_found": rI["hypothesis_supported"],
+            })
+            logger.info(
+                "I 完成 (%.1fs): hypothesis_supported=%s, E*=%.4f",
+                time.time() - t0,
+                rI["hypothesis_supported"],
+                rI.get("E_star") or float("nan"),
+            )
+        except Exception as exc:
+            logger.warning("I 失败: %s", exc)
+    elif "I" in experiments:
+        logger.warning("I 跳过：未提供连接矩阵 W_main。")
+
     # ── Save summary ──────────────────────────────────────────────────────────
     summary_path = output_dir / "run_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -503,7 +609,7 @@ def _parse_args() -> argparse.Namespace:
     exp = p.add_argument_group("实验选择")
     exp.add_argument("--experiments", nargs="*", default=None,
                      choices=_ALL_EXPERIMENTS + [e.lower() for e in _ALL_EXPERIMENTS]
-                             + ["E1", "B", "e1", "b"],
+                             + ["E1", "B", "e1", "b", "LYA", "lya"],
                      help="指定要运行的实验子集；不指定则全部运行")
 
     perf = p.add_argument_group("性能参数")

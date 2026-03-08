@@ -142,3 +142,47 @@ output:
   save_response_matrix: true
   save_stability_metrics: true
   save_plots: true
+
+# Power spectrum analysis (Step 13)
+power_spectrum:
+  enabled: true
+  burnin: 10       # skip first N steps of each trajectory (transient)
+
+# Jacobian spectrum analysis (Step 14) — EXPENSIVE: 2N+1 model calls per attractor state
+# Enable only after confirming the system is near an attractor (step 7 shows "limit_cycle"
+# or "fixed_point"). Runtime: ~N×n_states rollout(steps=1) calls = ~570 calls for N=190, n_states=3.
+jacobian_analysis:
+  enabled: false   # set true to enable
+  tail_steps: 20   # attractor states from final tail_steps of trajectories
+  n_states: 3      # number of attractor states to average Jacobian over
+  epsilon: 1.0e-4  # finite difference step
+
+# Lyapunov spectrum + Kaplan-Yorke dimension (Step 15) — EXPENSIVE: k×(T/renorm) model calls/traj
+# Each trajectory needs k×(T//renorm_steps) = 10×(1000//50)=200 extra model calls.
+# With n_traj_sample=3: 600 extra calls total. Rosenstein LLE (step 9) gives λ₁ for free;
+# enable this only when full D_KY is needed (e.g., for publication).
+lyapunov_spectrum:
+  enabled: false   # set true to enable
+  n_exponents: 10  # number of Lyapunov exponents to compute (k ≤ n_regions)
+  renorm_steps: 50 # Wolf-GS renormalization period
+  epsilon: 1.0e-6  # perturbation magnitude
+  n_traj_sample: 3 # number of trajectories to average spectrum over
+
+# Energy constraint experiment (Step 16) — moderate cost: n_alpha × n_init rollouts
+# Experiment A (α scan): n_alpha=11 × n_init=5 × steps=200 = 11000 rollout(steps=1) calls.
+# Experiment B (dynamic E): n_init=5 × steps=300 = 1500 calls.
+energy_constraint:
+  enabled: false        # set true to enable
+  # Experiment A: x(t+1) = α · F(x(t)) bifurcation scan
+  run_alpha_scan: true
+  alpha_min: 0.5
+  alpha_max: 1.5
+  alpha_step: 0.1
+  n_init: 5             # trajectories per alpha value
+  steps: 200            # steps per trajectory
+  warmup: 50            # discard first warmup steps
+  # Experiment B: dynamic energy E(t)
+  run_dynamic_energy: true
+  energy_alpha: 0.5     # energy supply rate
+  energy_beta: 0.5      # metabolic consumption coefficient
+  E_ref: 1.0            # energy reference (g=0.5 at E=E_ref)
