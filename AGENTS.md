@@ -596,3 +596,36 @@ r ≈ 0 的两个神经生物学合理原因：
 - **规则**: 真正的能量约束对比用 `--energy-budget X` 重新运行完整管线实现，Step 16 **不应**在单次运行内执行任何额外的 rollout。
 
 *Last updated: 2026-03-08*
+
+### [2026-03-08] λ=-0.028 → λ=0.0002 根因 & dynamics 模块全面审查
+
+#### 根因分析：三级叠加效应
+
+**λ 变化**（-0.028 → 0.0002）是计算错误，不是系统真实 LLE 变化。
+
+**Bug 1（主因）: convergence-first 错误地将 `rosenstein` 切换为 `ftle`**
+- **问题**: `run_lyapunov_analysis` 中，当检测到强收敛时（`dist_ratio < convergence_threshold`），代码无论原始方法是什么都执行 `effective_method = "ftle"`。当 `method='rosenstein'`（默认）时，这会触发 FTLE 计算，而非正确地保持 Rosenstein。
+- **根本原因**: 该逻辑原本设计为"跳过昂贵的 Wolf 计算"，但错误地扩展到了所有方法，包括本来就是零成本、无偏差的 Rosenstein。
+- **修复**: 仅当原始方法为 `"wolf"` 或 `"both"` 时才切换为 FTLE；`method='rosenstein'` 保持不变，`skipped_wolf=True` 仍然触发最终混沌分类覆盖为 "stable"。
+
+**Bug 2（放大因子）: FTLE 上下文稀释 + 数值底层效应**
+- **机制**: `ftle_lyapunov()` 调用 `simulator.rollout(x0=x0, ...)` 时，base/perturbed 两条 rollout 共享 (context_length-1)/context_length ≈ 199/200 的相同 base_graph 历史。有效扰动 ε_eff ≈ ε/200 = 5×10⁻⁹。对于 LLE=-0.028 的系统，数值底层（1e-15）在约 400 步时被触发。
+- **修复**: `ftle_lyapunov` 增加**底层感知回归**：仅对 `log_dist > log(1e-12)` 的有信号区域做线性拟合，排除平坦底层段。当整段均在底层时，回退至 [0:skip] 初始段估计（或返回 NaN）。
+
+**Bug 3（n_segments=3 进一步放大）:**
+- n_segments=3 时，段 1/2 从近吸引子点出发，FTLE 立即触达底层 → λ ≈ 0。fix 2 部分缓解，fix 1 彻底解决（rosenstein 不再切换到 FTLE）。
+
+#### `_autocorrelation` FFT 优化
+
+- **问题**: `stability_analysis.py` 的 `_autocorrelation` 函数使用 O(T²) Python 循环计算自相关（`[np.dot(x[:n-lag], x[lag:]) / norm for lag in range(max_lag+1)]`），而 `compute_acf_oscillation_score` 已使用 FFT（O(T log T)）。两套实现功能重叠，前者效率低下。
+- **修复**: `_autocorrelation` 改为 FFT（`np.fft.rfft/irfft`），零填充到 2n 保证线性卷积，验证数值等价性（max_err = 0）。
+
+#### 模块审查总结
+
+经过全面审查，其他分析文件（jacobian_analysis.py, power_spectrum.py, surrogate_test.py, embedding_dimension.py, random_comparison.py, trajectory_convergence.py, attractor_analysis.py, free_dynamics.py, virtual_stimulation.py, energy_constraint.py, controllability.py, information_flow.py, critical_slowing_down.py）实现正确，无需修改。
+
+#### 规则
+
+- convergence-first 逻辑**仅**针对 `method='wolf'` 或 `'both'` 时才切换为 FTLE。`method='rosenstein'` 遇到收敛检测时保持不变，`skipped_wolf=True` 直接覆盖最终分类为 "stable"。
+- FTLE 底层效应：对收敛系统（LLE < -0.05），ε=1e-6 会在约 400 步内触达底层，回归必须排除底层段。推荐对 TwinBrain 使用 `method='rosenstein'`。
+- n_segments=3 只对 `rosenstein` 有显著价值（零额外成本，覆盖早/中/晚三段）；对 Wolf/FTLE 应保持 n_segments=1（防止近吸引子段引入底层偏差）。

@@ -1209,6 +1209,72 @@ class TestConvergenceThreshold(unittest.TestCase):
         self.assertTrue(results["skipped_wolf"],
                         "Wolf should be skipped for ratio=0.010 < threshold=0.05")
 
+    def test_convergence_skip_rosenstein_stays_rosenstein(self):
+        """Fix 1: method='rosenstein' + convergence detected → method stays 'rosenstein'.
+
+        Previously the convergence-first logic unconditionally switched the
+        effective_method to 'ftle' regardless of the original method.  This
+        caused λ=-0.028 (rosenstein) → λ≈0.0002 (ftle) for TwinBrain convergent
+        systems because FTLE suffers context-dilution (ε_eff≈ε/context_length)
+        which immediately floors the divergence near the attractor.
+
+        After the fix: rosenstein should be preserved when convergence is detected.
+        The regime is still forced to 'stable' via skipped_wolf=True.
+        """
+        class _MockSim:
+            device = "cpu"
+            state_bounds = (0.0, 1.0)
+            # No rollout needed — Rosenstein works on pre-computed trajectories
+
+        trajs = np.random.rand(3, 100, N).astype(np.float32)
+        conv_result = {"distance_ratio": 0.005, "convergence_label": "converging"}
+
+        results = run_lyapunov_analysis(
+            trajs, _MockSim(),
+            method="rosenstein",
+            convergence_result=conv_result,
+            convergence_threshold=0.05,
+            rosenstein_max_lag=15, rosenstein_min_sep=5,
+        )
+        self.assertTrue(results["skipped_wolf"],
+                        "skipped_wolf should be True: convergence detected")
+        self.assertEqual(results["method"], "rosenstein",
+                         "method should remain 'rosenstein', not switch to 'ftle'")
+        self.assertEqual(results["chaos_regime"]["regime"], "stable",
+                         "regime should be 'stable' via skipped_wolf override")
+
+    def test_ftle_floor_detection_convergent_system(self):
+        """Fix 2: FTLE returns finite negative value for convergent system.
+
+        Previously, strongly convergent trajectories caused dist(t) to hit the
+        numerical floor (1e-15) before skip, making the regression range entirely
+        flat → slope≈0.  The floor-aware regression now fits only the above-floor
+        portion, restoring the correct negative LLE.
+        """
+        class _ConvergentSim:
+            state_bounds = None
+            def rollout(self, x0, steps, stimulus=None, context_window_idx=0):
+                # Strongly convergent: factor 0.85/step, LLE = log(0.85) ≈ -0.163
+                multiplier = 0.85 ** np.arange(steps)
+                traj = (x0[None, :] * multiplier[:, None]).astype(np.float32)
+                return traj, np.arange(steps, dtype=np.float32)
+
+        sim = _ConvergentSim()
+        x0 = np.random.default_rng(42).random(N).astype(np.float32) + 0.3
+        traj = np.array([
+            x0 * (0.85 ** t) for t in range(200)
+        ], dtype=np.float32)
+        # FTLE should give a finite negative value (not NaN or ~0)
+        lam = ftle_lyapunov(traj, sim, epsilon=1e-6, skip_fraction=0.1,
+                            rng=np.random.default_rng(0))
+        # Either a meaningfully negative value or NaN (if floor was hit before skip)
+        # In either case, it must NOT be near zero (old buggy behavior)
+        if np.isfinite(lam):
+            self.assertLess(lam, -0.05,
+                            f"Convergent system LLE={lam:.4f} should be clearly negative; "
+                            "floor-aware regression appears not to be working")
+        # NaN is acceptable (floor hit before skip, cannot estimate LLE)
+
     def test_no_skip_above_threshold(self):
         """ratio=0.10 should NOT trigger skip with threshold=0.05."""
         class _MockSim:

@@ -882,16 +882,25 @@ def run_stability_analysis(
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _autocorrelation(x: np.ndarray, max_lag: int) -> np.ndarray:
-    """Normalised autocorrelation for lag 0..max_lag."""
-    x = x - x.mean()
-    norm = np.dot(x, x)
-    if norm == 0:
+    """Normalised autocorrelation for lag 0..max_lag.
+
+    Uses FFT-based computation (O(n log n)) for efficiency.
+    The previous O(n²) dot-product loop was equivalent but slower; for
+    tail_fraction=0.5 on T=1000 trajectories the tail has ~500 points, and
+    at max_lag=100 the loop performs 100 × 400 = 40 000 FMAs.  FFT reduces
+    this to 2 × n_fft × log2(n_fft) operations regardless of max_lag.
+    """
+    x = np.asarray(x, dtype=np.float64) - x.mean()
+    n = len(x)
+    if n == 0:
         return np.zeros(max_lag + 1, dtype=np.float32)
-    result = np.array(
-        [np.dot(x[: len(x) - lag], x[lag:]) / norm for lag in range(max_lag + 1)],
-        dtype=np.float32,
-    )
-    return result
+    # Full circular autocorrelation via FFT (zero-padded to 2n for linearity)
+    f = np.fft.rfft(x, n=2 * n)
+    acf_full = np.fft.irfft(f * np.conj(f))[:n]
+    if acf_full[0] == 0.0:
+        return np.zeros(max_lag + 1, dtype=np.float32)
+    acf = (acf_full / acf_full[0]).astype(np.float32)
+    return acf[: max_lag + 1]
 
 
 def _find_peaks(arr: np.ndarray, min_height: float = 0.0) -> List[int]:

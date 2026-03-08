@@ -207,9 +207,15 @@ _DEFAULTS = {
         # ── n_segments ────────────────────────────────────────────────────────
         # For Rosenstein, each extra segment adds negligible cost (pure NumPy);
         # 3 segments samples the attractor at early / mid / late trajectory
-        # positions, giving a more robust LLE estimate.  For Wolf/FTLE, each
-        # extra segment adds 2 model calls per trajectory (keep at 1 for speed).
-        "n_segments": 3,           # Changed from 1 → 3 for better Rosenstein coverage
+        # positions, giving a more robust LLE estimate.
+        #
+        # IMPORTANT: n_segments > 1 for FTLE on convergent TwinBrain systems
+        # is harmful: later segments start near the attractor, context-dilution
+        # immediately floors the divergence, and those segments give λ ≈ 0.
+        # With Fix 1 (convergence-first no longer switches rosenstein → ftle),
+        # this is moot for the default method='rosenstein'.  If you explicitly
+        # use method='wolf' or 'ftle', keep n_segments=1 for reliable results.
+        "n_segments": 3,           # 3 segments for robust Rosenstein coverage
         "rosenstein_max_lag": 50,  # Rosenstein method: max tracking lag
         "rosenstein_min_sep": 20,  # Rosenstein method: min temporal separation for NN search
         # ── Delay embedding (Takens) ──────────────────────────────────────────

@@ -59,9 +59,16 @@ Lyapunov Exponent Analysis
 **收敛优先策略**：
 
   若 trajectory_convergence 模块已检测到系统强收敛
-  （distance_ratio < convergence_threshold，默认 0.01），
-  则 Wolf 计算被跳过，直接用 FTLE 做快速交叉验证并标记为
-  "stable_by_convergence"，节省计算时间。
+  （distance_ratio < convergence_threshold，默认 0.05），
+  则记录 skipped_wolf=True 并最终将混沌分类强制为 "stable"。
+
+  切换行为（仅当原始方法为 "wolf" 或 "both" 时）：
+    自动切换到 FTLE 做快速交叉验证，节省大量 Wolf 推断时间。
+
+  不切换行为（原始方法为 "rosenstein" 或 "ftle" 时）：
+    rosenstein 无需切换——它本身就是零额外模型调用且无上下文稀释。
+    ftle 则保持用户的显式设置。
+    两种情况均通过 skipped_wolf=True 触发 "stable" 分类覆盖。
 
 **混沌状态分类**（基于 mean LLE）：
 
@@ -382,10 +389,23 @@ def ftle_lyapunov(
     - 无重归一化，δ(t) 可能饱和（[0,1] 有界状态空间）
     - 适合与 Wolf 方法对比验证，或轨迹数量多时的快速筛查
 
+    **数值底层处理（floor-aware regression）**：
+    对于收敛系统（LLE < 0），||δ(t)|| 随时间减小，最终跌落到数值底层
+    （dist ≤ 1e-15）并保持平坦。若直接对 [skip:T] 全段做线性回归，
+    平坦底层段主导导致 λ ≈ 0（而非正确的负值）。
+    修复：仅对 log_dist > log(1e-12) 的"有信号"区域做回归；
+    若整段均在底层（系统极快收敛），尝试用 [0:skip] 的初始段估计。
+
+    **TwinBrainDigitalTwin 上下文稀释注意事项**：
+    ``rollout()`` 的 x0 仅替换上下文最后一步，被 (context_length-1) 步共享
+    历史稀释，使有效扰动 ε_eff ≈ ε/context_length ≪ ε。这会显著加速底层
+    效应的出现，尤其在 n_segments>1 时（后续段起点接近吸引子）。
+    推荐用 method='rosenstein' 代替 FTLE 作为 TwinBrain 的主要 LLE 估计。
+
     Args:
         trajectory:     shape (T, n_regions)，已计算好的轨迹。
         simulator:      ``BrainDynamicsSimulator`` 实例。
-        epsilon:        初始扰动幅度（默认 1e-5）。
+        epsilon:        初始扰动幅度（默认 1e-6）。
         skip_fraction:  线性拟合时跳过前段的比例（避免瞬态）。
         rng:            随机数生成器；None → 使用 seed=0。
 
@@ -417,13 +437,51 @@ def ftle_lyapunov(
     log_dist = np.log(dist)
 
     skip = max(1, int(T * skip_fraction))
-    t_vals = np.arange(len(log_dist) - skip, dtype=np.float64)
-    y_vals = log_dist[skip:]
 
-    if len(t_vals) < 2:
+    # Guard: too short to fit a line after skip
+    if T - skip < 2:
         return 0.0
 
-    coeffs = np.polyfit(t_vals, y_vals, deg=1)
+    # ── Floor-aware regression ────────────────────────────────────────────────
+    # For strongly convergent systems, ||δ(t)|| quickly hits the 1e-15 floor.
+    # Fitting the entire [skip:T] range then gives λ ≈ 0 because the flat
+    # floor region (where no convergence signal remains) dominates the
+    # regression.  We instead restrict the fit to the "above-floor" portion:
+    #
+    #   soft floor = log(1e-12) (3 orders of magnitude above the hard floor)
+    #
+    # Using 1e-12 rather than 1e-15 gives a comfortable margin so that
+    # floating-point noise in the flat region is excluded.
+    # For chaotic / growing systems, dist never approaches 1e-12 → all points
+    # are selected → behaviour is identical to the original code.
+    _soft_floor_log = np.log(1e-12)
+
+    # Primary regression range: [skip:T], above soft floor
+    y_post = log_dist[skip:]
+    t_post = np.arange(len(y_post), dtype=np.float64)
+    above_post = y_post > _soft_floor_log
+
+    if above_post.sum() >= 2:
+        coeffs = np.polyfit(t_post[above_post], y_post[above_post], deg=1)
+    else:
+        # The floor was already hit before the skip point.  The system converged
+        # so fast that skip_fraction × T steps were enough to exhaust all signal.
+        # Fall back to the pre-skip region (initial fast convergence).
+        y_pre = log_dist[:skip]
+        t_pre = np.arange(len(y_pre), dtype=np.float64)
+        above_pre = y_pre > _soft_floor_log
+        if above_pre.sum() < 2:
+            # Even the pre-skip region is entirely at the floor; FTLE cannot
+            # estimate the LLE with this epsilon.  Return NaN rather than 0.0
+            # to avoid misclassifying the system as "edge of chaos".
+            logger.debug(
+                "ftle_lyapunov: 轨迹整体已达数值底层（ε=%.0e 太小或系统极快收敛），"
+                "FTLE 无法给出有效估计。返回 NaN。",
+                epsilon,
+            )
+            return float("nan")
+        coeffs = np.polyfit(t_pre[above_pre], y_pre[above_pre], deg=1)
+
     return float(coeffs[0])
 
 
@@ -892,20 +950,62 @@ def run_lyapunov_analysis(
     n_traj, total_steps, n_regions = trajectories.shape
 
     # ── Convergence-first: skip Wolf if system is clearly converging ──────────
+    #
+    # Design rationale: this block was originally designed to skip the expensive
+    # Wolf computation (O(n_traj × n_periods × 2) model calls) when the trajectory-
+    # convergence analysis already indicates that the system is stable.
+    #
+    # Critical constraint: ONLY switch to FTLE when the original method is "wolf"
+    # or "both".  If method="rosenstein" (the default), do NOT switch to FTLE:
+    #
+    #   Rosenstein works directly on pre-computed trajectories (zero extra model
+    #   calls, no context-dilution bias) and correctly measures negative LLE for
+    #   convergent systems.  Switching to FTLE for TwinBrainDigitalTwin causes:
+    #
+    #     1. Context-dilution artefact: ftle_lyapunov() calls simulator.rollout(),
+    #        which injects x0 only in the LAST step of a (context_length-step)
+    #        context window.  Both the base and perturbed rollouts share the same
+    #        (context_length-1) history from base_graph → the effective initial
+    #        separation is ≈ ε/context_length ≈ 5×10⁻⁹ (diluted from ε=10⁻⁶).
+    #
+    #     2. Early-floor artefact: with ε_eff ≈ 5×10⁻⁹ and LLE ≈ -0.028, the
+    #        numerical floor (1e-15) is reached at t ≈ 400 steps.  Later segments
+    #        (n_segments=3, starting at traj[333] and traj[666]) begin NEAR THE
+    #        ATTRACTOR, so the floor is hit at step ~0 → flat log_dist → λ ≈ 0.
+    #
+    #     Combined effect: λ=-0.028 (rosenstein) → λ≈0.0002 (ftle).
+    #     This is a measurement artefact, not the true LLE.
+    #
     skipped_wolf = False
     effective_method = method
 
     if convergence_result is not None:
         dist_ratio = float(convergence_result.get("distance_ratio", 1.0))
         if dist_ratio < convergence_threshold:
-            logger.info(
-                "  收敛优先：distance_ratio=%.4f < threshold=%.4f，"
-                "系统强收敛，跳过 Wolf 计算，切换为 FTLE 快速验证。",
-                dist_ratio,
-                convergence_threshold,
-            )
             skipped_wolf = True
-            effective_method = "ftle"
+            if method in ("wolf", "both"):
+                # Wolf is expensive (O(n_traj × n_periods × 2) extra model calls).
+                # Switch to FTLE for a cheaper cross-check that confirms stability.
+                logger.info(
+                    "  收敛优先：distance_ratio=%.4f < threshold=%.4f，"
+                    "系统强收敛，跳过 Wolf 计算，切换为 FTLE 快速验证。",
+                    dist_ratio,
+                    convergence_threshold,
+                )
+                effective_method = "ftle"
+            else:
+                # method is already 'rosenstein' or 'ftle'.
+                # Rosenstein: already zero-cost and unaffected by context dilution.
+                # FTLE: user explicitly requested it; don't interfere.
+                # Just record skipped_wolf=True so the chaos regime is overridden
+                # to "stable" at the end of this function.
+                logger.info(
+                    "  收敛优先：distance_ratio=%.4f < threshold=%.4f，"
+                    "系统强收敛（方法='%s'，无需切换，继续使用原方法）。",
+                    dist_ratio,
+                    convergence_threshold,
+                    method,
+                )
 
     # ── GPU auto-limit: Wolf/FTLE with multiple workers causes VRAM contention ─
     # Each Wolf/FTLE worker invokes the neural network independently on the same
@@ -1250,10 +1350,12 @@ def run_lyapunov_analysis(
         chaos_info["regime"] = "stable"
         chaos_info["is_chaotic"] = False
         chaos_info["near_chaos_edge"] = False
+        _mean_lam_str = f"{mean_lam:.4f}" if np.isfinite(mean_lam) else "NaN"
+        _method_str = effective_method.upper()
         chaos_info["interpretation_zh"] = (
             f"系统强收敛（trajectory distance_ratio="
             f"{convergence_result.get('distance_ratio', '?'):.4f} < {convergence_threshold}），"
-            f"Wolf 计算已跳过。FTLE 均值 λ={mean_lam:.4f}，确认稳定。"
+            f"Wolf 计算已跳过（{_method_str} 均值 λ={_mean_lam_str}，确认稳定）。"
         )
 
     # ── Logging summary ────────────────────────────────────────────────────────
