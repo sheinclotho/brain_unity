@@ -1049,6 +1049,20 @@ def run_lyapunov_analysis(
     final_diversity   = float(np.std(trajectories[:, -1, :], axis=0).mean())
     context_dominated = initial_diversity < _TRAJECTORY_DIVERSITY_LOW_THRESHOLD
 
+    # Threshold for "moderate diversity loss": initial_std is above the strict
+    # context_dominated threshold but still much lower than the random baseline
+    # (0.289 for uniform U[0,1]^N).  In this regime the convergence test may be
+    # misleading for CHAOTIC systems: a bounded chaotic attractor also pulls
+    # trajectories from slightly-different x0's toward the same attractor set,
+    # producing distance_ratio < threshold even though the intrinsic LLE > 0.
+    # We flag this as "attractor-size ambiguity" to remind downstream code.
+    _RANDOM_BASELINE_STD: float = 0.289
+    _ATTRACTOR_AMBIGUITY_THRESHOLD: float = 0.3 * _RANDOM_BASELINE_STD  # ≈ 0.087
+    attractor_ambiguous = (
+        not context_dominated
+        and initial_diversity < _ATTRACTOR_AMBIGUITY_THRESHOLD
+    )
+
     logger.info(
         "  轨迹多样性: 初始 std=%.4f, 终止 std=%.4f  "
         "(随机基线预期 ≈ 0.289; 阈值 %.3f)",
@@ -1066,6 +1080,19 @@ def run_lyapunov_analysis(
             "     要获得真正独立的轨迹，需要使用不同的 base_graph（不同时间段\n"
             "     或不同受试者的图缓存），而不是同一图的不同 x0 注入。",
             initial_diversity, _TRAJECTORY_DIVERSITY_LOW_THRESHOLD, n_traj,
+        )
+    elif attractor_ambiguous:
+        # Middle ground: not fully context-dominated, but initial diversity is
+        # small enough that the trajectory convergence test may conflate
+        # "converging to a chaotic attractor" with "converging to a fixed point".
+        logger.warning(
+            "  ⚠  初始轨迹多样性偏低（%.4f < %.3f，随机基线 0.289）：\n"
+            "     收敛检验结果存在歧义——对于有界混沌吸引子，所有轨迹也会从\n"
+            "     相近初始条件汇聚到同一吸引子集合，导致 distance_ratio 减小，\n"
+            "     但这并不意味着系统是稳定的（LLE 可能 > 0）。\n"
+            "     建议：以实际计算的 LLE 符号（而非 distance_ratio）判断稳定性。\n"
+            "     若 convergence-first 覆盖了 LLE 分类，其结论需谨慎对待。",
+            initial_diversity, _ATTRACTOR_AMBIGUITY_THRESHOLD,
         )
     else:
         logger.info(
@@ -1345,18 +1372,57 @@ def run_lyapunov_analysis(
 
     chaos_info = classify_chaos_regime(primary_mean)
 
-    # If Wolf was skipped due to convergence, override regime to "stable"
+    # ── skipped_wolf regime override ──────────────────────────────────────────
+    # If Wolf was skipped due to convergence, we use the actual computed LLE
+    # to decide whether to override the regime to "stable":
+    #
+    # Case 1 — LLE < 0 (confirmed convergent):
+    #   The computed LLE agrees with the distance_ratio evidence.  Override
+    #   regime to "stable" regardless of what classify_chaos_regime returned.
+    #
+    # Case 2 — LLE ≥ 0 (chaotic despite low distance_ratio):
+    #   This is the "chaotic attractor attraction" scenario: all trajectories
+    #   from nearby x0 converge TO THE SAME CHAOTIC ATTRACTOR, making the
+    #   pairwise distance decrease (ratio < threshold) even though the intrinsic
+    #   dynamics are chaotic (LLE > 0).  We must NOT force "stable" here — doing
+    #   so would produce the exact inconsistency seen in the logs (Step 9 says
+    #   "stable", Step 15 says "strongly chaotic").  Keep the actual LLE-based
+    #   classification.
+    #
+    # This fix is triggered even for method='rosenstein' (previously only for
+    # method='ftle' after convergence-first switching).
     if skipped_wolf:
-        chaos_info["regime"] = "stable"
-        chaos_info["is_chaotic"] = False
-        chaos_info["near_chaos_edge"] = False
-        _mean_lam_str = f"{mean_lam:.4f}" if np.isfinite(mean_lam) else "NaN"
-        _method_str = effective_method.upper()
-        chaos_info["interpretation_zh"] = (
-            f"系统强收敛（trajectory distance_ratio="
-            f"{convergence_result.get('distance_ratio', '?'):.4f} < {convergence_threshold}），"
-            f"Wolf 计算已跳过（{_method_str} 均值 λ={_mean_lam_str}，确认稳定）。"
-        )
+        if np.isfinite(primary_mean) and primary_mean < 0:
+            # LLE confirms stability → safe to override
+            chaos_info["regime"] = "stable"
+            chaos_info["is_chaotic"] = False
+            chaos_info["near_chaos_edge"] = False
+            _mean_lam_str = f"{mean_lam:.4f}"
+            _method_str = effective_method.upper()
+            chaos_info["interpretation_zh"] = (
+                f"系统强收敛（trajectory distance_ratio="
+                f"{convergence_result.get('distance_ratio', '?'):.4f} < {convergence_threshold}），"
+                f"Wolf 计算已跳过（{_method_str} 均值 λ={_mean_lam_str}，确认稳定）。"
+            )
+        else:
+            # LLE ≥ 0: chaotic attractor attraction — DO NOT override to "stable"
+            _mean_lam_str = f"{mean_lam:.4f}" if np.isfinite(mean_lam) else "NaN"
+            logger.warning(
+                "  ⚠  收敛矛盾：distance_ratio=%.4f < %.4f 表明轨迹收敛（已跳过 Wolf），\n"
+                "     但实际计算的 LLE=%s ≥ 0，表明系统可能为混沌。\n"
+                "     最可能的原因：初始条件相似（initial_std=%.4f << 随机基线 0.289），\n"
+                "     轨迹收敛到同一混沌吸引子集合（而非固定点）——\n"
+                "     这是有界混沌系统的正常行为，不应被误判为稳定。\n"
+                "     → 以 LLE 结果为准：%s（regime=%s）。\n"
+                "     建议：增加 n_init 或使用不同 base_graph 以提高初始多样性。",
+                convergence_result.get("distance_ratio", float("nan")),
+                convergence_threshold,
+                _mean_lam_str,
+                initial_diversity,
+                _mean_lam_str,
+                chaos_info["regime"].upper(),
+            )
+            # Do NOT override chaos_info — keep the LLE-based classification
 
     # ── Logging summary ────────────────────────────────────────────────────────
     logger.info(
@@ -1556,22 +1622,30 @@ def lyapunov_spectrum_wolf(
     原理
     ----
     维护 k 个正交扰动向量 Q[:, i]，每个重归一化周期：
-      1. 对每个扰动向量 eᵢ 运行 ``simulator.rollout``（使用当前轨迹状态作为
-         基准），估计 J·eᵢ ≈ (x(t+τ|x₀+ε·eᵢ) − x(t+τ|x₀)) / ε。
+      1. 对每个扰动向量 eᵢ 运行一次 Wolf 演化（使用当前轨迹状态作为
+         基准），估计 J·eᵢ ≈ (x(t+τ|x₀+ε·eᵢ) − x(t+τ|x₀)) / ε_actual。
       2. 对更新后的扰动向量矩阵做 QR 分解（Gram-Schmidt 等价）。
       3. 累积 log|Rᵢᵢ|（对角元的对数 = 第 i 个方向的增长率）。
     最终：λᵢ = Σ log|Rᵢᵢ| / (n_valid_periods × renorm_steps)
 
-    计算成本（每次 ``predict_future`` 调用 = 1 次）：
-      k × n_periods 次额外调用，外加 1 次基准轨迹调用/周期。
+    **上下文推进（Wolf context advancement）**：
+    每个周期使用 ``simulator.wolf_rollout_pair`` 进行 base+pert 双轨演化。
+    基准轨迹的历史上下文在每个周期结束后前进（通过 ``wolf_context``
+    传递），使得后续周期能真正延续之前的历史，而非每次重置到 base_graph。
+
+    若不推进上下文（直接调用 ``rollout()``），k 条扰动轨迹都共享同一
+    base_graph 历史，所有方向的增长率由上下文稀释主导而非真实动力学，
+    导致 λ₁ ≈ λ₂ ≈ ... ≈ λₖ > 0 ——这是一个已知的严重偏差。
+
+    计算成本（每次 ``wolf_rollout_pair`` 调用 = 2 次 predict_future）：
+      k × n_periods 次 wolf_rollout_pair 调用，每次 2 次推断。
       n_periods = (len(trajectory) − 1) // renorm_steps
-      例：k=10, T=1000, renorm_steps=50 → 10 × 20 = 200 次额外调用。
+      例：k=10, T=1000, renorm_steps=50 → 10 × 19 × 2 = 380 次推断。
+      （与旧实现相比：旧实现是 (k+1) × 19 = 209 次，但存在上下文稀释偏差）
 
     Args:
         simulator:    ``BrainDynamicsSimulator`` 实例（TwinBrainDigitalTwin 模式）。
-        trajectory:   预计算基准轨迹，shape (T, N)，用于提供基准状态 x(t)。
-                      注意：此函数会在轨迹各采样点重新运行 rollout 获取 x(t+τ)，
-                      而不是直接使用 trajectory[t+τ]——这是为了同时演化扰动轨迹。
+        trajectory:   预计算基准轨迹，shape (T, N)，用于提供每周期起点 x(t)。
         n_exponents:  要计算的指数数量 k（默认 10；最大 n_regions）。
         renorm_steps: 每个 Wolf 周期的步数（默认 50）。
         epsilon:      扰动幅度（默认 1e-6）。
@@ -1585,6 +1659,11 @@ def lyapunov_spectrum_wolf(
     k = min(n_exponents, N)
     _bounds = getattr(simulator, "state_bounds", (0.0, 1.0))
 
+    # Check if the simulator supports context-advancing Wolf rollout.
+    # wolf_rollout_pair() advances the HeteroData context window across periods,
+    # eliminating the context-dilution bias that plagues plain rollout().
+    _use_wolf_pair = callable(getattr(simulator, "wolf_rollout_pair", None))
+
     rng = np.random.default_rng(seed)
 
     # Initialise k orthonormal perturbation vectors via QR decomposition
@@ -1594,33 +1673,68 @@ def lyapunov_spectrum_wolf(
     log_sum = np.zeros(k, dtype=np.float64)
     n_periods = 0
 
+    # wolf_context is advanced across periods (None → auto-init on first call)
+    wolf_context = None
+
     t = 0
     while t + renorm_steps < T:
         x_base = trajectory[t].astype(np.float64)
 
-        # Baseline: run renorm_steps from x_base
-        traj_base, _ = simulator.rollout(
-            x0=x_base.astype(np.float32), steps=renorm_steps
-        )
-        x_base_end = traj_base[-1].astype(np.float64)
-
-        # Evolved perturbation vectors
+        # ── Evolved perturbation vectors ──────────────────────────────────────
         evolved = np.zeros((N, k), dtype=np.float64)
+        x_base_end: Optional[np.ndarray] = None
+        next_wolf_context = None  # will be set from first wolf_rollout_pair call
+
         for i in range(k):
             x_pert_raw = (x_base + epsilon * Q[:, i]).astype(np.float32)
             if _bounds is not None:
                 x_pert_raw = np.clip(x_pert_raw, _bounds[0], _bounds[1])
-            # Actual applied perturbation (may be clipped near boundary)
             eps_actual = float(np.linalg.norm(
                 x_pert_raw.astype(np.float64) - x_base
             )) + 1e-30
 
-            traj_pert, _ = simulator.rollout(
-                x0=x_pert_raw, steps=renorm_steps
-            )
-            x_pert_end = traj_pert[-1].astype(np.float64)
-            delta = (x_pert_end - x_base_end) / eps_actual
-            evolved[:, i] = delta
+            if _use_wolf_pair:
+                # Correct path: use the SAME pre-advance wolf_context for all k
+                # directions.  wolf_rollout_pair clones the context internally,
+                # so repeated calls with the same wolf_context are safe.
+                # next_wolf_context is the context advanced by the BASE rollout.
+                # The `x_base_end is None` guard ensures we capture the base
+                # endpoint and advanced context only from direction i=0.  For
+                # directions i>1 the base endpoint is already known (x_base_end
+                # is not None) so we skip the capture.  Only one context
+                # advancement per period is needed; remaining ctx_out values
+                # are discarded.
+                end_base_i, end_pert_i, ctx_out = simulator.wolf_rollout_pair(
+                    x_base=x_base.astype(np.float32),
+                    x_pert=x_pert_raw,
+                    steps=renorm_steps,
+                    wolf_context=wolf_context,
+                )
+                if x_base_end is None:
+                    # First direction: save base endpoint and advanced context
+                    x_base_end = end_base_i.astype(np.float64)
+                    next_wolf_context = ctx_out
+                evolved[:, i] = (
+                    end_pert_i.astype(np.float64) - x_base_end
+                ) / eps_actual
+            else:
+                # Legacy fallback: plain rollout() (context resets every call).
+                # This suffers from context-dilution but at least keeps the code
+                # running on simulators that don't have wolf_rollout_pair.
+                if x_base_end is None:
+                    traj_base, _ = simulator.rollout(
+                        x0=x_base.astype(np.float32), steps=renorm_steps
+                    )
+                    x_base_end = traj_base[-1].astype(np.float64)
+                traj_pert, _ = simulator.rollout(
+                    x0=x_pert_raw, steps=renorm_steps
+                )
+                x_pert_end = traj_pert[-1].astype(np.float64)
+                evolved[:, i] = (x_pert_end - x_base_end) / eps_actual
+
+        # Advance context for the next period
+        if _use_wolf_pair and next_wolf_context is not None:
+            wolf_context = next_wolf_context
 
         # Gram-Schmidt via thin QR: Q_new columns = normalised orthogonal basis
         Q_new, R = np.linalg.qr(evolved)

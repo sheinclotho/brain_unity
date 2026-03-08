@@ -629,3 +629,38 @@ r ≈ 0 的两个神经生物学合理原因：
 - convergence-first 逻辑**仅**针对 `method='wolf'` 或 `'both'` 时才切换为 FTLE。`method='rosenstein'` 遇到收敛检测时保持不变，`skipped_wolf=True` 直接覆盖最终分类为 "stable"。
 - FTLE 底层效应：对收敛系统（LLE < -0.05），ε=1e-6 会在约 400 步内触达底层，回归必须排除底层段。推荐对 TwinBrain 使用 `method='rosenstein'`。
 - n_segments=3 只对 `rosenstein` 有显著价值（零额外成本，覆盖早/中/晚三段）；对 Wolf/FTLE 应保持 n_segments=1（防止近吸引子段引入底层偏差）。
+
+### [2026-03-08] Step 9 vs Step 15 不一致：混沌吸引子吸引效应 & Wolf-GS 上下文稀释
+
+#### 根因（Step 9 "stable" vs Step 15 "strongly_chaotic" 矛盾）
+
+**Case A（Step 9 错误）: 混沌吸引子吸引效应（Chaotic Attractor Attraction）**
+- **问题**: 当初始多样性（initial_std=0.0325）远小于随机基线（0.289）时，所有轨迹从相近 x0 汇入同一混沌吸引子集合，产生 distance_ratio < threshold（如 0.009 < 0.05）。旧代码将此误判为"稳定"，强制 regime="stable"，即使 Rosenstein LLE > 0。
+- **科学依据**: 混沌吸引子具有全局吸引性（attractor basin），任意初始条件最终都落在吸引子集合上。若初始条件已接近吸引子，轨迹间距离会先减小再饱和，而非一直减小到零（固定点收敛）。distance_ratio 不能区分这两种情况。
+- **修复**: `skipped_wolf` 的 regime 覆盖增加 LLE 符号检验：仅当 `primary_mean < 0`（LLE 确认稳定）时才覆盖为 "stable"；若 `primary_mean ≥ 0`（混沌），发出警告并保留原始 LLE 分类。
+
+**Case B（Step 15 错误）: `lyapunov_spectrum_wolf` 上下文稀释**
+- **问题**: 旧实现每个 Wolf 周期对 baseline 和 k 个扰动方向均调用 `simulator.rollout()`，而 `rollout()` 每次重置 base_graph 上下文。所有 k+1 次 rollout 共享 199/200 的相同 base_graph 历史。k 个扰动方向全部被相同稀释因子影响 → λ₁≈λ₂≈...≈λₖ ≈ +0.13（强混沌假象）。
+- **修复**: 改用 `simulator.wolf_rollout_pair()` 并维护推进的 `wolf_context`：每周期保存 `next_wolf_context`，下一周期继续从上次的历史开始。k 个方向均使用同一**推进前**的 wolf_context（通过 `wolf_rollout_pair` 内部克隆实现）。
+
+**修复后预期**:
+- Step 9: Rosenstein LLE > 0 → regime 保持 "weakly_chaotic" 或 "edge_of_chaos"（不再错误"stable"）
+- Step 15: 使用推进上下文后，λ 的方向间差异增大，不再全部趋同于+0.13
+
+#### 初始多样性歧义阈值（Attractor Ambiguity Warning）
+- **新阈值**: `_ATTRACTOR_AMBIGUITY_THRESHOLD = 0.3 × 0.289 = 0.087`
+  - initial_std < 0.020（旧阈值）: context_dominated（context 完全主导）
+  - 0.020 ≤ initial_std < 0.087: attractor_ambiguous（收敛测试有歧义）
+  - initial_std ≥ 0.087: 多样性正常
+  - 警告内容: 明确说明 distance_ratio 下降可能是"汇入混沌吸引子"而非"收敛到固定点"
+
+#### 跨步骤一致性检查（Step 9 vs Step 15）
+- **新增**: `run_dynamics_analysis.py` Step 15 完成后，自动比较 Step 9 regime 和 Step 15 n_positive：
+  - Step 9 = stable/marginal_stable AND Step 15 = n_positive > 0 → 打印醒目 WARNING 方框，列出可能原因和建议
+  - 其他情况: 仅打印简要对比日志
+
+#### 规则（追加）
+- `skipped_wolf` 的 stable 覆盖**必须**检查 `primary_mean < 0`，不允许在 LLE ≥ 0 时强制 stable。
+- `lyapunov_spectrum_wolf` **必须**使用 `wolf_rollout_pair()` + 推进的 `wolf_context`（已检测 `hasattr(simulator, 'wolf_rollout_pair')`），不允许使用 `rollout()` 重置上下文。
+- 当 `initial_std < 0.087`（attractor_ambiguous）时，收敛检验结论必须注明歧义，以 LLE 符号为准。
+- 发现 Step 9 vs Step 15 矛盾时，**以 Step 11（代替数据检验）为主要参考**：surrogate test 对 LLE 符号的估计最鲁棒（对比相位随机化/shuffle/AR 代替序列）。
