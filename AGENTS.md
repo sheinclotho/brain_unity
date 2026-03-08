@@ -538,3 +538,61 @@ r ≈ 0 的两个神经生物学合理原因：
 - 若直接 `torch.load` 后发现响应矩阵退化为对角线，立即检查 `graph.edge_types` 是否缺少同模态边。
 
 *Last updated: 2026-03-07*
+
+### [2026-03-08] `sample_random_state` z-score 初始状态裁剪错误 & `state_bounds` 单模态失效
+
+#### 根因
+- V5 图缓存中 fMRI 和 EEG 均以 **z-score 归一化**存储（均值 ≈ 0，标准差 ≈ 1，值域约 ±3σ）。
+- 旧版 `sample_random_state` 对单模态路径（fmri/eeg）执行 `np.clip(mean + noise, 0, 1)`。
+  - `mean_state` ≈ 0（z-score 后均值接近零），`noise = N(0, 0.05)`→ x0 ≈ [0, 0.05]。
+  - 将 [0, 0.05] 注入上下文末步，而上下文历史值约为 ±3σ，产生巨大跳跃。
+  - 效果：刺激前期出现大幅振荡（振幅 ±0.7 AU），如 Image 4（刺激响应图）所示；
+    PCA 密度图（Image 2）的 Final states 散点与亮斑中心不一致。
+- 旧版 `state_bounds` 对单模态无条件返回 `(0.0, 1.0)`，对 z-scored 数据 Wolf/FTLE
+  分析中将扰动状态错误裁剪至 [0,1]，引入 0 处虚假吸引子，偏置 Lyapunov 估计。
+
+#### 修复（twinbrain-dynamics/simulator/brain_dynamics_simulator.py）
+
+1. **`__init__` 新增 `_state_bounds` 属性**：检测 `base_graph[modality].x.min() < -0.1`：
+   - z-scored 数据（min < -0.1）→ `self._state_bounds = None`（不裁剪）
+   - [0,1] 归一化数据（min ≥ -0.1，旧格式兼容）→ `self._state_bounds = (0.0, 1.0)`
+   - joint 模式 → 始终 `None`（拼接 z-score 无界）
+
+2. **`state_bounds` property**：改为直接返回 `self._state_bounds`，移除硬编码 `(0.0, 1.0)`。
+
+3. **`sample_random_state` 修复**：
+   - 计算每通道均值 `mean_state` 和标准差 `std_state`（使用 `_STD_GUARD` 保护）
+   - 噪声缩放：`noise = N(0, 0.3)`，`x0 = mean + noise * std_state`（0.3σ 扰动，在自然分布内）
+   - 仅当 `_state_bounds is not None`（旧格式）时才执行 clip
+
+#### 附带修复（run_dynamics_analysis.py）
+
+4. **PSD burnin 自适应**：Step 13 的默认 burnin 从固定 10 改为 `max(20, T // 10)`（轨迹长度的 10%，最少 20 步），移除初始瞬态对功率谱空间拓扑图的条纹污染（Image 1）。
+
+5. **PCA burnin 默认化**：`plot_pca_trajectories` 调用增加 `burnin=max(0, T // 10)`，PCA 密度图不再包含初始瞬态帧（Image 2 改善）。
+
+#### 规则
+- `sample_random_state` 在单模态路径下必须检测数据是否 z-scored，**禁止**对 z-scored 数据执行 `clip(0, 1)`。判据：`base_graph[modality].x.min() < -0.1`。
+- `state_bounds` 对 z-scored 单模态数据必须返回 `None`，使 Wolf/FTLE 不裁剪扰动状态。
+- PSD burnin 必须与轨迹长度正比（10%），不得使用小于 20 步的固定值。
+
+### [2026-03-08] Jacobian DMD 替换有限差分 & 功率谱线性去趋势 & 能量约束重构
+
+#### Jacobian 谱分析 ρ=0 根因：TwinBrainDigitalTwin 上下文稀释
+- **问题**: `estimate_jacobian_at_point` 用 `rollout(x0, steps=1)` 做有限差分，将 x0 注入 200 步上下文窗口的最后一步。Conv1d+注意力编码器对全部 200 步加权平均，单步扰动 ε=1e-4 被稀释为 ≈5×10⁻⁷，在 float32 精度下 `f_fwd - f_bwd = 0` → J=0 → ρ=0。
+- **修复**: 删除 `estimate_jacobian_at_point`，用 **Dynamic Mode Decomposition (DMD)** 替代：从自由动力学轨迹提取时序对 (x_t, x_{t+1})，用 Tikhonov 正则化最小二乘拟合最优线性转移算子 A = (X₁ᵀX₀)(X₀ᵀX₀ + αI)⁻¹。**零额外模型调用**，直接复用步骤 3 的轨迹。
+- **验证**: 对已知谱半径 0.85 的合成系统，DMD 恢复谱半径 0.8515（误差 < 2%）；对角线系统特征值误差 < 0.01。
+- **规则**: TwinBrainDigitalTwin 的 Jacobian **必须**使用 DMD，**禁止**使用 `rollout(steps=1)` 有限差分（上下文稀释）。函数签名保持向后兼容（`n_states`、`epsilon` 参数保留但不使用）。
+
+#### 功率谱 dominant_freq=0.0005 Hz 根因：仅去均值未去趋势
+- **问题**: `compute_trajectory_psd` 注释写"Detrend (remove linear trend per channel)"，但代码只做 `seg - seg.mean()`（仅去 DC）。从随机初态收敛到吸引子的轨迹存在强线性趋势，FFT 功率集中在最低频率（T=1000, dt=2s → 0.0005 Hz），掩盖真实振荡。
+- **修复**: 改用 `scipy.signal.detrend(seg, axis=0, type='linear')`（有 scipy）或矢量化 OLS 回归（无 scipy），逐通道去除仿射趋势后再加窗。
+- **验证**: 含强线性漂移 + 0.05 Hz 振荡的合成轨迹，去趋势后主导频率正确恢复为 0.05 Hz（而非近 DC）。
+- **规则**: 功率谱分析**必须**在 FFT 前做完整线性去趋势（`type='linear'`），不允许仅做均值去除（`type='constant'`）。
+
+#### 能量约束实验重构：删除非存在函数，用 `run_energy_budget_analysis` 替代
+- **问题**: Step 16 导入 `run_energy_constraint_scan`（α 扫描 x(t+1)=α·F(x(t))）和 `run_dynamic_energy_experiment` 均不存在。α 扫描科学上也是错误的（等比缩放不改变拓扑）。
+- **修复**: 添加 `run_energy_budget_analysis(trajectories, state_bounds, output_dir)` — 零额外模型调用，从已有轨迹计算 E*=mean(|x|)，给出 tight(0.4E*)/moderate(0.7E*)/natural(E*)/relaxed(1.3E*) 四档建议值，保存 JSON+PNG。更新 Step 16 使用该函数，更新 `dynamics_config.yaml` 删除废弃的 `run_alpha_scan`/`run_dynamic_energy` 字段。
+- **规则**: 真正的能量约束对比用 `--energy-budget X` 重新运行完整管线实现，Step 16 **不应**在单次运行内执行任何额外的 rollout。
+
+*Last updated: 2026-03-08*

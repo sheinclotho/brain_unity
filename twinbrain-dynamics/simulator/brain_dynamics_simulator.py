@@ -48,6 +48,19 @@ _DEFAULT_FMRI_TR: float = 2.0
 # Guard added to per-channel std to prevent division-by-zero during z-normalisation.
 _STD_GUARD: float = 1e-8
 
+# Threshold used to detect whether the primary modality's data is z-scored or
+# [0,1]-normalised.  V5 graph caches store z-scored BOLD and EEG (values
+# ≈ −3 to +3).  Any genuine minimum below this threshold confirms z-scoring,
+# so that sample_random_state() and state_bounds can behave correctly.
+_ZSCORE_DETECTION_THRESHOLD: float = -0.1
+
+# Per-channel noise scale for sample_random_state() in single-modality mode.
+# Expressed as a fraction of the data's own standard deviation.  0.3σ gives a
+# moderate diversity of initial conditions while staying well within the
+# model's natural operating range (avoids extreme ±2-3σ starting states that
+# would require many warm-up steps to recover from).
+_INITIAL_STATE_NOISE_SCALE: float = 0.3
+
 
 def _resolve_device(device: str) -> str:
     """Resolve ``"auto"`` to the actual device string (``"cuda"`` or ``"cpu"``)."""
@@ -380,6 +393,31 @@ class BrainDynamicsSimulator:
             self.native_sampling_rate = float(_fmri_sr_local) if _fmri_sr_local else None
             self.dt = 1.0 / float(_fmri_sr_local) if _fmri_sr_local else _pred_dt
 
+        # ── Determine state-space bounds ──────────────────────────────────────
+        # Wolf/FTLE Lyapunov analysis clips perturbed states to these bounds
+        # after each renormalisation period.  V5 graph caches store z-scored
+        # data for BOTH fMRI and EEG (values ≈ −3 to +3).  Clipping z-scored
+        # states to [0, 1] would introduce a spurious attractor at 0 and bias
+        # all Lyapunov estimates.
+        #
+        # We detect z-scored data by checking the minimum value in the primary
+        # modality's tensor:
+        #   min < −0.1  →  z-scored  →  no hard bounds (None)
+        #   min ≥ −0.1  →  [0, 1]-normalised (legacy)  →  bounds = (0.0, 1.0)
+        #
+        # Joint mode always uses None (concatenated z-scores are unbounded).
+        if modality == "joint":
+            self._state_bounds: Optional[Tuple[float, float]] = None
+        else:
+            _nt_min = float(base_graph[modality].x.min())
+            self._state_bounds = None if _nt_min < _ZSCORE_DETECTION_THRESHOLD else (0.0, 1.0)
+            if self._state_bounds is None:
+                logger.debug(
+                    "state_bounds: '%s' data min=%.4f < %.1f → z-scored, "
+                    "disabling [0,1] clipping for Wolf/FTLE.",
+                    modality, _nt_min, _ZSCORE_DETECTION_THRESHOLD,
+                )
+
         logger.info(
             "BrainDynamicsSimulator: TwinBrainDigitalTwin 模式 "
             "(modality=%s, n_regions=%d, dt=%.4f s [fMRI TR], device=%s)",
@@ -394,21 +432,24 @@ class BrainDynamicsSimulator:
         State-space bounds used by Wolf/FTLE Lyapunov analysis for clipping
         perturbed states after each renormalisation period.
 
-        - Single-modality (fMRI / EEG): returns ``(0.0, 1.0)``.
-          The graph cache stores normalised values that are treated as bounded
-          in ``[0, 1]`` for the purposes of Wolf-Benettin renormalisation
-          (preserves physical realism of the perturbed state).
+        The value is determined at construction time by inspecting the primary
+        modality's data:
 
-        - Joint mode: returns ``None``.
-          Joint trajectories are z-score normalised (values roughly in
-          ``[−3, 3]`` with no hard bound).  Clipping z-scores to ``[0, 1]``
-          would introduce an artificial attractor at 0 and must be avoided.
-          Lyapunov analysis in joint mode should use the Rosenstein method
-          (which does not require clipping) rather than Wolf-Benettin.
+        - **z-scored data** (V5 format, ``data.min() < _ZSCORE_DETECTION_THRESHOLD``):
+          returns ``None``.
+          Both fMRI BOLD and EEG in the V5 graph cache are z-score normalised
+          (values ≈ −3 to +3).  Clipping to ``[0, 1]`` would introduce a
+          spurious attractor at 0 and must be avoided.  Lyapunov analysis
+          should use the Rosenstein method (no clipping required).
+
+        - **[0, 1]-normalised data** (legacy format,
+          ``data.min() ≥ _ZSCORE_DETECTION_THRESHOLD``):
+          returns ``(0.0, 1.0)``.  Preserves physical realism of the perturbed
+          state during Wolf-Benettin renormalisation.
+
+        - **Joint mode**: always ``None`` (concatenated z-scores are unbounded).
         """
-        if self.modality == "joint":
-            return None
-        return (0.0, 1.0)
+        return self._state_bounds
 
     def rollout(
         self,
@@ -1223,7 +1264,16 @@ class BrainDynamicsSimulator:
         采样随机初始脑状态。
 
         **单模态模式 (fMRI / EEG)**：从 ``base_graph`` 数据的均值附近添加随机
-        噪声，结果 clip 到 [0, 1]，以 ``rollout()`` 注入初始上下文末步。
+        噪声，噪声幅度按各通道的标准差缩放（0.3σ），确保初始状态位于数据的
+        自然分布范围内。对 z-score 归一化数据（值域约 ±3σ），**不裁剪**到
+        [0, 1]；对 [0, 1]-归一化数据，仍执行裁剪以保留物理合理性。
+
+        检测方式：``base_graph[modality].x.min() < -0.1`` → z-scored。
+
+        **背景**：V5 格式的 fMRI BOLD 和 EEG 数据均为 z-score 归一化（均值≈0，
+        标准差≈1）。若将初始状态裁剪到 [0, 1]，则写入上下文末步的值（≈ 0–0.05）
+        与上下文历史中的真实值（≈ ±3σ）产生巨大跳跃，模型在预刺激阶段需要大量
+        时间步恢复，表现为刺激前的大幅振荡（Image 4 中可见的现象）。
 
         **joint 模式**：分别为 fMRI 和 EEG 部分各自采样，使用
         ``_fmri_mean/std`` 和 ``_eeg_mean/std`` 对噪声缩放，再拼接成
@@ -1245,9 +1295,27 @@ class BrainDynamicsSimulator:
             return np.concatenate([fmri_x0_z, eeg_x0_z])
 
         x_data = self.base_graph[self.modality].x  # [N, T, 1]
-        mean_state = x_data.squeeze(-1).mean(dim=1).cpu().numpy()  # [N]
-        noise = rng.normal(0, 0.05, self.n_regions).astype(np.float32)
-        return np.clip(mean_state + noise, 0.0, 1.0)
+        data_np = x_data.squeeze(-1).cpu().numpy()   # [N, T]
+        mean_state = data_np.mean(axis=1)            # [N]
+        std_state  = np.maximum(data_np.std(axis=1), _STD_GUARD)  # [N]
+
+        # Scale noise by the data's per-channel standard deviation so that
+        # the injected initial state lies within the model's normal operating
+        # range.  For z-scored data (std ≈ 1) this gives ≈ ±0.3σ perturbations;
+        # for [0,1]-normalised data (std ≈ 0.15–0.25) it gives proportionally
+        # smaller perturbations — both within the natural data distribution.
+        noise = rng.normal(0.0, _INITIAL_STATE_NOISE_SCALE, self.n_regions).astype(np.float32)
+        x0 = (mean_state + noise * std_state).astype(np.float32)
+
+        # Only clip to [0, 1] for strictly non-negative (legacy-normalised) data.
+        # Z-scored data (min < -0.1) must NOT be clipped: doing so would force
+        # all negative channel values to 0, creating an anomalous initial state
+        # that causes large transient oscillations during the pre-stimulation
+        # period (up to ±0.7 AU visible in EEG stim-response plots).
+        if self._state_bounds is not None:
+            x0 = np.clip(x0, self._state_bounds[0], self._state_bounds[1])
+
+        return x0
 
 
 # ══════════════════════════════════════════════════════════════════════════════

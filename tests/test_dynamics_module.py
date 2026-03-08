@@ -4,9 +4,9 @@ Tests for the twinbrain-dynamics module
 
 Covers:
   - Stimulus classes (SinStimulus, SquareWaveStimulus, StepStimulus, RampStimulus)
-  - _WilsonCowanIntegrator (standalone WC integrator)
-  - BrainDynamicsSimulator in WC mode (model=None)
   - BrainDynamicsSimulator validation: rejects can_forward=False models
+  - BrainDynamicsSimulator twin-mode: context trimming, x0 injection,
+    sample_random_state() z-score awareness
   - Free dynamics experiment
   - Attractor analysis
   - Virtual stimulation experiment
@@ -18,6 +18,13 @@ Covers:
   - Delay-embedding helper (_build_delay_embedding)
   - Convergence-threshold skip behaviour (raised to 0.05)
   - load_model: error behavior for missing / non-TwinBrain checkpoints
+
+NOTE: Tests for the deprecated Wilson-Cowan (WC) mode and
+_WilsonCowanIntegrator are marked @unittest.skip — WC mode was removed
+from BrainDynamicsSimulator (see AGENTS.md).  The old API
+BrainDynamicsSimulator(model=None, n_regions=N) raises ValueError.
+Many legacy test classes that still reference this API are listed
+below; they emit ERRORS when run until ported to the twin-mode API.
 """
 
 import json
@@ -40,7 +47,6 @@ from simulator.brain_dynamics_simulator import (
     SinStimulus,
     SquareWaveStimulus,
     StepStimulus,
-    _WilsonCowanIntegrator,
 )
 from experiments.free_dynamics import run_free_dynamics
 from experiments.attractor_analysis import extract_final_states, run_attractor_analysis
@@ -167,6 +173,7 @@ class TestRampStimulus(unittest.TestCase):
 # WilsonCowanIntegrator Tests
 # ══════════════════════════════════════════════════════════════════════════════
 
+@unittest.skip("_WilsonCowanIntegrator removed: WC mode deprecated (see AGENTS.md)")
 class TestWilsonCowanIntegrator(unittest.TestCase):
     def test_no_stim_stays_near_x0(self):
         """Without stimulation, state should stay close to x0."""
@@ -204,6 +211,11 @@ class TestWilsonCowanIntegrator(unittest.TestCase):
 # BrainDynamicsSimulator Tests
 # ══════════════════════════════════════════════════════════════════════════════
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md). "
+    "Twin-mode equivalents are covered by TestContextTrimming."
+)
 class TestBrainDynamicsSimulator(unittest.TestCase):
     def setUp(self):
         self.sim = BrainDynamicsSimulator(model=None, n_regions=N)
@@ -261,6 +273,11 @@ class TestBrainDynamicsSimulator(unittest.TestCase):
 # Free Dynamics Tests
 # ══════════════════════════════════════════════════════════════════════════════
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md). "
+    "Twin-mode free-dynamics is covered by TestContextTrimming."
+)
 class TestFreeDynamics(unittest.TestCase):
     def setUp(self):
         self.sim = BrainDynamicsSimulator(model=None, n_regions=N)
@@ -2005,6 +2022,76 @@ class TestContextTrimming(unittest.TestCase):
         sim, _, _ = self._make_sim(T_base=20, context_length=10, pred_steps=3)
         traj, times = sim.rollout(steps=3, x0=None)
         self.assertEqual(traj.shape, (3, N))
+
+    def test_sample_random_state_zscore_no_clip(self):
+        """
+        sample_random_state() must NOT clip z-scored data to [0, 1].
+
+        V5 graph caches store z-scored data (values in roughly [-3, 3]).
+        The old code did np.clip(..., 0.0, 1.0) which forced all values into
+        [0, 0.05] when mean_state ≈ 0.  Injecting these near-zero values into
+        a context full of ±σ values caused a large discontinuity that
+        manifested as large pre-stimulation oscillations in stim-response plots.
+
+        After the fix: x0 must contain negative values (mean ≈ 0, std ≈ per-channel
+        std), and state_bounds must be None for z-scored graphs.
+        """
+        from torch_geometric.data import HeteroData
+
+        # Build a graph with clearly z-scored data (large negative values)
+        g = HeteroData()
+        rng_t = np.random.default_rng(0)
+        # Simulate z-scored EEG: values centred at 0, std ≈ 1, clearly negative
+        raw = rng_t.standard_normal((N, 30)).astype(np.float32)  # mean ≈ 0, min ≈ -2.5
+        import torch
+        g["fmri"].x = torch.tensor(raw).unsqueeze(-1)  # [N, 30, 1]
+        g["fmri", "connects", "fmri"].edge_index = torch.zeros(2, 0, dtype=torch.long)
+
+        sim, _, _ = self._make_sim(T_base=30, context_length=10, pred_steps=3)
+        # Override base_graph with z-scored one
+        sim.base_graph = g
+
+        # Force recompute of _state_bounds by re-init would be complex;
+        # instead verify via the public state_bounds property of a fresh sim
+        from models.graph_native_system import GraphNativeBrainModel
+        from models.digital_twin_inference import TwinBrainDigitalTwin
+        model = GraphNativeBrainModel(
+            node_types=["fmri"],
+            edge_types=[("fmri", "connects", "fmri")],
+            in_channels_dict={"fmri": 1},
+            hidden_channels=16,
+            prediction_steps=3,
+            predictor_config={"context_length": 10},
+        )
+        model.eval()
+        twin = TwinBrainDigitalTwin(model=model, device="cpu")
+        sim2 = BrainDynamicsSimulator(model=twin, base_graph=g, modality="fmri", device="cpu")
+
+        # state_bounds must be None for z-scored data (data.min() < -0.1)
+        self.assertIsNone(
+            sim2.state_bounds,
+            "state_bounds must be None for z-scored data to prevent spurious "
+            "attractor at 0 during Wolf/FTLE Lyapunov analysis",
+        )
+
+        # sample_random_state() must return values that include negatives
+        x0 = sim2.sample_random_state(rng=np.random.default_rng(42))
+        self.assertEqual(x0.shape, (N,))
+        self.assertTrue(
+            np.any(x0 < 0.0),
+            "sample_random_state() returned all non-negative values for z-scored "
+            "data — the [0,1] clip was not disabled.  This causes large "
+            "pre-stimulation transient oscillations.",
+        )
+        # Values must be finite and within the model's natural operating range.
+        # For z-scored data, any |value| > _MAX_INIT_SIGMA_CHECK would indicate a
+        # pathological initial state far outside the training distribution.
+        _MAX_INIT_SIGMA_CHECK = 20.0  # generous bound: ±20σ is unphysical for any brain signal
+        self.assertTrue(np.all(np.isfinite(x0)), "x0 contains NaN/Inf")
+        self.assertTrue(
+            np.all(np.abs(x0) < _MAX_INIT_SIGMA_CHECK),
+            f"x0 values are unrealistically large (>±{_MAX_INIT_SIGMA_CHECK}σ)",
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
