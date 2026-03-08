@@ -663,5 +663,137 @@ class TestH2WithAttractorDimension(unittest.TestCase):
         self.assertIsNone(H["H2"]["D2"])
 
 
+class TestModalityDefaults(unittest.TestCase):
+    """Test that new modality-related config keys are present in _DEFAULTS."""
+
+    def test_k_cross_modal_default(self):
+        from dynamics_pipeline.run import _DEFAULTS
+        self.assertIn("k_cross_modal", _DEFAULTS["model"])
+        self.assertEqual(_DEFAULTS["model"]["k_cross_modal"], 5)
+
+    def test_fmri_subsample_default(self):
+        from dynamics_pipeline.run import _DEFAULTS
+        self.assertIn("fmri_subsample", _DEFAULTS["simulator"])
+        self.assertEqual(_DEFAULTS["simulator"]["fmri_subsample"], 25)
+
+    def test_n_temporal_windows_default(self):
+        from dynamics_pipeline.run import _DEFAULTS
+        self.assertIn("n_temporal_windows", _DEFAULTS["data_generation"])
+        self.assertIsNone(_DEFAULTS["data_generation"]["n_temporal_windows"])
+
+    def test_lyapunov_method_default(self):
+        from dynamics_pipeline.run import _DEFAULTS
+        lya = _DEFAULTS["dynamics"]["lyapunov"]
+        self.assertIn("method", lya)
+        self.assertEqual(lya["method"], "rosenstein")
+
+    def test_lyapunov_n_workers_default(self):
+        from dynamics_pipeline.run import _DEFAULTS
+        lya = _DEFAULTS["dynamics"]["lyapunov"]
+        self.assertIn("n_workers", lya)
+        self.assertEqual(lya["n_workers"], 1)
+
+    def test_modality_choices(self):
+        """simulator.modality can be fmri/eeg/both/joint."""
+        from dynamics_pipeline.run import _DEFAULTS, _merge
+        for modality in ("fmri", "eeg", "both", "joint"):
+            cfg = _merge(_DEFAULTS, {"simulator": {"modality": modality}})
+            self.assertEqual(cfg["simulator"]["modality"], modality)
+
+    def test_n_workers_override_via_merge(self):
+        from dynamics_pipeline.run import _DEFAULTS, _merge
+        cfg = _merge(_DEFAULTS, {"dynamics": {"lyapunov": {"n_workers": 4}}})
+        self.assertEqual(cfg["dynamics"]["lyapunov"]["n_workers"], 4)
+        # Other lyapunov keys must not be lost
+        self.assertIn("method", cfg["dynamics"]["lyapunov"])
+
+
+class TestPhase3ModalityParam(unittest.TestCase):
+    """Test that modality parameter is respected in run_phase3_dynamics."""
+
+    def _make_cfg(self, **lya_overrides):
+        from dynamics_pipeline.run import _DEFAULTS, _merge
+        lya = {"enabled": False}
+        lya.update(lya_overrides)
+        return _merge(_DEFAULTS, {
+            "dynamics": {
+                "stability": {"enabled": False},
+                "attractor": {"enabled": False},
+                "convergence": {"enabled": False},
+                "lyapunov": lya,
+                "dmd_spectrum": {"enabled": False},
+                "power_spectrum": {"enabled": False},
+                "pca": {"enabled": False},
+                "attractor_dimension": {"enabled": False},
+            },
+            "output": {"save_plots": False},
+        })
+
+    def test_lyapunov_disabled_no_results(self):
+        from dynamics_pipeline.pipeline import run_phase3_dynamics
+        cfg = self._make_cfg()
+        rng = np.random.default_rng(0)
+        trajs = rng.random((5, 50, 10)).astype(np.float32)
+        results = {"trajectories": trajs}
+        sim = MagicMock()
+        sim.n_regions = 10
+        sim.dt = 2.0
+        sim.state_bounds = (0.0, 1.0)
+        sim.modality = "fmri"
+        with tempfile.TemporaryDirectory() as td:
+            run_phase3_dynamics(cfg, results, sim, Path(td), modality="fmri")
+        self.assertNotIn("lyapunov", results)
+
+    def test_phase3_accepts_modality_kwarg(self):
+        """run_phase3_dynamics must accept modality kwarg without error."""
+        from dynamics_pipeline.pipeline import run_phase3_dynamics
+        cfg = self._make_cfg()
+        rng = np.random.default_rng(0)
+        trajs = rng.random((5, 20, 8)).astype(np.float32)
+        results = {"trajectories": trajs}
+        sim = MagicMock()
+        sim.n_regions = 8
+        sim.dt = 2.0
+        sim.state_bounds = None
+        sim.modality = "joint"
+        with tempfile.TemporaryDirectory() as td:
+            # Should not raise
+            run_phase3_dynamics(cfg, results, sim, Path(td), modality="joint")
+
+
+class TestPhase5ModalityParam(unittest.TestCase):
+    """Test that modality parameter is forwarded to run_phase5_advanced."""
+
+    def test_phase5_accepts_modality_kwarg(self):
+        from dynamics_pipeline.pipeline import run_phase5_advanced
+        from dynamics_pipeline.run import _DEFAULTS, _merge
+        cfg = _merge(_DEFAULTS, {
+            "advanced": {
+                "stimulation": {"enabled": False},
+                "energy_constraint": {"enabled": False},
+                "phase_diagram": {"enabled": False},
+                "controllability": {"enabled": False},
+                "information_flow": {"enabled": False},
+                "critical_slowing_down": {"enabled": False},
+            },
+        })
+        results = {}
+        sim = MagicMock()
+        sim.n_regions = 8
+        with tempfile.TemporaryDirectory() as td:
+            # Must not raise for any modality value
+            run_phase5_advanced(cfg, results, sim, Path(td), modality="joint")
+            run_phase5_advanced(cfg, results, sim, Path(td), modality="eeg")
+            run_phase5_advanced(cfg, results, sim, Path(td), modality="fmri")
+
+
+class TestRunPhasesFunctionExists(unittest.TestCase):
+    """Verify _run_phases_for_modality is defined and callable."""
+
+    def test_helper_importable(self):
+        from dynamics_pipeline.pipeline import _run_phases_for_modality
+        self.assertTrue(callable(_run_phases_for_modality))
+
+
 if __name__ == "__main__":
     unittest.main()

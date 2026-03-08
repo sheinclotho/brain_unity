@@ -8,7 +8,7 @@
 ## 快速开始
 
 ```bash
-# 完整分析
+# 完整分析（默认 fMRI 模态）
 python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt
 
 # 快速预实验（参数大幅缩减，适合验证流程）
@@ -19,7 +19,47 @@ python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --phases 
 
 # 带能量约束
 python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --energy-budget 0.3
+
+# EEG 模态分析
+python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality eeg
+
+# 双模态分析（fMRI + EEG 分别运行，结果存入 output/fmri/ 和 output/eeg/）
+python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality both
+
+# 联合模态分析（fMRI + EEG 拼接为统一状态向量）
+python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality joint
+
+# 直接运行（等价于 python -m dynamics_pipeline.run）
+python dynamics_pipeline/run.py --model best_model.pt --graph graph.pt
 ```
+
+---
+
+## 模态选择
+
+管线支持四种模态模式，通过 `--modality` 控制（配置键：`simulator.modality`）：
+
+| 模态 | 说明 | 图缓存要求 | 输出结构 |
+|------|------|-----------|---------|
+| `fmri` | 分析 fMRI BOLD 流（默认） | 需要 `fmri` 节点 | `output_dir/` 平铺 |
+| `eeg` | 分析 EEG 流 | 需要 `eeg` 节点 | `output_dir/` 平铺 |
+| `both` | 对每种模态**独立运行完整管线** | 需要两种节点 | `output_dir/fmri/` + `output_dir/eeg/` |
+| `joint` | 单次运行，使用 **fMRI+EEG 拼接状态向量** | 需要两种节点 | `output_dir/` 平铺 |
+
+### `both` 模式
+
+适用于**对比**两种模态的动力学特性。管线依次运行两遍（fMRI → EEG），每次使用独立的
+模拟器实例，结果保存在各自子目录中。返回值格式为 `{"fmri": {...}, "eeg": {...}}`。
+
+### `joint` 模式
+
+适用于**统一**分析多模态脑状态。单次 `predict_future()` 调用同时获取 fMRI 和 EEG
+预测；各自按 `base_graph` 统计量做逐通道 z-score 归一化后拼接为联合状态向量
+`[z_fmri | z_eeg]`（维度 N_fmri + N_eeg），输出单一动力学指标集合。
+
+**注意**：`joint` 模式下 Lyapunov 方法**自动强制为 `rosenstein`**。原因：Wolf/FTLE
+依赖 [0,1] 状态空间裁剪，联合模态的 z-score 空间无上下界，裁剪会在 0 处产生虚假
+吸引点，污染 LLE 估计。Rosenstein 不依赖状态空间边界，是唯一正确选择。
 
 ---
 
@@ -355,6 +395,8 @@ validation:
 
 ## 输出目录结构
 
+### 单模态（`fmri` / `eeg` / `joint`）
+
 ```
 outputs/dynamics_pipeline/
 ├── trajectories.npy              # Phase 1: 轨迹数据
@@ -381,6 +423,22 @@ outputs/dynamics_pipeline/
 │   ├── lyapunov_histogram.png
 │   └── basin_sizes.png
 └── pipeline_report.json          # Phase 6: 综合报告
+```
+
+### 双模态（`both`）
+
+```
+outputs/dynamics_pipeline/
+├── fmri/                         # fMRI 模态完整结果（同上结构）
+│   ├── trajectories.npy
+│   ├── structure/ ...
+│   ├── dynamics/ ...
+│   └── pipeline_report.json
+└── eeg/                          # EEG 模态完整结果（同上结构）
+    ├── trajectories.npy
+    ├── structure/ ...
+    ├── dynamics/ ...
+    └── pipeline_report.json
 ```
 
 ---
@@ -422,14 +480,14 @@ outputs/dynamics_pipeline/
 
 | 旧步骤 (run_dynamics_analysis.py) | 新阶段 | 备注 |
 |-----------------------------------|--------|------|
-| Step 1-2: 加载模型/创建模拟器 | 初始化 | 移到 `run_pipeline()` 顶部 |
-| Step 3: 自由动力学 | Phase 1a | 不变 |
+| Step 1-2: 加载模型/创建模拟器 | 初始化 | 移到 `run_pipeline()` 顶部，新增模态分发逻辑 |
+| Step 3: 自由动力学 | Phase 1a | 新增 `n_temporal_windows` 参数 |
 | Step 4: 吸引子分析 | Phase 3b | 移到动力学阶段 |
-| Step 5: 虚拟刺激 | Phase 5a | 移到高级阶段 |
+| Step 5: 虚拟刺激 | Phase 5a | 移到高级阶段，新增 joint 模态节点映射日志 |
 | Step 6: 响应矩阵 | Phase 1b | 前移到数据生成阶段 |
 | Step 7: 稳定性分析 | Phase 3a | 不变 |
 | Step 8: 轨迹收敛 | Phase 3c | 不变 |
-| Step 9: Lyapunov 指数 | Phase 3d | 固定为 Rosenstein（非线性权威） |
+| Step 9: Lyapunov 指数 | Phase 3d | 配置驱动方法（默认 Rosenstein），joint 自动强制 Rosenstein，新增 `n_workers` |
 | Step 10: 随机对照 | Phase 4b | 移到验证阶段 |
 | Step 11: 代替检验 | Phase 4a | 移到验证阶段 |
 | Step 12: 嵌入维度 | Phase 4c | D₂ 同时用于 Phase 3h 吸引子维度 |
@@ -437,6 +495,7 @@ outputs/dynamics_pipeline/
 | Step 14: Jacobian (DMD) | Phase 3e | 默认启用，重定位为线性化分析 |
 | **Step 15: Wolf-GS 谱** | **已删除** | **上下文稀释不可修复** |
 | Step 16: 能量约束 | Phase 5b | 不变 |
+| 模态分发（fmri/eeg/both/joint）| `run_pipeline()` | 从旧管线完整移植，`_run_phases_for_modality()` 处理 `both` 模式 |
 
 | 旧实验 (spectral_dynamics) | 新阶段 | 备注 |
 |---------------------------|--------|------|
@@ -465,11 +524,28 @@ python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --quick
 
 检查输出，确认模型加载正确，轨迹形状合理。
 
-### 完整分析
+### 完整分析（单模态）
 
 ```bash
 python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt \
     --n-init 200 --steps 1000
+```
+
+### 双模态对比分析
+
+```bash
+# 对比 fMRI 和 EEG 各自的动力学特性
+python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt \
+    --modality both --output outputs/both_modality
+# 结果: outputs/both_modality/fmri/  和  outputs/both_modality/eeg/
+```
+
+### 联合多模态分析
+
+```bash
+# 使用 fMRI+EEG 拼接状态向量，分析整体脑动力学
+python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt \
+    --modality joint --output outputs/joint_modality
 ```
 
 ### 能量约束假设测试
