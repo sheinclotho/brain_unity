@@ -68,7 +68,7 @@ from spectral_dynamics.e4_structural_perturbation import (
 )
 from spectral_dynamics.e5_phase_diagram import (
     _compute_oscillation_amplitude,
-    _simple_rosenstein,
+    _lle_from_trajs,
     run_phase_diagram,
 )
 from spectral_dynamics.e6_random_comparison import (
@@ -240,7 +240,7 @@ class TestSpectralAnalysis(unittest.TestCase):
 class TestModalProjection(unittest.TestCase):
     def setUp(self):
         self.W = _low_rank_matrix()
-        self.trajs = _wc_trajectories(self.W)
+        self.trajs = _random_trajectories()
 
     def test_symmetric_projection_shape(self):
         W_sym = symmetrize(self.W)
@@ -352,8 +352,7 @@ class TestStructuralPerturbation(unittest.TestCase):
 
     def test_run_structural_perturbation_returns_keys(self):
         result = run_structural_perturbation(
-            self.W, label="test",
-            n_traj_lle=5, steps_lle=50, k_values=[1, 3], seed=0
+            self.W, label="test", k_values=[1, 3], seed=0
         )
         self.assertIn("original", result)
         self.assertIn("weight_shuffle", result)
@@ -362,17 +361,18 @@ class TestStructuralPerturbation(unittest.TestCase):
 
     def test_run_structural_perturbation_original_metrics(self):
         result = run_structural_perturbation(
-            self.W, label="test",
-            n_traj_lle=5, steps_lle=50, k_values=[1], seed=0
+            self.W, label="test", k_values=[1], seed=0
         )
         self.assertIn("spectral_radius", result["original"])
         self.assertIn("participation_ratio", result["original"])
+        # lle_wc must NOT be present — no WC in this project
+        self.assertNotIn("lle_wc", result["original"])
 
     def test_run_structural_perturbation_saves_json(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             run_structural_perturbation(
                 self.W, output_dir=Path(tmpdir), label="test",
-                n_traj_lle=5, steps_lle=50, k_values=[1], seed=0
+                k_values=[1], seed=0
             )
             self.assertTrue((Path(tmpdir) / "perturbation_summary_test.json").exists())
 
@@ -385,13 +385,6 @@ class TestPhaseDiagram(unittest.TestCase):
     def setUp(self):
         self.W = _low_rank_matrix(rho=0.8)
 
-    def test_wc_trajectories_bounded(self):
-        # WC dynamics: x(t+1) = clip(tanh(g*W@x), 0, 1) must stay in [0, 1]
-        W = _low_rank_matrix(rho=0.9)
-        trajs = _wc_trajectories(W, n_traj=5, steps=50)
-        self.assertGreaterEqual(float(trajs.min()), -1e-6)
-        self.assertLessEqual(float(trajs.max()), 1.0 + 1e-6)
-
     def test_oscillation_amplitude_positive(self):
         trajs = _random_trajectories()
         amp = _compute_oscillation_amplitude(trajs)
@@ -402,44 +395,50 @@ class TestPhaseDiagram(unittest.TestCase):
         amp = _compute_oscillation_amplitude(trajs)
         self.assertAlmostEqual(amp, 0.0, places=5)
 
-    def test_simple_rosenstein_finite(self):
-        trajs = _wc_trajectories(self.W)
-        lle = _simple_rosenstein(trajs[0], max_lag=15)
-        self.assertTrue(np.isfinite(lle) or np.isnan(lle))  # may be nan for short series
+    def test_lle_from_trajs_finite(self):
+        trajs = _random_trajectories()
+        lle = _lle_from_trajs(trajs, max_lag=15)
+        # May be nan when analysis.lyapunov is not on path; must not crash
+        self.assertTrue(np.isfinite(lle) or np.isnan(lle))
 
     def test_run_phase_diagram_keys(self):
         result = run_phase_diagram(
             self.W, g_min=0.5, g_max=1.5, g_step=0.5,
-            n_traj=5, steps=60, warmup=10, max_lag=10
         )
-        for k in ("g_values", "lles", "oscillation_amplitudes", "spectral_radii",
-                  "actual_rho_W", "g_linear_critical", "critical_g_lle0"):
+        for k in ("g_values", "spectral_radii", "actual_rho_W",
+                  "g_linear_critical", "h3_supported"):
             self.assertIn(k, result)
+        # Old WC keys must not be present
+        self.assertNotIn("lles", result)
+        self.assertNotIn("oscillation_amplitudes", result)
+        self.assertNotIn("critical_g_lle0", result)
 
     def test_run_phase_diagram_g_values_length(self):
         result = run_phase_diagram(
             self.W, g_min=0.5, g_max=1.5, g_step=0.5,
-            n_traj=5, steps=60, warmup=10, max_lag=10
         )
-        g_arr = np.array(result["g_values"])
         expected_len = len(np.arange(0.5, 1.5 + 0.25, 0.5))
-        self.assertEqual(len(g_arr), expected_len)
+        self.assertEqual(len(result["g_values"]), expected_len)
 
     def test_run_phase_diagram_spectral_radii_scale_with_g(self):
         result = run_phase_diagram(
             self.W, g_min=0.5, g_max=1.5, g_step=0.5,
-            n_traj=5, steps=60, warmup=10, max_lag=10
         )
         rhos = result["spectral_radii"]
-        # Spectral radii should increase monotonically with g
         self.assertLess(rhos[0], rhos[-1])
+
+    def test_run_phase_diagram_lle_reference_annotated(self):
+        result = run_phase_diagram(
+            self.W, g_min=0.5, g_max=1.5, g_step=0.5,
+            lle_reference=-0.05,
+        )
+        self.assertAlmostEqual(result["lle_at_g1"], -0.05, places=4)
 
     def test_run_phase_diagram_saves_json(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             run_phase_diagram(
                 self.W, g_min=0.5, g_max=1.0, g_step=0.5,
-                n_traj=5, steps=60, warmup=10, max_lag=10,
-                output_dir=Path(tmpdir), label="test"
+                output_dir=Path(tmpdir), label="test",
             )
             self.assertTrue((Path(tmpdir) / "phase_diagram_test.json").exists())
 
@@ -467,42 +466,34 @@ class TestRandomSpectralComparison(unittest.TestCase):
         self.assertFalse(np.allclose(W1, W2))
 
     def test_run_random_spectral_comparison_keys(self):
-        result = run_random_spectral_comparison(
-            self.W, n_random=3, n_traj_lle=5, steps_lle=50
-        )
+        result = run_random_spectral_comparison(self.W, n_random=3)
         for k in ("real", "er_random", "degree_preserving_rewire",
                   "weight_shuffle", "z_scores_vs_er", "h1_supported"):
             self.assertIn(k, result)
 
     def test_run_random_spectral_comparison_real_metrics(self):
-        result = run_random_spectral_comparison(
-            self.W, n_random=3, n_traj_lle=5, steps_lle=50
-        )
+        result = run_random_spectral_comparison(self.W, n_random=3)
         self.assertIn("participation_ratio", result["real"])
         self.assertGreater(result["real"]["participation_ratio"], 0.0)
+        # WC LLE must not be present
+        self.assertNotIn("lle_wc", result["real"])
 
     def test_run_random_spectral_comparison_er_has_mean_std(self):
-        result = run_random_spectral_comparison(
-            self.W, n_random=3, n_traj_lle=5, steps_lle=50
-        )
+        result = run_random_spectral_comparison(self.W, n_random=3)
         er = result["er_random"]
         self.assertIn("participation_ratio_mean", er)
         self.assertIn("participation_ratio_std", er)
 
     def test_low_rank_matrix_pr_below_er(self):
-        # A clearly low-rank matrix should have lower PR than ER with high probability
-        result = run_random_spectral_comparison(
-            self.W, n_random=5, n_traj_lle=5, steps_lle=50
-        )
+        result = run_random_spectral_comparison(self.W, n_random=5)
         z = result["z_scores_vs_er"]["pr_z"]
-        # z should be negative (real PR << ER PR)
         if np.isfinite(z):
-            self.assertLess(z, 1.0)  # At least not significantly above ER
+            self.assertLess(z, 1.0)
 
     def test_run_random_spectral_comparison_saves_json(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             run_random_spectral_comparison(
-                self.W, n_random=3, n_traj_lle=5, steps_lle=50,
+                self.W, n_random=3,
                 output_dir=Path(tmpdir), label="test"
             )
             self.assertTrue(
@@ -526,11 +517,7 @@ class TestRunAllSynthetic(unittest.TestCase):
                 response_matrix=self.R,
                 output_dir=Path(tmpdir),
                 experiments=experiments,
-                n_traj_lle=5,
-                steps_lle=60,
                 n_random=3,
-                n_traj_phase=5,
-                steps_phase=60,
                 g_min=0.5,
                 g_max=1.5,
                 g_step=0.5,
@@ -587,8 +574,6 @@ class TestRunAllSynthetic(unittest.TestCase):
                 response_matrix=self.R,
                 output_dir=Path(tmpdir),
                 experiments=["B_E1"],
-                n_traj_lle=5,
-                steps_lle=60,
             )
             self.assertIn("E1_main", result["results"])
 
@@ -599,8 +584,6 @@ class TestRunAllSynthetic(unittest.TestCase):
                 response_matrix=None,
                 output_dir=Path(tmpdir),
                 experiments=["B_E1"],
-                n_traj_lle=5,
-                steps_lle=60,
             )
             self.assertIn("E1_main", result["results"])
 
@@ -780,7 +763,7 @@ class TestHierarchicalStructure(unittest.TestCase):
 class TestPCAAttractor(unittest.TestCase):
     def setUp(self):
         self.W = _low_rank_matrix()
-        self.trajs = _wc_trajectories(self.W, n_traj=8, steps=60)
+        self.trajs = _random_trajectories(n_traj=8, steps=60)
 
     def test_compute_pca_shapes(self):
         result = compute_pca(self.trajs)
@@ -914,145 +897,44 @@ class TestPowerSpectrum(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# I: Energy Constraint
+# I: Energy Budget (GNN trajectories → run_energy_budget)
 # ══════════════════════════════════════════════════════════════════════════════
 
-from spectral_dynamics.i_energy_constraint import (
-    run_energy_constraint_wc,
-    _project_energy_wc,
-)
+from spectral_dynamics.i_energy_constraint import run_energy_budget
 
 
-class TestEnergyConstraint(unittest.TestCase):
+class TestEnergyBudget(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        N = 15
-        rng = np.random.default_rng(11)
-        W = rng.standard_normal((N, N)).astype(np.float32) * 0.25
-        rho = float(np.abs(np.linalg.eigvals(W.astype(np.float64))).max())
-        cls.W = (W * 0.9 / max(rho, 1e-6)).astype(np.float32)
-        cls.N = N
+        cls.trajs = _random_trajectories(n_traj=10, steps=80, n=N).astype(np.float32)
 
-    # ── L1 projection tests ───────────────────────────────────────────────────
-
-    def test_project_energy_feasible_unchanged(self):
-        """If already feasible, projection returns input unchanged."""
-        rng = np.random.default_rng(0)
-        y = rng.random(self.N).astype(np.float32) * 0.2   # mean ≈ 0.1
-        x, active = _project_energy_wc(y, 0.5)            # E_budget=0.5 >> 0.1
-        self.assertFalse(active)
-        np.testing.assert_array_almost_equal(x, y.clip(0, 1), decimal=5)
-
-    def test_project_energy_budget_respected(self):
-        """After projection, mean(x) ≤ E_budget."""
-        rng = np.random.default_rng(1)
-        y = rng.random(self.N).astype(np.float32) * 0.9   # mean ≈ 0.45
-        E_budget = 0.20
-        x, active = _project_energy_wc(y, E_budget)
-        self.assertTrue(active)
-        self.assertLessEqual(float(x.mean()), E_budget + 1e-4)
-
-    def test_project_energy_sparse(self):
-        """Tight budget creates sparsity when inputs are heterogeneous."""
-        # Heterogeneous input: half neurons fire strongly, half fire weakly
-        y = np.zeros(self.N, dtype=np.float32)
-        y[:self.N // 2] = 0.8    # strong activations
-        y[self.N // 2:] = 0.05   # weak activations
-        # Budget tight enough to silence weak neurons
-        E_budget = 0.20
-        x, active = _project_energy_wc(y, E_budget)
-        self.assertTrue(active)
-        # Weak neurons should be silenced (the L1 projection sets them to 0)
-        n_zeros = int((x < 1e-5).sum())
-        self.assertGreater(n_zeros, 0, "L1 projection should silence weak neurons")
-
-    def test_project_energy_gradient_input(self):
-        """Gradient input: threshold λ* correctly partitions by activation strength."""
-        # Linearly increasing activations from 0.01 to 0.9
-        y = np.linspace(0.01, 0.9, self.N, dtype=np.float32)
-        E_budget = 0.15
-        x, active = _project_energy_wc(y, E_budget)
-        self.assertTrue(active)
-        # Verify budget is respected
-        self.assertLessEqual(float(x.mean()), E_budget + 1e-4)
-        # Verify threshold partitions by value: all zeroed neurons had smaller
-        # original activation than all surviving neurons
-        zeroed = y[x < 1e-5]
-        surviving = y[x >= 1e-5]
-        if len(zeroed) > 0 and len(surviving) > 0:
-            self.assertLess(float(zeroed.max()), float(surviving.min()) + 1e-4)
-
-    def test_project_energy_in_bounds(self):
-        """Output must stay in [0,1]."""
-        rng = np.random.default_rng(2)
-        y = rng.random(self.N).astype(np.float32)
-        x, _ = _project_energy_wc(y, 0.15)
-        self.assertGreaterEqual(float(x.min()), 0.0)
-        self.assertLessEqual(float(x.max()), 1.0 + 1e-6)
-
-    # ── run_energy_constraint_wc tests ────────────────────────────────────────
-
-    def test_constraint_wc_keys(self):
-        result = run_energy_constraint_wc(
-            self.W, E_budget_values=[None, 0.30],
-            n_traj=3, steps=40, warmup=5, seed=0,
-        )
-        for key in ("conditions", "E_star", "rho_W", "hypothesis_supported"):
+    def test_energy_budget_keys(self):
+        result = run_energy_budget(self.trajs)
+        for key in ("E_mean", "E_std", "E_median", "E_per_region", "recommended_budgets"):
             self.assertIn(key, result)
 
-    def test_constraint_wc_conditions_have_required_fields(self):
-        result = run_energy_constraint_wc(
-            self.W, E_budget_values=[None, 0.30],
-            n_traj=3, steps=40, warmup=5, seed=0,
-        )
-        for cname, info in result["conditions"].items():
-            for field in ("lle", "osc_amplitude", "mean_activity", "projection_rate"):
-                self.assertIn(field, info, f"Missing {field!r} in condition {cname!r}")
+    def test_energy_budget_recommended_budgets_keys(self):
+        result = run_energy_budget(self.trajs)
+        rec = result["recommended_budgets"]
+        for k in ("tight_constraint", "moderate_constraint", "natural", "relaxed"):
+            self.assertIn(k, rec)
 
-    def test_constraint_wc_projection_rate_zero_for_unconstrained(self):
-        """Unconstrained condition must have projection_rate=0."""
-        result = run_energy_constraint_wc(
-            self.W, E_budget_values=[None, 0.25],
-            n_traj=3, steps=40, warmup=5, seed=0,
-        )
-        baseline = next(info for info in result["conditions"].values()
-                        if info["E_budget"] is None)
-        self.assertAlmostEqual(baseline["projection_rate"], 0.0, places=5)
+    def test_energy_budget_tight_less_than_relaxed(self):
+        result = run_energy_budget(self.trajs)
+        rec = result["recommended_budgets"]
+        self.assertLess(rec["tight_constraint"], rec["relaxed"])
 
-    def test_constraint_wc_projection_rate_positive_when_constrained(self):
-        """Tight budget must cause constraint to activate."""
-        result = run_energy_constraint_wc(
-            self.W, E_budget_values=[None, 0.05],
-            n_traj=3, steps=40, warmup=5, seed=0,
-        )
-        tight = next(info for info in result["conditions"].values()
-                     if info["E_budget"] is not None)
-        self.assertGreater(tight["projection_rate"], 0.0)
+    def test_energy_budget_e_mean_positive(self):
+        result = run_energy_budget(self.trajs)
+        self.assertGreater(result["E_mean"], 0.0)
 
-    def test_constraint_wc_mean_activity_respects_budget(self):
-        """With tight budget, mean_activity ≤ E_budget + tolerance."""
-        E_budget = 0.10
-        result = run_energy_constraint_wc(
-            self.W, E_budget_values=[None, E_budget],
-            n_traj=3, steps=40, warmup=5, seed=0,
-        )
-        tight = next(info for info in result["conditions"].values()
-                     if info["E_budget"] == E_budget)
-        self.assertLessEqual(tight["mean_activity"], E_budget + 0.02)
-
-    def test_constraint_wc_saves_files(self):
+    def test_energy_budget_saves_json(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            run_energy_constraint_wc(
-                self.W, E_budget_values=[None, 0.30],
-                n_traj=3, steps=40, warmup=5, seed=0,
+            run_energy_budget(
+                self.trajs,
                 output_dir=Path(tmpdir), label="test",
             )
-            self.assertTrue(
-                (Path(tmpdir) / "energy_constraint_test.json").exists()
-            )
-            self.assertTrue(
-                (Path(tmpdir) / "energy_constraint_test.png").exists()
-            )
+            self.assertTrue((Path(tmpdir) / "energy_budget_test.json").exists())
 
 
 class TestRunAllNewExperiments(unittest.TestCase):
@@ -1086,7 +968,8 @@ class TestRunAllNewExperiments(unittest.TestCase):
                 experiments=["I"],
             )
             self.assertIn("I", summary["results"])
-            self.assertIn("conditions", summary["results"]["I"])
+            self.assertIn("E_mean", summary["results"]["I"])
+            self.assertIn("recommended_budgets", summary["results"]["I"])
 
     def test_h5_hypothesis_populated(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1098,7 +981,6 @@ class TestRunAllNewExperiments(unittest.TestCase):
             )
             hyp = summary["hypotheses"]
             self.assertIn("H5_energy_constraint_criticality", hyp)
-            self.assertIn("bifurcation_found",
-                          hyp["H5_energy_constraint_criticality"])
+            self.assertIn("E_mean", hyp["H5_energy_constraint_criticality"])
 
 

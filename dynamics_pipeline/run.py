@@ -17,6 +17,15 @@ import logging
 import sys
 from pathlib import Path
 
+# Allow running this file directly (e.g. ``python dynamics_pipeline/run.py``)
+# in addition to the standard module invocation
+# (``python -m dynamics_pipeline.run``).  The relative import below requires
+# ``__package__`` to be set, which Python only sets automatically for the
+# module-invocation style.
+if __name__ == "__main__" and __package__ is None:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = "dynamics_pipeline"
+
 from .pipeline import run_pipeline
 
 logger = logging.getLogger("dynamics_pipeline")
@@ -29,9 +38,34 @@ _DEFAULTS = {
         "graph_path": None,
         "config_path": None,
         "device": "auto",
+        # Number of cross-modal (EEG→fMRI) edges added per EEG electrode when
+        # rebuilding graph structure for inference (see API.md §2.5).
+        "k_cross_modal": 5,
     },
-    "simulator": {"modality": "fmri"},
-    "data_generation": {"n_init": 100, "steps": 500, "seed": 42},
+    "simulator": {
+        # Which modality to analyse: 'fmri', 'eeg', 'both', or 'joint'.
+        # - 'fmri'  : analyse the fMRI BOLD stream only.
+        # - 'eeg'   : analyse the EEG stream only.
+        # - 'both'  : run the full pipeline independently for each modality,
+        #             outputting separate results under output_dir/fmri/ and
+        #             output_dir/eeg/.  Requires both node types in the graph.
+        # - 'joint' : single pipeline run using a COMBINED fMRI+EEG state
+        #             vector (z-score normalised, then concatenated).
+        #             Requires both 'fmri' and 'eeg' nodes in the graph cache.
+        "modality": "fmri",
+        # Internal fMRI sub-sampling factor (kept for compatibility; model
+        # infers dt from graph).
+        "fmri_subsample": 25,
+    },
+    "data_generation": {
+        "n_init": 100,
+        "steps": 500,
+        "seed": 42,
+        # Number of sliding context windows used for free-dynamics rollouts.
+        # None = auto-compute from trajectory length.  Set explicitly to limit
+        # the number of distinct historical contexts sampled.
+        "n_temporal_windows": None,
+    },
     "network_structure": {
         "enabled": True,
         "spectral": {"enabled": True},
@@ -45,8 +79,17 @@ _DEFAULTS = {
         "attractor": {"enabled": True, "tail_steps": 50, "k_candidates": [2, 3, 4, 5, 6]},
         "convergence": {"enabled": True, "n_pairs": 50},
         "lyapunov": {
-            "enabled": True, "max_lag": 50, "min_sep": 20, "n_segments": 3,
-            "convergence_threshold": 0.05, "delay_embed_dim": 0, "delay_embed_tau": 1,
+            "enabled": True,
+            # Method: 'rosenstein' (default, zero extra model calls, no
+            # context-dilution bias), 'wolf', 'ftle', or 'both'.
+            # joint modality always forces 'rosenstein'.
+            "method": "rosenstein",
+            "max_lag": 50, "min_sep": 20, "n_segments": 3,
+            "convergence_threshold": 0.05,
+            "delay_embed_dim": 0, "delay_embed_tau": 1,
+            # Parallel workers for Wolf/FTLE (1 = sequential).
+            # Keep at 1 for GPU inference to avoid VRAM contention.
+            "n_workers": 1,
         },
         "dmd_spectrum": {"enabled": True, "tail_steps": 20, "n_states": 3},
         "power_spectrum": {"enabled": True},
@@ -129,6 +172,9 @@ Examples:
   Full run:   python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt
   Quick run:  python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --quick
   Phases 1-3: python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --phases 1 2 3
+  EEG mode:   python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality eeg
+  Both modes: python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality both
+  Joint mode: python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality joint
         """,
     )
     p.add_argument("--model", required=True, help="Trained model checkpoint (.pt)")
@@ -136,7 +182,17 @@ Examples:
     p.add_argument("--config", type=Path, default=None, help="YAML config override")
     p.add_argument("--training-config", default=None, help="Training config.yaml")
     p.add_argument("--output", default=None, help="Output directory")
-    p.add_argument("--modality", choices=["fmri", "eeg", "both", "joint"], default=None)
+    p.add_argument(
+        "--modality",
+        choices=["fmri", "eeg", "both", "joint"],
+        default=None,
+        help=(
+            "Which brain-data stream(s) to analyse: "
+            "'fmri' (default), 'eeg', "
+            "'both' (run pipeline twice, once per modality, into output/<modality>/), "
+            "'joint' (combined fMRI+EEG z-score state vector)."
+        ),
+    )
     p.add_argument("--device", choices=["cpu", "cuda", "auto"], default=None)
     p.add_argument("--n-init", type=int, default=None, help="Number of trajectories")
     p.add_argument("--steps", type=int, default=None, help="Steps per trajectory")
@@ -146,6 +202,18 @@ Examples:
                    help="Run only specific phases (1-6)")
     p.add_argument("--energy-budget", type=float, default=None,
                    help="Energy constraint budget (L1 projection)")
+    p.add_argument(
+        "--n-workers",
+        type=int,
+        default=None,
+        dest="n_workers",
+        help=(
+            "Parallel workers for Lyapunov Wolf/FTLE analysis (overrides config, "
+            "default 1). Set >1 for CPU multi-core acceleration. "
+            "Keep at 1 for GPU inference to avoid VRAM contention. "
+            "Rosenstein method (default) is not affected by this flag."
+        ),
+    )
     return p.parse_args()
 
 
@@ -185,6 +253,8 @@ def main() -> None:
         cfg["output"]["save_plots"] = False
     if args.energy_budget is not None:
         cfg["advanced"]["energy_constraint"]["E_budget"] = args.energy_budget
+    if args.n_workers is not None:
+        cfg["dynamics"]["lyapunov"]["n_workers"] = args.n_workers
 
     # Phase selection: disable phases not requested
     if args.phases:

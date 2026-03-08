@@ -103,7 +103,7 @@ from .d_hierarchical_structure import run_hierarchical_structure
 from .f_pca_attractor import run_pca_attractor
 # New analyses (H, I)
 from .h_power_spectrum import run_power_spectrum
-from .i_energy_constraint import run_energy_constraint_wc
+from .i_energy_constraint import run_energy_budget
 
 _ALL_EXPERIMENTS = ["A", "B_E1", "C", "D", "E2E3", "E4", "E5", "E6", "F",
                     "H", "I"]
@@ -168,43 +168,50 @@ def run_all(
     experiments: Optional[List[str]] = None,
     # Community detection
     k_range: Optional[List[int]] = None,
-    # E4/E5/E6 performance params
-    n_traj_lle: int = 20,
-    steps_lle: int = 200,
-    g_lle: float = 0.9,
+    # E4/E6 performance params
     n_random: int = 10,
     g_min: float = 0.1,
     g_max: float = 3.0,
     g_step: float = 0.2,
-    n_traj_phase: int = 15,
-    steps_phase: int = 200,
     # PCA
     burnin: int = 0,
     seed: int = 42,
+    # Legacy params (ignored — no longer used)
+    n_traj_lle: int = 0,
+    steps_lle: int = 0,
+    g_lle: float = 0.9,
+    n_traj_phase: int = 0,
+    steps_phase: int = 0,
 ) -> dict:
     """
     运行全部（或指定的）谱动力学实验。
 
+    所有实验仅对 GNN 生成的轨迹和响应矩阵做分析，不运行任何独立的动力学模拟。
+
     Args:
-        trajectories:   shape (n_init, T, N)，自由动力学轨迹；
-                        None → 仅用 FC 分析（需要响应矩阵也有轨迹补充）
-        response_matrix: shape (N, N)，有效连接/响应矩阵；
-                         None → 仅用 FC 作为连接矩阵
+        trajectories:   shape (n_init, T, N)，GNN 自由动力学轨迹；
+                        None → 仅用 FC 分析。
+        response_matrix: shape (N, N)，GNN 有效连接/响应矩阵；
+                         None → 仅用 FC 作为连接矩阵。
         output_dir:     所有输出文件的保存目录。
         experiments:    要运行的实验列表（如 ["E1", "E4"]）；
                         None → 全部运行。
-        n_traj_lle:     E4/E6 中 LLE 估计的轨迹数。
-        steps_lle:      E4/E6 中 LLE 估计的步数。
-        g_lle:          E4/E6/E6 中 WC LLE 耦合强度。
         n_random:       E6 中随机对照的实现数。
-        g_min/max/step: E5 相图扫描范围。
-        n_traj_phase:   E5 每个 g 值的轨迹数。
-        steps_phase:    E5 每条轨迹步数。
+        g_min/max/step: E5 相图扫描范围（谱半径解析扫描，无仿真）。
         seed:           全局随机种子。
 
     Returns:
         run_summary dict，含各实验结果摘要。
     """
+    # Warn if caller passes legacy WC params (they no longer have any effect)
+    if n_traj_lle or steps_lle or n_traj_phase or steps_phase:
+        import warnings
+        warnings.warn(
+            "n_traj_lle, steps_lle, n_traj_phase, steps_phase are ignored — "
+            "WC simulation has been removed. spectral_dynamics now operates "
+            "purely on GNN-generated trajectories and response matrices.",
+            DeprecationWarning, stacklevel=2,
+        )
     if experiments is None:
         experiments = _ALL_EXPERIMENTS
     # Normalize aliases (E1 → B_E1, B → B_E1)
@@ -346,15 +353,12 @@ def run_all(
         t0 = time.time()
         logger.info("═══ E4: 结构扰动实验 ═══")
         r4 = run_structural_perturbation(
-            W_main, output_dir=output_dir, label=W_label,
-            n_traj_lle=n_traj_lle, steps_lle=steps_lle, g=g_lle, seed=seed,
+            W_main, output_dir=output_dir, label=W_label, seed=seed,
         )
         run_summary["results"]["E4"] = {
             "original_pr": r4["original"]["participation_ratio"],
             "shuffle_delta_pr": r4["weight_shuffle"].get("delta_pr"),
             "rewire_delta_pr": r4["degree_preserving_rewire"].get("delta_pr"),
-            "original_lle": r4["original"]["lle_wc"],
-            "shuffle_delta_lle": r4["weight_shuffle"].get("delta_lle"),
         }
         logger.info("E4 完成 (%.1fs)", time.time() - t0)
 
@@ -362,21 +366,35 @@ def run_all(
     if "E5" in experiments:
         t0 = time.time()
         logger.info("═══ E5: 耦合强度相图 ═══")
+        # Compute LLE reference from GNN trajectories produced by earlier pipeline
+        # steps — E5 itself is pure spectral analysis; it receives a precomputed float.
+        lle_reference = None
+        if trajectories is not None:
+            try:
+                from analysis.lyapunov import rosenstein_lyapunov
+                lles = [
+                    rosenstein_lyapunov(trajectories[i])[0]
+                    for i in range(min(10, len(trajectories)))
+                ]
+                valid = [v for v in lles if np.isfinite(v)]
+                if valid:
+                    lle_reference = float(np.median(valid))
+                    logger.info("E5: 流水线 LLE 参考值 (g=1) = %.4f", lle_reference)
+            except Exception as exc:
+                logger.debug("E5: LLE 参考值计算失败 (%s)，跳过标注。", exc)
         r5 = run_phase_diagram(
             W_main, g_min=g_min, g_max=g_max, g_step=g_step,
-            n_traj=n_traj_phase, steps=steps_phase,
-            output_dir=output_dir, label=W_label, seed=seed,
+            lle_reference=lle_reference,
+            output_dir=output_dir, label=W_label,
         )
         run_summary["results"]["E5"] = {
             "actual_rho_W": r5["actual_rho_W"],
             "g_linear_critical": r5["g_linear_critical"],
-            "critical_g_lle0": r5["critical_g_lle0"],
             "h3_supported": r5["h3_supported"],
         }
         run_summary["hypotheses"]["H3_near_critical"] = {
             "spectral_radius": r5["actual_rho_W"],
             "g_linear_critical": r5["g_linear_critical"],
-            "critical_g_where_lle0": r5["critical_g_lle0"],
             "h3_supported": r5["h3_supported"],
         }
         logger.info("E5 完成 (%.1fs)", time.time() - t0)
@@ -387,7 +405,6 @@ def run_all(
         logger.info("═══ E6: 随机网络谱比较 ═══")
         r6 = run_random_spectral_comparison(
             W_main, n_random=n_random,
-            n_traj_lle=n_traj_lle, steps_lle=steps_lle, g_lle=g_lle,
             output_dir=output_dir, label=W_label, seed=seed,
         )
         run_summary["results"]["E6"] = {
@@ -462,31 +479,28 @@ def run_all(
         logger.warning("H 跳过：未提供轨迹数据。")
 
     # ── I: Energy constraint experiment ───────────────────────────────────────
-    if "I" in experiments and W_main is not None:
+    if "I" in experiments and trajectories is not None:
         t0 = time.time()
-        logger.info("═══ I: 能量约束实验（L1 投影 vs 无约束对比）═══")
+        logger.info("═══ I: 能量约束预算分析 ═══")
         try:
-            rI = run_energy_constraint_wc(
-                W_main,
-                E_budget_values=[None, 0.5, 0.35, 0.20],
-                n_traj=10, steps=200, warmup=50,
-                seed=seed, output_dir=output_dir, label=W_label,
+            rI = run_energy_budget(
+                trajectories,
+                output_dir=output_dir, label=W_label,
             )
-            run_summary["results"]["I"] = rI
+            run_summary["results"]["I"] = {
+                k: v.tolist() if isinstance(v, np.ndarray) else v
+                for k, v in rI.items()
+            }
             run_summary["hypotheses"].setdefault(
                 "H5_energy_constraint_criticality", {}
             ).update({
-                "hypothesis_supported": rI["hypothesis_supported"],
-                "E_star": rI.get("E_star"),
-                "rho_W": rI.get("rho_W"),
-                "h5_supported": rI["hypothesis_supported"],
-                "bifurcation_found": rI["hypothesis_supported"],
+                "E_mean": rI.get("E_mean"),
+                "recommended_budgets": rI.get("recommended_budgets"),
             })
             logger.info(
-                "I 完成 (%.1fs): hypothesis_supported=%s, E*=%.4f",
+                "I 完成 (%.1fs): E*=%.4f",
                 time.time() - t0,
-                rI["hypothesis_supported"],
-                rI.get("E_star") or float("nan"),
+                rI.get("E_mean") or float("nan"),
             )
         except Exception as exc:
             logger.warning("I 失败: %s", exc)
@@ -584,19 +598,11 @@ def _parse_args() -> argparse.Namespace:
                       help="F 模块 PCA 中跳过的前 N 步（去除瞬态）")
     perf.add_argument("--k-range", nargs="*", type=int, default=None,
                       help="C 模块社区检测候选 k 列表，如 3 4 5 6 7 8")
-    perf.add_argument("--n-traj-lle", type=int, default=20,
-                      help="E4/E6 LLE 估计轨迹数")
-    perf.add_argument("--steps-lle", type=int, default=200,
-                      help="E4/E6 LLE 估计步数")
     perf.add_argument("--n-random", type=int, default=10,
                       help="E6 随机对照实现数")
     perf.add_argument("--g-min", type=float, default=0.1)
     perf.add_argument("--g-max", type=float, default=3.0)
     perf.add_argument("--g-step", type=float, default=0.2)
-    perf.add_argument("--n-traj-phase", type=int, default=15,
-                      help="E5 每个 g 值的轨迹数")
-    perf.add_argument("--steps-phase", type=int, default=200,
-                      help="E5 每条轨迹步数")
     perf.add_argument("--seed", type=int, default=42)
 
     return p.parse_args()
@@ -640,14 +646,10 @@ def main() -> None:
         output_dir=args.output_dir,
         experiments=args.experiments,
         k_range=args.k_range,
-        n_traj_lle=args.n_traj_lle,
-        steps_lle=args.steps_lle,
         n_random=args.n_random,
         g_min=args.g_min,
         g_max=args.g_max,
         g_step=args.g_step,
-        n_traj_phase=args.n_traj_phase,
-        steps_phase=args.steps_phase,
         burnin=args.burnin,
         seed=args.seed,
     )

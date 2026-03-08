@@ -100,6 +100,7 @@ def run_phase1_data(cfg: dict, simulator, output_dir: Path,
         seed=dg.get("seed", 42),
         output_dir=output_dir if cfg["output"].get("save_trajectories") else None,
         device=device,
+        n_temporal_windows=dg.get("n_temporal_windows", None),
     )
     results["trajectories"] = trajectories
     logger.info("  → trajectories shape: %s", trajectories.shape)
@@ -227,7 +228,8 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
 
 
 def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
-                        simulator, output_dir: Path) -> None:
+                        simulator, output_dir: Path,
+                        modality: str = "fmri") -> None:
     """Phase 3: Dynamics characterisation from trajectory data."""
     dyn_cfg = cfg.get("dynamics", {})
     trajs = results.get("trajectories")
@@ -293,15 +295,28 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
         except Exception as e:
             logger.warning("  Trajectory convergence failed: %s", e)
 
-    # 3d: Lyapunov exponent (Rosenstein — zero extra model calls, no bias)
+    # 3d: Lyapunov exponent
+    # Default method: "rosenstein" (zero extra model calls, no context-dilution bias).
+    # For joint mode, Wolf/FTLE would clip z-scored states to [0,1] producing
+    # spurious attractors — force rosenstein automatically.
     lya_cfg = dyn_cfg.get("lyapunov", {})
     if lya_cfg.get("enabled", True):
         try:
             from analysis.lyapunov import run_lyapunov_analysis
+            lya_method = lya_cfg.get("method", "rosenstein")
+            if modality == "joint" and lya_method != "rosenstein":
+                logger.info(
+                    "  joint modality: auto-switching Lyapunov method '%s' → "
+                    "'rosenstein'. Wolf/FTLE relies on [0,1] state-space clipping; "
+                    "the joint z-score state space is unbounded so clipping would "
+                    "introduce spurious attractors.",
+                    lya_method,
+                )
+                lya_method = "rosenstein"
             lya = run_lyapunov_analysis(
                 trajectories=trajs,
                 simulator=simulator,
-                method="rosenstein",
+                method=lya_method,
                 convergence_result=results.get("convergence"),
                 convergence_threshold=lya_cfg.get("convergence_threshold", 0.05),
                 n_segments=lya_cfg.get("n_segments", 3),
@@ -309,12 +324,15 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
                 rosenstein_min_sep=lya_cfg.get("min_sep", 20),
                 rosenstein_delay_embed_dim=lya_cfg.get("delay_embed_dim", 0),
                 rosenstein_delay_embed_tau=lya_cfg.get("delay_embed_tau", 1),
+                n_workers=lya_cfg.get("n_workers", 1),
                 output_dir=dyn_dir,
             )
             results["lyapunov"] = lya
             regime = lya["chaos_regime"]["regime"]
             mean_lya = lya.get("mean_lyapunov", float("nan"))
-            logger.info("  Lyapunov (Rosenstein): λ=%.5f, regime=%s", mean_lya, regime)
+            logger.info(
+                "  Lyapunov (%s): λ=%.5f, regime=%s", lya_method, mean_lya, regime,
+            )
         except Exception as e:
             logger.warning("  Lyapunov analysis failed: %s", e)
 
@@ -535,7 +553,8 @@ def run_phase4_validation(cfg: dict, results: Dict[str, Any],
 
 
 def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
-                        simulator, output_dir: Path) -> None:
+                        simulator, output_dir: Path,
+                        modality: str = "fmri") -> None:
     """Phase 5: Optional advanced analyses (expensive)."""
     adv_cfg = cfg.get("advanced", {})
     trajs = results.get("trajectories")
@@ -553,6 +572,16 @@ def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
                        if n < simulator.n_regions]
             if not targets:
                 targets = [0]
+            # For joint mode: log which modality each target node falls into
+            if modality == "joint" and hasattr(simulator, "n_fmri_regions"):
+                for tn in targets:
+                    _tmod = "fmri" if tn < simulator.n_fmri_regions else "eeg"
+                    _tch = (tn if tn < simulator.n_fmri_regions
+                            else tn - simulator.n_fmri_regions)
+                    logger.info(
+                        "  target_node=%d → %s node %d (joint modality index mapping)",
+                        tn, _tmod, _tch,
+                    )
             stim = run_virtual_stimulation(
                 simulator=simulator,
                 target_nodes=targets,
@@ -592,11 +621,28 @@ def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
             try:
                 from spectral_dynamics.e5_phase_diagram import run_phase_diagram
                 pd_cfg = adv_cfg.get("phase_diagram", {})
+                # Compute LLE reference from GNN trajectories generated by Phase 1
+                lle_ref = None
+                _trajs = results.get("trajectories")
+                if _trajs is not None:
+                    try:
+                        from analysis.lyapunov import rosenstein_lyapunov
+                        import numpy as _np
+                        _lles = [
+                            rosenstein_lyapunov(_trajs[i])[0]
+                            for i in range(min(10, len(_trajs)))
+                        ]
+                        _valid = [v for v in _lles if _np.isfinite(v)]
+                        if _valid:
+                            lle_ref = float(_np.median(_valid))
+                    except Exception:
+                        pass
                 phase = run_phase_diagram(
                     R, output_dir=adv_dir,
                     g_min=pd_cfg.get("g_min", 0.1),
                     g_max=pd_cfg.get("g_max", 3.0),
                     g_step=pd_cfg.get("g_step", 0.2),
+                    lle_reference=lle_ref,
                 )
                 results["phase_diagram"] = phase
                 logger.info("  Phase diagram: done.")
@@ -849,6 +895,53 @@ def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Per-modality phase runner helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _run_phases_for_modality(
+    cfg: dict,
+    simulator,
+    modality: str,
+    output_dir: Path,
+    device: str,
+) -> Dict[str, Any]:
+    """
+    Run all six analysis phases for a single modality.
+
+    This helper is called by :func:`run_pipeline` for each requested modality.
+    It accepts an already-constructed *simulator* so that the expensive model /
+    graph loading is done exactly once, even when ``modality='both'`` triggers
+    two sequential runs.
+
+    Args:
+        cfg:        Merged configuration dictionary.
+        simulator:  ``BrainDynamicsSimulator`` (or energy-constrained wrapper)
+                    already configured for *modality*.
+        modality:   ``"fmri"``, ``"eeg"``, or ``"joint"``.
+        output_dir: Per-modality output directory (created if absent).
+        device:     Compute device string.
+
+    Returns:
+        results dict containing all computed artefacts for this modality.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    results: Dict[str, Any] = {}
+
+    results.update(run_phase1_data(cfg, simulator, output_dir, device))
+    run_phase2_structure(cfg, results, output_dir)
+    run_phase3_dynamics(cfg, results, simulator, output_dir, modality=modality)
+    run_phase4_validation(cfg, results, output_dir)
+    run_phase5_advanced(cfg, results, simulator, output_dir, modality=modality)
+    run_phase6_synthesis(cfg, results, output_dir)
+
+    if cfg["output"].get("save_plots"):
+        _save_summary_plots(results, output_dir, simulator)
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Main orchestrator
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -856,11 +949,33 @@ def run_pipeline(cfg: dict) -> Dict[str, Any]:
     """
     Run the complete dynamics analysis pipeline.
 
+    Loads a trained TwinBrainDigitalTwin model and drives the full analysis
+    workflow.  The ``simulator.modality`` config key controls which brain-data
+    stream(s) are analysed:
+
+    * ``"fmri"``  — analyse the fMRI BOLD stream only.
+    * ``"eeg"``   — analyse the EEG stream only.
+    * ``"both"``  — run all phases independently for each modality available
+                    in the graph cache.  Results are stored under
+                    ``output_dir/fmri/`` and ``output_dir/eeg/`` and returned
+                    as ``{"fmri": {...}, "eeg": {...}}``.
+    * ``"joint"`` — single pipeline run using a **combined fMRI+EEG** state
+                    vector.  ``predict_future()`` is called once; each
+                    modality's predictions are z-score normalised per channel,
+                    then concatenated into a joint state of dimension
+                    N_fmri + N_eeg.  Requires both node types in the graph
+                    cache.
+
     Args:
         cfg: Merged configuration dictionary.
 
     Returns:
-        Dictionary of all analysis results.
+        * Single-modality / joint: flat results dict.
+        * ``modality="both"``:  ``{"fmri": {...}, "eeg": {...}}``.
+
+    Raises:
+        ValueError: If model_path or graph_path is not specified, or if the
+                    requested modality is absent from the graph cache.
     """
     from loader.load_model import load_trained_model, load_graph_for_inference
     from simulator.brain_dynamics_simulator import BrainDynamicsSimulator
@@ -890,48 +1005,125 @@ def run_pipeline(cfg: dict) -> Dict[str, Any]:
         checkpoint_path=model_path, device=device,
         config_path=cfg["model"].get("config_path"),
     )
+    k_cross_modal = cfg["model"].get("k_cross_modal", 5)
     base_graph = load_graph_for_inference(
         graph_path=graph_path, device=device,
+        k_cross_modal=k_cross_modal,
     )
 
-    modality = cfg["simulator"].get("modality", "fmri")
+    # ── Determine which modalities to run ─────────────────────────────────────
+    modality_cfg = cfg["simulator"].get("modality", "fmri")
+    available_modalities = list(base_graph.node_types)
 
-    # ── Create simulator ──────────────────────────────────────────────────────
-    simulator = BrainDynamicsSimulator(
-        model=twin, base_graph=base_graph, modality=modality, device=device,
-    )
-    logger.info(
-        "Simulator: modality=%s, n_regions=%d, dt=%.4f s",
-        modality, simulator.n_regions, simulator.dt,
-    )
+    if modality_cfg == "joint":
+        # Joint mode requires BOTH fmri and eeg in the graph cache.
+        if "fmri" not in available_modalities or "eeg" not in available_modalities:
+            raise ValueError(
+                f"modality='joint' requires the graph cache to contain both "
+                f"'fmri' and 'eeg' nodes.\n"
+                f"Graph cache node types: {available_modalities}\n"
+                "Hint: joint mode uses a single predict_future() call that "
+                "concatenates z-score-normalised fMRI and EEG predictions into "
+                "one joint state vector for unified dynamics analysis."
+            )
+        logger.info(
+            "modality='joint': single model call processing fMRI(%d) + EEG(%d) "
+            "→ concatenated z-score state vector, single dynamics metric set.",
+            base_graph["fmri"].x.shape[0],
+            base_graph["eeg"].x.shape[0],
+        )
+        modalities_to_run = ["joint"]
 
-    # ── Energy constraint wrapper (optional) ──────────────────────────────────
-    ec_budget = cfg.get("advanced", {}).get("energy_constraint", {}).get("E_budget")
-    if ec_budget is not None:
-        from experiments.energy_constraint import EnergyConstrainedSimulator
-        simulator = EnergyConstrainedSimulator(simulator, E_budget=float(ec_budget))
-        logger.info("⚡ Energy constraint: E_budget=%.4f", ec_budget)
+    elif modality_cfg == "both":
+        modalities_to_run = [m for m in ["fmri", "eeg"] if m in available_modalities]
+        if not modalities_to_run:
+            raise ValueError(
+                f"modality='both' specified, but the graph cache contains neither "
+                f"'fmri' nor 'eeg' nodes.\n"
+                f"Graph cache node types: {available_modalities}"
+            )
+        logger.info(
+            "modality='both': running pipeline sequentially for %s "
+            "(outputs in output_dir/<modality>/)",
+            modalities_to_run,
+        )
 
-    # ── Run phases ────────────────────────────────────────────────────────────
-    results: Dict[str, Any] = {}
+    else:
+        # Single modality
+        if modality_cfg not in available_modalities:
+            raise ValueError(
+                f"Requested modality='{modality_cfg}' not found in graph cache "
+                f"node types.\n"
+                f"Graph cache node types: {available_modalities}\n"
+                f"Supported modalities: 'fmri', 'eeg', 'both', 'joint'.\n"
+                f"Other node types found: "
+                f"{[m for m in available_modalities if m not in ('fmri', 'eeg')]}"
+            )
+        modalities_to_run = [modality_cfg]
 
-    results.update(run_phase1_data(cfg, simulator, output_dir, device))
-    run_phase2_structure(cfg, results, output_dir)
-    run_phase3_dynamics(cfg, results, simulator, output_dir)
-    run_phase4_validation(cfg, results, output_dir)
-    run_phase5_advanced(cfg, results, simulator, output_dir)
-    run_phase6_synthesis(cfg, results, output_dir)
+    # ── Dispatch ──────────────────────────────────────────────────────────────
+    def _make_simulator(mod: str):
+        """Create simulator + optional energy-constraint wrapper for modality."""
+        sim = BrainDynamicsSimulator(
+            model=twin,
+            base_graph=base_graph,
+            modality=mod,
+            fmri_subsample=cfg["simulator"].get("fmri_subsample", 25),
+            device=device,
+        )
+        if mod == "joint":
+            logger.info(
+                "  Simulator [joint]: N_fmri=%d, N_eeg=%d, N_joint=%d, dt=%.4f s/TR",
+                sim.n_fmri_regions, sim.n_eeg_regions, sim.n_regions, sim.dt,
+            )
+        else:
+            logger.info(
+                "  Simulator [%s]: n_regions=%d, dt=%.4f s/TR",
+                mod, sim.n_regions, sim.dt,
+            )
+        ec_budget = cfg.get("advanced", {}).get("energy_constraint", {}).get("E_budget")
+        if ec_budget is not None:
+            from experiments.energy_constraint import EnergyConstrainedSimulator
+            sim = EnergyConstrainedSimulator(sim, E_budget=float(ec_budget))
+            logger.info("⚡ Energy constraint: E_budget=%.4f", ec_budget)
+        return sim
 
-    # ── Plots ─────────────────────────────────────────────────────────────────
-    if cfg["output"].get("save_plots"):
-        _save_summary_plots(results, output_dir, simulator)
+    if len(modalities_to_run) == 1:
+        # Single or joint: flat result dict (backward-compatible)
+        mod = modalities_to_run[0]
+        simulator = _make_simulator(mod)
+        results = _run_phases_for_modality(cfg, simulator, mod, output_dir, device)
+        elapsed = time.time() - t0
+        logger.info("=" * 60)
+        logger.info(
+            "✓ Pipeline [%s] complete in %.1f s. Results: %s",
+            mod.upper(), elapsed, output_dir.resolve(),
+        )
+        return results
+
+    # Both modalities: run sequentially, store under output_dir/{modality}/
+    all_results: Dict[str, Any] = {}
+    for mod in modalities_to_run:
+        logger.info("=" * 60)
+        logger.info("◆ Starting [%s] modality pipeline", mod.upper())
+        mod_output_dir = output_dir / mod
+        mod_output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            simulator = _make_simulator(mod)
+            all_results[mod] = _run_phases_for_modality(
+                cfg, simulator, mod, mod_output_dir, device,
+            )
+        except Exception as exc:
+            logger.error("  [%s] pipeline failed: %s", mod.upper(), exc)
+            all_results[mod] = {"error": str(exc)}
 
     elapsed = time.time() - t0
     logger.info("=" * 60)
     logger.info(
-        "✓ Pipeline complete in %.1f s. Results: %s", elapsed, output_dir.resolve(),
+        "✓ Both-modality pipeline complete in %.1f s. Results in: %s/{%s}",
+        elapsed, output_dir.resolve(), ",".join(modalities_to_run),
     )
-    return results
+    return all_results
 
 
 def _save_summary_plots(results: Dict[str, Any], output_dir: Path,

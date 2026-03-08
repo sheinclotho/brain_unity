@@ -7,49 +7,34 @@ E4: Structural Perturbation Experiments
 核心思路
 --------
 若"低维动力学是结构必然"，则对连接矩阵进行破坏性扰动后，
-低维性质（谱有效维度、主导模态数量、LLE）应发生显著变化。
+低维性质（谱有效维度 PR、主导模态数量、谱半径）应发生显著变化。
 
 三种扰动方式
 ------------
 1. **边权重随机化（weight_shuffle）**
    保留网络拓扑（edge_index 不变），随机打乱所有边的权重。
-   - 破坏：权重分布结构（局部→远程的功能梯度）
-   - 保留：度分布、稀疏模式
 
 2. **保度随机重连（degree_preserving_rewire）**
    随机交换边对（Configuration Model 方法），保留节点度序列。
-   - 破坏：模块结构、富人俱乐部、长程连接
-   - 保留：每个节点的总连接强度（入度/出度序列）
 
 3. **低秩截断（low_rank_truncation）**
    保留 SVD 前 k 个奇异值，截断剩余 N-k 个模态。
-   - 破坏：高频细节、短程局部结构
-   - 保留：主导模态的功能方向（强化低秩性）
-   - 作用：若低秩截断后动力学指标改变很小，则说明高频部分无关
 
 指标计算
 --------
-对每种扰动后的矩阵，重新计算：
+对每种扰动后的矩阵，重新计算纯谱指标：
   - 谱有效维度（参与率 PR）
   - 主导特征值数量（n_dominant）
-  - Rosenstein LLE（从新生成的 WC 轨迹估计，无需 TwinBrain 模型）
+  - 谱半径（spectral_radius）
+  - 谱间隔比（spectral_gap_ratio）
 
-批判性注意事项
---------------
-1. **WC 模型的 LLE 与 TwinBrain 模型不直接可比**：WC 使用固定的
-   tanh(g*W@x) 动力学，而 TwinBrain 通过 GNN 学习。扰动实验在
-   WC 框架下完成，结论适用于"如果真实 connectome 有特殊谱结构，
-   则对 WC 类动力学有显著影响"，不能直接外推到 TwinBrain 模型。
-2. **保度随机重连的有限效应**：对稠密矩阵（如 FC），保度重连几乎
-   等价于权重随机化，两者区分意义不大。对稀疏矩阵（如 DTI），
-   拓扑变化更明显。
-3. **低秩截断后的 PR 必然降低**（因为 truncated matrix 更低秩），
-   需要对比 LLE 来判断是否"保留了动力学关键结构"。
+LLE 估计需要运行模型（由 twinbrain-dynamics 管线负责）。
+本模块只做纯矩阵谱分析，不模拟任何动力学。
 
 输出文件
 --------
   perturbation_summary.json     — 所有扰动的指标对比
-  perturbation_comparison.png   — PR / n_dominant / LLE 对比柱状图
+  perturbation_comparison.png   — PR / n_dominant / spectral_radius 对比柱状图
 """
 
 from __future__ import annotations
@@ -173,100 +158,6 @@ def low_rank_truncation(W: np.ndarray, k: int) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WC-based LLE estimation for perturbed matrices
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _wc_step(x: np.ndarray, W: np.ndarray, g: float = 0.9) -> np.ndarray:
-    """One-step WC dynamics: clip(tanh(g * W @ x), 0, 1)."""
-    return np.clip(np.tanh(g * (W @ x)), 0.0, 1.0)
-
-
-def _rosenstein_lle_on_wc(
-    W: np.ndarray,
-    n_traj: int = 30,
-    steps: int = 300,
-    max_lag: int = 30,
-    min_sep: int = 10,
-    g: float = 0.9,
-    seed: int = 42,
-) -> float:
-    """
-    对 WC 模型（W 矩阵，耦合强度 g）运行 Rosenstein 算法估计 LLE。
-
-    生成 n_traj 条轨迹，每条从随机初始状态出发，
-    然后调用 twinbrain-dynamics 的 rosenstein_lyapunov 函数。
-
-    Returns:
-        mean LLE（负=稳定，正=混沌，≈0=边缘混沌）
-    """
-    import sys
-    _td = Path(__file__).parent.parent / "twinbrain-dynamics"
-    if str(_td) not in sys.path:
-        sys.path.insert(0, str(_td))
-    try:
-        from analysis.lyapunov import rosenstein_lyapunov
-    except ImportError:
-        logger.warning("无法导入 rosenstein_lyapunov，使用内置简化版本。")
-        return _simple_lle(W, n_traj=n_traj, steps=steps, g=g, seed=seed)
-
-    rng = np.random.default_rng(seed)
-    N = W.shape[0]
-    trajs = np.empty((n_traj, steps, N), dtype=np.float32)
-    for i in range(n_traj):
-        x = rng.random(N).astype(np.float32)
-        for t in range(steps):
-            trajs[i, t] = x
-            x = _wc_step(x, W, g).astype(np.float32)
-
-    lles = [rosenstein_lyapunov(trajs[i], max_lag=max_lag, min_temporal_sep=min_sep)[0]
-            for i in range(n_traj)]
-    valid = [v for v in lles if np.isfinite(v)]
-    return float(np.mean(valid)) if valid else float("nan")
-
-
-def _simple_lle(
-    W: np.ndarray,
-    n_traj: int = 20,
-    steps: int = 200,
-    g: float = 0.9,
-    seed: int = 42,
-) -> float:
-    """
-    简化版 Wolf-Benettin LLE（当 twinbrain-dynamics 不可导入时的备用）。
-
-    对 WC 系统 x(t+1) = clip(tanh(g*W@x), 0, 1) 运行 Wolf 方法。
-    """
-    rng = np.random.default_rng(seed)
-    N = W.shape[0]
-    eps = 1e-6
-    renorm = 20
-    log_growths: list[float] = []
-
-    for _ in range(n_traj):
-        x = rng.random(N).astype(np.float64)
-        # Warm up
-        for _ in range(50):
-            x = _wc_step(x, W, g)
-        d = rng.standard_normal(N)
-        d = d / (np.linalg.norm(d) + 1e-30)
-        x_p = x + eps * d
-
-        for step in range(steps):
-            x = _wc_step(x, W, g)
-            x_p = _wc_step(x_p, W, g)
-            if (step + 1) % renorm == 0:
-                delta = x_p - x
-                r = np.linalg.norm(delta)
-                if r > 1e-30:
-                    log_growths.append(np.log(r / eps))
-                    x_p = x + eps * delta / r
-
-    if not log_growths:
-        return 0.0
-    return float(np.mean(log_growths)) / renorm
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Main analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -275,23 +166,20 @@ def run_structural_perturbation(
     output_dir: Optional[Path] = None,
     label: str = "matrix",
     k_values: Optional[List[int]] = None,
-    n_traj_lle: int = 30,
-    steps_lle: int = 300,
-    g: float = 0.9,
     seed: int = 42,
 ) -> Dict:
     """
-    运行 E4 结构扰动实验：对三类扰动比较谱指标与 WC LLE。
+    运行 E4 结构扰动实验：对三类扰动比较谱指标。
+
+    本函数只做纯矩阵谱分析（PR、谱半径、n_dominant、谱间隔比），
+    不模拟任何动力学。LLE 估计由 twinbrain-dynamics 管线负责。
 
     Args:
-        W:            原始连接矩阵 (N, N)。
-        output_dir:   结果保存目录。
-        label:        矩阵标签（用于文件名）。
-        k_values:     低秩截断的 k 列表；默认 [1, 2, 5, 10, N//10]。
-        n_traj_lle:   LLE 估计用的轨迹数。
-        steps_lle:    每条轨迹步数。
-        g:            WC 耦合强度。
-        seed:         随机种子。
+        W:          原始连接矩阵 (N, N)。
+        output_dir: 结果保存目录。
+        label:      矩阵标签（用于文件名）。
+        k_values:   低秩截断的 k 列表；默认 [1, 2, 5, 10, N//10]。
+        seed:       随机种子。
 
     Returns:
         summary dict（可序列化为 JSON）。
@@ -302,16 +190,12 @@ def run_structural_perturbation(
 
     def _metrics(mat: np.ndarray, tag: str) -> Dict:
         spec = compute_spectral_metrics(mat, symmetric=False)
-        lle = _rosenstein_lle_on_wc(
-            mat, n_traj=n_traj_lle, steps=steps_lle, g=g, seed=seed
-        )
         return {
             "tag": tag,
             "spectral_radius": spec["spectral_radius"],
             "participation_ratio": spec["participation_ratio"],
             "n_dominant": spec["n_dominant"],
             "spectral_gap_ratio": spec["spectral_gap_ratio"],
-            "lle_wc": round(lle, 5),
         }
 
     results: Dict = {}
@@ -335,16 +219,11 @@ def run_structural_perturbation(
                 low_rank_truncation(W, k), f"low_rank_k{k}"
             )
 
-    # Summary: delta from original
+    # Delta from original
     orig_pr = results["original"]["participation_ratio"]
-    orig_lle = results["original"]["lle_wc"]
 
     def _delta_summary(r: Dict) -> Dict:
-        return {
-            **r,
-            "delta_pr": round(r["participation_ratio"] - orig_pr, 3),
-            "delta_lle": round(r["lle_wc"] - orig_lle, 5),
-        }
+        return {**r, "delta_pr": round(r["participation_ratio"] - orig_pr, 3)}
 
     results["weight_shuffle"] = _delta_summary(results["weight_shuffle"])
     results["degree_preserving_rewire"] = _delta_summary(
@@ -354,19 +233,17 @@ def run_structural_perturbation(
     if output_dir is not None:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
-
         json_path = out / f"perturbation_summary_{label}.json"
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
         logger.info("保存扰动摘要: %s", json_path)
-
         _try_plot_perturbation(results, out / f"perturbation_comparison_{label}.png", label)
 
     return results
 
 
 def _try_plot_perturbation(results: Dict, output_path: Path, label: str) -> None:
-    """扰动实验对比柱状图。"""
+    """扰动实验对比柱状图：PR / n_dominant / spectral_radius。"""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -377,8 +254,8 @@ def _try_plot_perturbation(results: Dict, output_path: Path, label: str) -> None
     conditions = ["original", "weight_shuffle", "degree_preserving_rewire"]
     existing = [c for c in conditions if c in results]
 
-    metrics_to_plot = ["participation_ratio", "n_dominant", "lle_wc"]
-    metric_labels = ["谱有效维度 PR", "主导特征值数 n_dom", "WC Lyapunov LLE"]
+    metrics_to_plot = ["participation_ratio", "n_dominant", "spectral_radius"]
+    metric_labels = ["谱有效维度 PR", "主导特征值数 n_dom", "谱半径 ρ(W)"]
 
     fig, axes = plt.subplots(1, len(metrics_to_plot), figsize=(13, 4))
     x = np.arange(len(existing))

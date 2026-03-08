@@ -17,16 +17,39 @@ model:
   graph_path: null              # Required: path to graph cache .pt file
   config_path: null             # Optional: training config.yaml (auto-detected)
   device: "auto"                # "auto" | "cuda" | "cpu"
+  # Cross-modal edges per EEG electrode added when rebuilding graph structure
+  # for inference (see API.md §2.5).  Increase if EEG→fMRI signal is weak.
+  k_cross_modal: 5
 
 # ── Simulator ────────────────────────────────────────────────────────────────
 simulator:
-  modality: "fmri"              # "fmri" | "eeg" | "both" | "joint"
+  # Which brain-data stream(s) to analyse:
+  # - "fmri"  : fMRI BOLD stream only (default).
+  # - "eeg"   : EEG stream only.
+  # - "both"  : run all phases independently for each modality available in
+  #             the graph cache.  Outputs to output_dir/fmri/ and
+  #             output_dir/eeg/.  Requires both node types.
+  # - "joint" : single pipeline run using a COMBINED fMRI+EEG state vector.
+  #             Each modality's predictions are z-score normalised and
+  #             concatenated: [z_fmri | z_eeg].  Produces a single set of
+  #             dynamics metrics reflecting joint multi-scale brain state.
+  #             Requires both 'fmri' and 'eeg' nodes in the graph cache.
+  #             Note: joint mode always forces Lyapunov method='rosenstein'
+  #             (Wolf/FTLE clips z-score space to [0,1] → spurious attractors).
+  modality: "fmri"
+  # Internal fMRI sub-sampling factor (kept for compatibility; model infers
+  # dt from the graph cache automatically).
+  fmri_subsample: 25
 
 # ── Phase 1: Data Generation ────────────────────────────────────────────────
 data_generation:
   n_init: 100                   # Number of random initial trajectories
   steps: 500                    # Prediction steps per trajectory (fMRI TRs)
   seed: 42
+  # Number of sliding context windows used for free-dynamics rollouts.
+  # null = auto-compute from trajectory length (recommended).
+  # Set explicitly to limit distinct historical contexts (saves memory).
+  n_temporal_windows: null
 
 # ── Phase 2: Network Structure ──────────────────────────────────────────────
 # Analyses the connectivity/response matrix for structural properties.
@@ -58,7 +81,11 @@ dynamics:
     enabled: true               # Pairwise trajectory convergence
     n_pairs: 50
   lyapunov:
-    enabled: true               # Rosenstein LLE estimation
+    enabled: true               # LLE estimation
+    # Method: "rosenstein" (default, zero extra model calls, recommended),
+    # "wolf", "ftle", or "both".
+    # joint modality always forces "rosenstein" automatically.
+    method: "rosenstein"
     max_lag: 50                 # Maximum tracking lag
     min_sep: 20                 # Minimum temporal separation for NN search
     n_segments: 3               # Multi-segment sampling (early/mid/late)
@@ -66,6 +93,9 @@ dynamics:
     delay_embed_dim: 0          # 0=disabled; after running Phase 4c (embedding dimension),
                                 # set this to the FNN min_sufficient_dim for better NN quality
     delay_embed_tau: 1          # Delay embedding lag
+    # Parallel workers for Wolf/FTLE (1 = sequential, recommended for GPU).
+    # CLI: --n-workers N to override.
+    n_workers: 1
   dmd_spectrum:
     enabled: true               # DMD linearised spectral analysis
     tail_steps: 20              # Final trajectory steps for attractor state sampling

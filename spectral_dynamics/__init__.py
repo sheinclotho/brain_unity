@@ -13,23 +13,38 @@ e4_structural_perturbation  E4: 结构扰动实验（边重连、权重随机化
 e5_phase_diagram        E5: 耦合强度相图（稳定→振荡→混沌边界扫描）
 e6_random_comparison    E6: 随机网络对照（ER、保度随机、权重混洗）
 h_power_spectrum        H: 功率谱 / FFT 分析 + 脑节律频段标注 + 空间振荡模态
-i_energy_constraint     I: 能量约束分岔实验（α·F(x) 扫描 + 动态能量 E(t)）
+i_energy_constraint     I: 能量约束分岔实验（WC L1 投影 + LLE 扫描）
 run_all                 一键运行所有实验的主入口
 
-与 twinbrain-dynamics 的接口
-----------------------------
-本模块作为 **独立分析层**，直接读取 twinbrain-dynamics 流程的输出：
+与 twinbrain-dynamics 的关系（合并后）
+--------------------------------------
+本包作为 **矩阵驱动分析层**，直接读取 twinbrain-dynamics 流程的输出：
   outputs/trajectories.npy     — shape (n_init, steps, n_regions)
   outputs/response_matrix.npy  — shape (n_regions, n_regions)
 
-新模块（H/I）自动尝试导入 twinbrain-dynamics 的标准实现（rosenstein_lyapunov,
-run_power_spectrum_analysis 等），若不可用则退回内置轻量版。
-这确保了两个模块间的数值一致性，并为未来合并做好准备。
+**共享实现（已统合）**：
 
-注意：原 B_LYA 模块（数据驱动线性映射近似 Lyapunov 谱）已移除。
-该功能与 dynamics_pipeline 的 DMD 谱分析（Phase 3e）功能完全重叠，
-两者本质相同（均拟合线性转移算子 A 并分析其谱）。统一管线中使用
-DMD + Kaplan-Yorke 维度作为标准实现。
+以下功能曾在本包内多个文件中独立实现，现已统一由
+``twinbrain-dynamics/analysis/wc_dynamics.py`` 提供：
+
++------------------------------------------+----------------------------+
+| 旧位置（已删除）                          | 新统一位置                  |
++==========================================+============================+
+| e4._wc_step                              | wc_dynamics.wc_step        |
+| e5._wc_trajectories                      | wc_dynamics.wc_simulate    |
+| e4._rosenstein_lle_on_wc / _simple_lle   | wc_dynamics.rosenstein_lle_on_wc |
+| e5._rosenstein_from_twinbrain /          |                            |
+|   _simple_rosenstein                     | wc_dynamics.rosenstein_lle_on_wc |
+| i._rosenstein                            | wc_dynamics.rosenstein_lle_on_wc |
+| i._project_energy_wc                     | wc_dynamics.project_energy_l1_bounded |
++------------------------------------------+----------------------------+
+
+``h_power_spectrum.py`` 的内置 FFT 实现已删除；该模块现在只委托给
+``twinbrain-dynamics/analysis/power_spectrum.py``（权威实现），
+无 twinbrain 时抛出 ``ImportError``（有明确报错信息）。
+
+sys.path 管理已统一移至本 ``__init__.py``。各子模块使用相对导入
+``from analysis.wc_dynamics import ...``（在 _ensure_twinbrain_path() 调用后有效）。
 
 批判性说明
 ----------
@@ -39,6 +54,37 @@ DMD + Kaplan-Yorke 维度作为标准实现。
    非线性 GNN 模型下此近似成立的充分条件是刺激幅度小（0.5σ 范围内）。
 3. E5 相图在 Wilson-Cowan 框架下构建，而非直接修改 GNN 权重（后者需要
    重新训练）。WC 提供可控的基线，结构参数可以系统扫描。
-4. I 实验（α·F(x)）与 E5（g·W）的区别：α 在激活后缩放（能量门控），
-   g 在激活前缩放（突触增益）。两者在 WC 框架下产生不同的分岔结构。
+4. 注意：原 B_LYA 模块（数据驱动线性映射近似 Lyapunov 谱）已移除。
+   该功能与 dynamics_pipeline 的 DMD 谱分析（Phase 3e）功能完全重叠。
 """
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Centralised sys.path setup — call _ensure_twinbrain_path() once at package
+# import time so that all sub-modules can do:
+#   from analysis.wc_dynamics import ...
+# without needing their own sys.path manipulation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TD_DIR = Path(__file__).resolve().parent.parent / "twinbrain-dynamics"
+
+
+def _ensure_twinbrain_path() -> bool:
+    """
+    Add ``twinbrain-dynamics/`` to ``sys.path`` if not already present.
+
+    Returns True if the directory exists and was added (or already present).
+    """
+    if not _TD_DIR.exists():
+        return False
+    td_str = str(_TD_DIR)
+    if td_str not in sys.path:
+        sys.path.insert(0, td_str)
+    return True
+
+
+_TWINBRAIN_AVAILABLE = _ensure_twinbrain_path()
