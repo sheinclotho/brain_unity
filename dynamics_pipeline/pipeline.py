@@ -57,6 +57,25 @@ _NEAR_CRITICAL_REGIMES = frozenset({
 })
 
 
+def _kaplan_yorke_dimension(spectrum: np.ndarray) -> float:
+    """Kaplan-Yorke dimension from a descending Lyapunov spectrum.
+
+    D_KY = j + (Σᵢ₌₁ʲ λ_i) / |λ_{j+1}|
+    where j is the largest index with non-negative partial sum.
+    """
+    s = np.sort(np.asarray(spectrum, dtype=np.float64))[::-1]
+    if len(s) == 0 or s[0] < 0:
+        return 0.0
+    cs = np.cumsum(s)
+    j = int(np.sum(cs >= 0))
+    if j >= len(s):
+        return float(len(s))
+    if j == 0:
+        return 0.0
+    denom = abs(float(s[j]))
+    return float(j) + float(cs[j - 1]) / denom if denom > 1e-20 else float(j)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Phase runners
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -299,7 +318,11 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
         except Exception as e:
             logger.warning("  Lyapunov analysis failed: %s", e)
 
-    # 3e: DMD Jacobian spectrum (replaces Wolf-GS which has context dilution)
+    # 3e: Linearised spectral analysis (DMD)
+    # DMD fits the best linear operator A: x_{t+1} ≈ A·x_t from trajectory data.
+    # Its eigenvalues give the LINEARISED dynamics — not true nonlinear Lyapunov
+    # exponents.  Useful for: spectral radius ρ, slow modes, Hopf oscillations,
+    # and linearised K-Y dimension.  See README §3e for scientific framing.
     dmd_cfg = dyn_cfg.get("dmd_spectrum", {})
     if dmd_cfg.get("enabled", True):
         try:
@@ -310,14 +333,33 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
                 tail_steps=dmd_cfg.get("tail_steps", 20),
                 n_states=dmd_cfg.get("n_states", 3),
             )
+            # Derive linearised Lyapunov spectrum from DMD eigenvalues:
+            #   λ_DMD_i = ln|μ_i|  (nats/step, discrete-time convention)
+            eigvals = dmd.get("eigenvalues")
+            if eigvals is not None:
+                eigvals = np.asarray(eigvals)
+                lin_spectrum = np.sort(
+                    np.log(np.maximum(np.abs(eigvals), 1e-30))
+                )[::-1]
+                dmd["linearised_lyapunov_spectrum"] = lin_spectrum
+                dmd["linearised_ky_dim"] = float(
+                    _kaplan_yorke_dimension(lin_spectrum)
+                )
+                logger.info(
+                    "  DMD (linearised): ρ=%.4f, n_slow=%d, n_Hopf=%d, "
+                    "K-Y_lin=%.2f",
+                    dmd["spectral_radius"], dmd["n_slow_modes"],
+                    dmd["n_hopf_pairs"], dmd["linearised_ky_dim"],
+                )
+            else:
+                logger.info(
+                    "  DMD: ρ=%.4f, n_slow=%d, n_Hopf=%d",
+                    dmd["spectral_radius"], dmd["n_slow_modes"],
+                    dmd["n_hopf_pairs"],
+                )
             results["dmd_spectrum"] = dmd
-            logger.info(
-                "  DMD spectrum: ρ=%.4f, n_slow=%d, n_Hopf=%d, f_dom=%.4f Hz",
-                dmd["spectral_radius"], dmd["n_slow_modes"],
-                dmd["n_hopf_pairs"], dmd["dominant_oscillation_hz"],
-            )
         except Exception as e:
-            logger.warning("  DMD Jacobian analysis failed: %s", e)
+            logger.warning("  DMD analysis failed: %s", e)
 
     # 3f: Power spectrum
     if dyn_cfg.get("power_spectrum", {}).get("enabled", True):
@@ -359,6 +401,46 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
             )
         except Exception as e:
             logger.warning("  PCA analysis failed: %s", e)
+
+    # 3h: Attractor dimension
+    # Two complementary estimates:
+    #   D₂ (correlation dimension): nonlinear, from Grassberger-Procaccia on trajectories
+    #   K-Y_linear: from DMD linearised Lyapunov spectrum (already computed in 3e)
+    ad_cfg = dyn_cfg.get("attractor_dimension", {})
+    if ad_cfg.get("enabled", True):
+        dim_results: Dict[str, Any] = {}
+        # D₂ from Grassberger-Procaccia
+        try:
+            from analysis.embedding_dimension import correlation_dimension
+            ref_idx = trajs.shape[0] // 2
+            ref_traj = trajs[ref_idx]
+            burnin = max(0, ref_traj.shape[0] // 10)
+            d2_out = correlation_dimension(ref_traj[burnin:])
+            dim_results["D2"] = d2_out.get("D2", float("nan"))
+            dim_results["D2_fit_r2"] = d2_out.get("fit_r2", float("nan"))
+            logger.info(
+                "  Attractor dim: D₂=%.2f (R²=%.3f)",
+                dim_results["D2"], dim_results["D2_fit_r2"],
+            )
+        except Exception as e:
+            logger.warning("  D₂ computation failed: %s", e)
+
+        # K-Y from linearised DMD spectrum (already in dmd_spectrum)
+        dmd = results.get("dmd_spectrum", {})
+        ky_lin = dmd.get("linearised_ky_dim")
+        if ky_lin is not None:
+            dim_results["KY_linearised"] = ky_lin
+            logger.info("  Attractor dim: K-Y_linear=%.2f (from DMD)", ky_lin)
+
+        # PCA effective dimension as upper bound
+        pca = results.get("pca", {})
+        n90 = pca.get("n_components_90")
+        if n90 is not None:
+            dim_results["PCA_n90"] = n90
+            logger.info("  Attractor dim: PCA n@90%%=%d (upper bound)", n90)
+
+        if dim_results:
+            results["attractor_dimension"] = dim_results
 
 
 def run_phase4_validation(cfg: dict, results: Dict[str, Any],
@@ -601,17 +683,29 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
             "rho_sign": rho_sign,
             "consistent": consistent,
         }
+        # Nonlinearity index: how much the nonlinear LLE deviates from the
+        # linearised prediction.  λ_DMD_max = ln(ρ) gives the linearised
+        # largest Lyapunov exponent.  A large gap indicates strong nonlinearity.
+        lambda_dmd_max = float(np.log(max(rho_dmd, 1e-30)))
+        if abs(mean_lle) > 1e-6:
+            nonlinearity_index = abs(mean_lle - lambda_dmd_max) / abs(mean_lle)
+        else:
+            nonlinearity_index = abs(lambda_dmd_max)
+        report["consistency"]["lambda_dmd_max"] = lambda_dmd_max
+        report["consistency"]["nonlinearity_index"] = round(nonlinearity_index, 4)
         if consistent:
             logger.info(
-                "  ✓ Consistency: Rosenstein λ=%.5f (%s) ↔ DMD ρ=%.4f (%s)",
-                mean_lle, lle_sign, rho_dmd, rho_sign,
+                "  ✓ Consistency: Rosenstein λ=%.5f (%s) ↔ DMD ρ=%.4f (%s)"
+                "  [nonlinearity=%.2f]",
+                mean_lle, lle_sign, rho_dmd, rho_sign, nonlinearity_index,
             )
         else:
             logger.warning(
-                "  ⚠ Inconsistency: Rosenstein λ=%.5f (%s) vs DMD ρ=%.4f (%s)\n"
-                "    Possible cause: DMD captures linearised dynamics only;\n"
-                "    nonlinear effects may push the system across the chaos boundary.",
-                mean_lle, lle_sign, rho_dmd, rho_sign,
+                "  ⚠ Inconsistency: Rosenstein λ=%.5f (%s) vs DMD ρ=%.4f (%s)"
+                "  [nonlinearity=%.2f]\n"
+                "    DMD captures linearised dynamics only; "
+                "nonlinear effects dominate.",
+                mean_lle, lle_sign, rho_dmd, rho_sign, nonlinearity_index,
             )
 
     # ── Surrogate validation cross-check ──────────────────────────────────────
@@ -677,19 +771,28 @@ def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:
                     "verdict": "INSUFFICIENT_DATA", "summary": "No spectral data."}
 
     # H2: Low-dimensional dynamics
+    # Evidence: PCA n@90%, correlation dimension D₂, linearised K-Y dimension
     pca = results.get("pca", {})
     n90 = pca.get("n_components_90")
-    modal = results.get("modal_energy", {})
+    ad = results.get("attractor_dimension", {})
+    d2 = ad.get("D2")
+    ky_lin = ad.get("KY_linearised")
     if n90 is not None and N is not None and N > 0:
         dim_ratio = n90 / N
         supported = dim_ratio < 0.15
+        summary_parts = [f"n@90%/N={dim_ratio:.2f} ({'<' if supported else '≥'}0.15)"]
+        if d2 is not None and np.isfinite(d2):
+            summary_parts.append(f"D₂={d2:.2f}")
+        if ky_lin is not None:
+            summary_parts.append(f"K-Y_lin={ky_lin:.2f}")
         H["H2"] = {
             "name": "Low-dimensional dynamics",
             "verdict": "SUPPORTED" if supported else "NOT_SUPPORTED",
-            "summary": f"n@90%/N={dim_ratio:.2f} ({'<' if supported else '≥'}0.15), "
-                       f"n@90%={n90}",
+            "summary": ", ".join(summary_parts),
             "n_components_90": n90,
             "dim_ratio": float(dim_ratio),
+            "D2": float(d2) if d2 is not None and np.isfinite(d2) else None,
+            "KY_linearised": float(ky_lin) if ky_lin is not None else None,
         }
     else:
         H["H2"] = {"name": "Low-dimensional dynamics",

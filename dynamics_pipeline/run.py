@@ -51,6 +51,7 @@ _DEFAULTS = {
         "dmd_spectrum": {"enabled": True, "tail_steps": 20, "n_states": 3},
         "power_spectrum": {"enabled": True},
         "pca": {"enabled": True},
+        "attractor_dimension": {"enabled": True},
     },
     "validation": {
         "surrogate_test": {

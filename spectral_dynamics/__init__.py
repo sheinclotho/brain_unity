@@ -12,7 +12,6 @@ e2_e3_modal_projection  E2+E3: 动力学模态投影与模态能量分布
 e4_structural_perturbation  E4: 结构扰动实验（边重连、权重随机化、低秩截断）
 e5_phase_diagram        E5: 耦合强度相图（稳定→振荡→混沌边界扫描）
 e6_random_comparison    E6: 随机网络对照（ER、保度随机、权重混洗）
-b_lyapunov_spectrum     B: 数据驱动 Lyapunov 谱 + Kaplan–Yorke 维度（无模型调用）
 h_power_spectrum        H: 功率谱 / FFT 分析 + 脑节律频段标注 + 空间振荡模态
 i_energy_constraint     I: 能量约束分岔实验（α·F(x) 扫描 + 动态能量 E(t)）
 run_all                 一键运行所有实验的主入口
@@ -23,9 +22,14 @@ run_all                 一键运行所有实验的主入口
   outputs/trajectories.npy     — shape (n_init, steps, n_regions)
   outputs/response_matrix.npy  — shape (n_regions, n_regions)
 
-新模块（B/H/I）自动尝试导入 twinbrain-dynamics 的标准实现（rosenstein_lyapunov,
+新模块（H/I）自动尝试导入 twinbrain-dynamics 的标准实现（rosenstein_lyapunov,
 run_power_spectrum_analysis 等），若不可用则退回内置轻量版。
 这确保了两个模块间的数值一致性，并为未来合并做好准备。
+
+注意：原 B_LYA 模块（数据驱动线性映射近似 Lyapunov 谱）已移除。
+该功能与 dynamics_pipeline 的 DMD 谱分析（Phase 3e）功能完全重叠，
+两者本质相同（均拟合线性转移算子 A 并分析其谱）。统一管线中使用
+DMD + Kaplan-Yorke 维度作为标准实现。
 
 批判性说明
 ----------
@@ -37,6 +41,4 @@ run_power_spectrum_analysis 等），若不可用则退回内置轻量版。
    重新训练）。WC 提供可控的基线，结构参数可以系统扫描。
 4. I 实验（α·F(x)）与 E5（g·W）的区别：α 在激活后缩放（能量门控），
    g 在激活前缩放（突触增益）。两者在 WC 框架下产生不同的分岔结构。
-5. 完整 Lyapunov 谱（B 模块）使用数据驱动线性近似；twinbrain-dynamics 的
-   lyapunov_spectrum_wolf 给出模型精确谱（需要额外推断调用）。
 """

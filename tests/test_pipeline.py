@@ -527,5 +527,141 @@ class TestPhaseSelection(unittest.TestCase):
         self.assertTrue(cfg["dynamics"]["lyapunov"]["enabled"])
 
 
+class TestKaplanYorkeDimension(unittest.TestCase):
+    """Test the local _kaplan_yorke_dimension helper."""
+
+    def test_fixed_point(self):
+        from dynamics_pipeline.pipeline import _kaplan_yorke_dimension
+        # All negative → fixed point → D_KY = 0
+        spectrum = np.array([-0.1, -0.5, -1.0])
+        self.assertAlmostEqual(_kaplan_yorke_dimension(spectrum), 0.0)
+
+    def test_limit_cycle(self):
+        from dynamics_pipeline.pipeline import _kaplan_yorke_dimension
+        # λ₁=0, rest negative → D_KY ∈ [1, 2)
+        spectrum = np.array([0.0, -0.5, -1.0])
+        ky = _kaplan_yorke_dimension(spectrum)
+        self.assertGreaterEqual(ky, 0.0)
+        self.assertLess(ky, 2.0)
+
+    def test_chaotic(self):
+        from dynamics_pipeline.pipeline import _kaplan_yorke_dimension
+        # One positive, one zero, rest negative → D_KY > 1
+        spectrum = np.array([0.1, 0.0, -0.05, -0.2, -0.5])
+        ky = _kaplan_yorke_dimension(spectrum)
+        self.assertGreater(ky, 1.0)
+        self.assertLess(ky, 5.0)
+
+    def test_empty_spectrum(self):
+        from dynamics_pipeline.pipeline import _kaplan_yorke_dimension
+        self.assertAlmostEqual(_kaplan_yorke_dimension(np.array([])), 0.0)
+
+
+class TestAttractorDimension(unittest.TestCase):
+    """Test that attractor dimension config entry is present and respected."""
+
+    def test_attractor_dimension_in_defaults(self):
+        from dynamics_pipeline.run import _DEFAULTS
+        self.assertIn("attractor_dimension", _DEFAULTS["dynamics"])
+        self.assertTrue(_DEFAULTS["dynamics"]["attractor_dimension"]["enabled"])
+
+    def test_attractor_dimension_disabled(self):
+        """When disabled, should not produce attractor_dimension results."""
+        from dynamics_pipeline.pipeline import run_phase3_dynamics
+        from dynamics_pipeline.run import _DEFAULTS, _merge
+        cfg = _merge(_DEFAULTS, {
+            "dynamics": {
+                "stability": {"enabled": False},
+                "attractor": {"enabled": False},
+                "convergence": {"enabled": False},
+                "lyapunov": {"enabled": False},
+                "dmd_spectrum": {"enabled": False},
+                "power_spectrum": {"enabled": False},
+                "pca": {"enabled": False},
+                "attractor_dimension": {"enabled": False},
+            },
+            "output": {"save_plots": False},
+        })
+        rng = np.random.default_rng(42)
+        trajs = rng.random((5, 50, 10)).astype(np.float32)
+        results = {"trajectories": trajs}
+        sim = MagicMock()
+        sim.n_regions = 10
+        sim.dt = 2.0
+        sim.state_bounds = (0.0, 1.0)
+        sim.modality = "fmri"
+        with tempfile.TemporaryDirectory() as td:
+            run_phase3_dynamics(cfg, results, sim, Path(td))
+        self.assertNotIn("attractor_dimension", results)
+
+
+class TestNonlinearityIndex(unittest.TestCase):
+    """Test the nonlinearity index in Phase 6 consistency check."""
+
+    def test_nonlinearity_index_present(self):
+        from dynamics_pipeline.pipeline import run_phase6_synthesis
+        results = {
+            "lyapunov": {
+                "mean_lyapunov": 0.05,
+                "chaos_regime": {"regime": "weakly_chaotic"},
+            },
+            "dmd_spectrum": {
+                "spectral_radius": 0.95,
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            run_phase6_synthesis({"data_generation": {"seed": 42}}, results, Path(td))
+        report = results["report"]
+        self.assertIn("nonlinearity_index", report["consistency"])
+        self.assertIn("lambda_dmd_max", report["consistency"])
+
+    def test_nonlinearity_index_near_zero_when_consistent(self):
+        """When ρ matches LLE, nonlinearity index should be small."""
+        from dynamics_pipeline.pipeline import run_phase6_synthesis
+        # λ=ln(ρ)=-0.05, mean_lle=-0.05 → index ≈ 0
+        rho = np.exp(-0.05)
+        results = {
+            "lyapunov": {
+                "mean_lyapunov": -0.05,
+                "chaos_regime": {"regime": "stable"},
+            },
+            "dmd_spectrum": {
+                "spectral_radius": float(rho),
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            run_phase6_synthesis({"data_generation": {"seed": 42}}, results, Path(td))
+        idx = results["report"]["consistency"]["nonlinearity_index"]
+        self.assertLess(idx, 0.05)  # nearly zero when consistent
+
+
+class TestH2WithAttractorDimension(unittest.TestCase):
+    """Test H2 hypothesis evaluation includes D₂ and K-Y when available."""
+
+    def test_h2_includes_d2(self):
+        from dynamics_pipeline.pipeline import _evaluate_hypotheses
+        results = {
+            "spectral": {"n_regions": 100},
+            "pca": {"n_components_90": 8},
+            "attractor_dimension": {"D2": 4.5, "KY_linearised": 6.2},
+        }
+        H = _evaluate_hypotheses(results)
+        self.assertEqual(H["H2"]["verdict"], "SUPPORTED")
+        self.assertAlmostEqual(H["H2"]["D2"], 4.5)
+        self.assertAlmostEqual(H["H2"]["KY_linearised"], 6.2)
+        self.assertIn("D₂=4.50", H["H2"]["summary"])
+        self.assertIn("K-Y_lin=6.20", H["H2"]["summary"])
+
+    def test_h2_works_without_attractor_dim(self):
+        from dynamics_pipeline.pipeline import _evaluate_hypotheses
+        results = {
+            "spectral": {"n_regions": 100},
+            "pca": {"n_components_90": 5},
+        }
+        H = _evaluate_hypotheses(results)
+        self.assertEqual(H["H2"]["verdict"], "SUPPORTED")
+        self.assertIsNone(H["H2"]["D2"])
+
+
 if __name__ == "__main__":
     unittest.main()

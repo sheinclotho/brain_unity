@@ -67,13 +67,15 @@ dynamics:
                                 # set this to the FNN min_sufficient_dim for better NN quality
     delay_embed_tau: 1          # Delay embedding lag
   dmd_spectrum:
-    enabled: true               # DMD-based linearized spectrum (replaces Wolf-GS)
+    enabled: true               # DMD linearised spectral analysis
     tail_steps: 20              # Final trajectory steps for attractor state sampling
     n_states: 3                 # Number of attractor states to analyse
   power_spectrum:
     enabled: true               # FFT power spectral density & band analysis
   pca:
     enabled: true               # PCA dimensionality (variance curve)
+  attractor_dimension:
+    enabled: true               # D₂ (correlation dim) + linearised K-Y from DMD
 
 # ── Phase 4: Statistical Validation ─────────────────────────────────────────
 validation:
