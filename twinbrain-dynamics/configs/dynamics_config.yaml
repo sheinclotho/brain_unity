@@ -192,16 +192,9 @@ jacobian_analysis:
   n_states: 3      # number of attractor states to average Jacobian over
   epsilon: 1.0e-4  # finite difference step
 
-# Lyapunov spectrum + Kaplan-Yorke dimension (Step 15) — EXPENSIVE: k×(T/renorm) model calls/traj
-# Each trajectory needs k×(T//renorm_steps) = 10×(1000//50)=200 extra model calls.
-# With n_traj_sample=3: 600 extra calls total. Rosenstein LLE (step 9) gives λ₁ for free;
-# enable this only when full D_KY is needed (e.g., for publication).
-lyapunov_spectrum:
-  enabled: false   # set true to enable
-  n_exponents: 10  # number of Lyapunov exponents to compute (k ≤ n_regions)
-  renorm_steps: 50 # Wolf-GS renormalization period
-  epsilon: 1.0e-6  # perturbation magnitude
-  n_traj_sample: 3 # number of trajectories to average spectrum over
+# Step 15 [REMOVED]: Wolf-GS Lyapunov spectrum had unrecoverable context-dilution
+# bias for TwinBrain.  Use dynamics_pipeline Phase 3e (DMD + K-Y) instead.
+# The lyapunov_spectrum config section has been removed.
 
 # Energy constraint experiment (Step 16) — zero extra model calls
 # Analyses the energy distribution of the already-computed trajectories and

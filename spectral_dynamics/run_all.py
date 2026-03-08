@@ -101,18 +101,16 @@ from .a_connectivity_visualization import run_connectivity_visualization
 from .c_community_structure import run_community_structure
 from .d_hierarchical_structure import run_hierarchical_structure
 from .f_pca_attractor import run_pca_attractor
-# New analyses (B_LYA, H, I)
-from .b_lyapunov_spectrum import run_lyapunov_spectrum
+# New analyses (H, I)
 from .h_power_spectrum import run_power_spectrum
 from .i_energy_constraint import run_energy_constraint_wc
 
 _ALL_EXPERIMENTS = ["A", "B_E1", "C", "D", "E2E3", "E4", "E5", "E6", "F",
-                    "B_LYA", "H", "I"]
+                    "H", "I"]
 # Aliases so old E1/B keys still work
 _EXPERIMENT_ALIASES: dict = {
     "E1":   "B_E1",
     "B":    "B_E1",
-    "LYA":  "B_LYA",
 }
 
 
@@ -425,37 +423,6 @@ def run_all(
         logger.info("F 完成 (%.1fs)", time.time() - t0)
     elif "F" in experiments:
         logger.warning("F 跳过：未提供轨迹数据。")
-
-    # ── B_LYA: Lyapunov spectrum + Kaplan-Yorke dimension ────────────────────
-    if "B_LYA" in experiments and trajectories is not None:
-        t0 = time.time()
-        logger.info("═══ B_LYA: Lyapunov 谱 + Kaplan–Yorke 维度 ═══")
-        try:
-            rLYA = run_lyapunov_spectrum(
-                trajectories, dt=1.0, burnin=burnin,
-                output_dir=output_dir, label=W_label,
-            )
-            run_summary["results"]["B_LYA"] = {
-                k: (v.tolist() if hasattr(v, "tolist") else v)
-                for k, v in rLYA.items()
-            }
-            run_summary["hypotheses"].setdefault(
-                "H2_low_dimensional_dynamics", {}
-            ).update({
-                "kaplan_yorke_dim": rLYA["kaplan_yorke_dim"],
-                "lambda1": rLYA["lambda1"],
-                "n_positive_exponents": rLYA["n_positive"],
-                "lya_classification": rLYA["classification"],
-            })
-            logger.info(
-                "B_LYA 完成 (%.1fs): λ₁=%.4f, D_KY=%.2f, 分类=[%s]",
-                time.time() - t0, rLYA["lambda1"],
-                rLYA["kaplan_yorke_dim"], rLYA["classification"],
-            )
-        except Exception as exc:
-            logger.warning("B_LYA 失败: %s", exc)
-    elif "B_LYA" in experiments:
-        logger.warning("B_LYA 跳过：未提供轨迹数据。")
 
     # ── H: Power spectrum + spatial oscillation modes ─────────────────────────
     if "H" in experiments and trajectories is not None:

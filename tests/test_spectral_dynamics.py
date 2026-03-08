@@ -838,107 +838,10 @@ if __name__ == "__main__":
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# B: Lyapunov Spectrum + Kaplan-Yorke Dimension
+# B_LYA (Lyapunov Spectrum): REMOVED — module b_lyapunov_spectrum.py has been
+# deleted.  Linearised Lyapunov spectrum is now computed via DMD in
+# dynamics_pipeline Phase 3e.
 # ══════════════════════════════════════════════════════════════════════════════
-
-from spectral_dynamics.b_lyapunov_spectrum import (
-    compute_lyapunov_spectrum,
-    kaplan_yorke_dimension,
-    run_lyapunov_spectrum,
-)
-
-
-class TestKaplanYorkeDimension(unittest.TestCase):
-    def test_all_negative_returns_zero(self):
-        self.assertAlmostEqual(kaplan_yorke_dimension(np.array([-0.1, -0.5])), 0.0)
-
-    def test_all_positive_returns_n(self):
-        # Conservative / Hamiltonian: all partial sums >= 0
-        self.assertEqual(kaplan_yorke_dimension(np.array([0.3, 0.2, 0.1])), 3.0)
-
-    def test_limit_cycle(self):
-        # λ₁=0, rest negative → D_KY in [1, 2)
-        spec = np.array([0.0, -0.1, -0.3])
-        dky = kaplan_yorke_dimension(spec)
-        self.assertGreaterEqual(dky, 1.0)
-        self.assertLess(dky, 2.0)
-
-    def test_chaotic_fractal_dim(self):
-        # λ₁ > 0, sum goes negative → non-integer D_KY
-        spec = np.array([0.5, -0.2, -0.8])
-        dky = kaplan_yorke_dimension(spec)
-        self.assertGreater(dky, 1.0)
-        self.assertLess(dky, 3.0)
-        self.assertNotAlmostEqual(dky % 1, 0.0, places=4)
-
-    def test_single_positive(self):
-        spec = np.array([0.1, -1.0])
-        dky = kaplan_yorke_dimension(spec)
-        self.assertGreater(dky, 1.0)
-        self.assertLess(dky, 2.0)
-
-    def test_descending_sort_invariant(self):
-        spec = np.array([-0.8, 0.5, -0.2])   # unsorted
-        spec_sorted = np.sort(spec)[::-1]
-        self.assertAlmostEqual(
-            kaplan_yorke_dimension(spec),
-            kaplan_yorke_dimension(spec_sorted),
-        )
-
-
-class TestLyapunovSpectrum(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        rng = np.random.default_rng(99)
-        N = 20
-        W = rng.standard_normal((N, N)).astype(np.float32) * 0.3
-        trajs = np.empty((10, 80, N), dtype=np.float32)
-        for i in range(10):
-            x = rng.random(N).astype(np.float32)
-            for t in range(80):
-                trajs[i, t] = x
-                x = np.clip(np.tanh(0.85 * (W @ x)), 0.0, 1.0)
-        cls.trajs = trajs
-        cls.N = N
-
-    def test_spectrum_length(self):
-        result = compute_lyapunov_spectrum(self.trajs, burnin=5)
-        self.assertEqual(len(result["spectrum"]), self.N)
-
-    def test_spectrum_descending(self):
-        result = compute_lyapunov_spectrum(self.trajs, burnin=5)
-        spec = result["spectrum"]
-        # Allow tiny floating-point violations
-        self.assertTrue(np.all(np.diff(spec) <= 1e-8))
-
-    def test_kaplan_yorke_in_result(self):
-        result = compute_lyapunov_spectrum(self.trajs, burnin=5)
-        self.assertIn("kaplan_yorke_dim", result)
-        dky = result["kaplan_yorke_dim"]
-        self.assertGreaterEqual(dky, 0.0)
-        self.assertLessEqual(dky, self.N)
-
-    def test_classification_present(self):
-        result = compute_lyapunov_spectrum(self.trajs, burnin=5)
-        self.assertIn(result["classification"],
-                      ["fixed_point", "limit_cycle", "quasi_periodic",
-                       "weakly_chaotic", "strongly_chaotic"])
-
-    def test_n_pairs_positive(self):
-        result = compute_lyapunov_spectrum(self.trajs, burnin=5)
-        self.assertGreater(result["n_pairs"], 0)
-
-    def test_run_lyapunov_spectrum_saves_json(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            run_lyapunov_spectrum(self.trajs, burnin=5,
-                                  output_dir=Path(tmpdir), label="test")
-            self.assertTrue((Path(tmpdir) / "lyapunov_spectrum_test.json").exists())
-
-    def test_run_lyapunov_spectrum_saves_png(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            run_lyapunov_spectrum(self.trajs, burnin=5,
-                                  output_dir=Path(tmpdir), label="test")
-            self.assertTrue((Path(tmpdir) / "lyapunov_spectrum_test.png").exists())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1153,7 +1056,7 @@ class TestEnergyConstraint(unittest.TestCase):
 
 
 class TestRunAllNewExperiments(unittest.TestCase):
-    """Integration test: run_all correctly executes B_LYA, H, I."""
+    """Integration test: run_all correctly executes H, I."""
 
     @classmethod
     def setUpClass(cls):
@@ -1161,19 +1064,6 @@ class TestRunAllNewExperiments(unittest.TestCase):
         cls.W = W
         cls.trajs = trajs
         cls.R = R
-
-    def test_b_lya_in_run_all(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            summary = run_all(
-                trajectories=self.trajs,
-                response_matrix=self.R,
-                output_dir=Path(tmpdir),
-                experiments=["B_LYA"],
-            )
-            self.assertIn("B_LYA", summary["results"])
-            dky = summary["results"]["B_LYA"].get("kaplan_yorke_dim")
-            self.assertIsNotNone(dky)
-            self.assertGreaterEqual(dky, 0.0)
 
     def test_h_in_run_all(self):
         with tempfile.TemporaryDirectory() as tmpdir:

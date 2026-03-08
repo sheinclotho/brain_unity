@@ -664,3 +664,65 @@ r ≈ 0 的两个神经生物学合理原因：
 - `lyapunov_spectrum_wolf` **必须**使用 `wolf_rollout_pair()` + 推进的 `wolf_context`（已检测 `hasattr(simulator, 'wolf_rollout_pair')`），不允许使用 `rollout()` 重置上下文。
 - 当 `initial_std < 0.087`（attractor_ambiguous）时，收敛检验结论必须注明歧义，以 LLE 符号为准。
 - 发现 Step 9 vs Step 15 矛盾时，**以 Step 11（代替数据检验）为主要参考**：surrogate test 对 LLE 符号的估计最鲁棒（对比相位随机化/shuffle/AR 代替序列）。
+
+### [2026-03-08] 统一动力学分析管线 `dynamics_pipeline`
+
+#### 背景与动机
+- **问题 1**: `twinbrain-dynamics`（16 步）和 `spectral_dynamics`（12 实验）存在显著功能重叠（LLE、功率谱、随机对照、PCA 各有两套实现），没有统一的假设评估。
+- **问题 2**: Wolf-GS Lyapunov 谱在 TwinBrain 架构下不可用（上下文稀释导致所有 k 个指数趋同），但仍保留在默认管线中。
+- **问题 3**: Step 9 和 Step 15 经常产生矛盾结论，缺乏自动一致性检查。
+
+#### 解决方案
+- **新增 `dynamics_pipeline/`**：6 阶段统一管线，单一 YAML 配置，合并两个模块。
+- **Phase 1 (Data)**: 自由动力学 + 响应矩阵。
+- **Phase 2 (Structure)**: 谱分析、社区检测、层次结构、模态能量、可视化。委托给 `spectral_dynamics` 模块。
+- **Phase 3 (Dynamics)**: 稳定性（Method C）、吸引子（KMeans）、收敛、**Rosenstein LLE**（固定方法）、**DMD 谱**（替代 Wolf-GS）、功率谱、PCA。委托给 `twinbrain-dynamics/analysis/` 模块。
+- **Phase 4 (Validation)**: 代替检验、随机对照、嵌入维度。
+- **Phase 5 (Advanced)**: 虚拟刺激、能量约束、相图、可控性、信息流、临界减速。
+- **Phase 6 (Synthesis)**: 假设评估（H1-H5）+ Rosenstein LLE vs DMD ρ 一致性检查。
+
+#### 关键设计决策
+1. **Wolf-GS 从默认管线移除**：DMD 谱分析提供等效信息（谱半径、慢模态、Hopf 分岔），零额外模型调用，无上下文稀释。旧的 `lyapunov_spectrum_wolf` 函数仍保留在库中但不被统一管线调用。
+2. **Rosenstein 作为唯一 LLE 方法**：在统一管线中不再提供 Wolf/FTLE 选项。原因：(a) Wolf 有上下文稀释偏差；(b) FTLE 有数值底层问题；(c) Rosenstein 零成本且无偏。
+3. **`--phases` 参数**：用户可选择只运行特定阶段（如 `--phases 1 3` 只运行数据生成和动力学特征化）。
+4. **旧管线保留**：`twinbrain-dynamics/run_dynamics_analysis.py` 和 `spectral_dynamics/run_all.py` 不删除，保持向后兼容。
+
+#### 规则
+- 统一管线中 Lyapunov 分析**只使用 Rosenstein**，不提供 Wolf/FTLE 选项。
+- DMD 提供**线性化谱分析**（不是非线性 Lyapunov 谱的替代品）。
+- Phase 6 自动检查 Rosenstein LLE 符号与 DMD ρ 的一致性 + 非线性指数。
+- 假设评估阈值：H1 (PR/N < 0.3)、H2 (n@90%/N < 0.15 + D₂ + K-Y_lin)、H3 (regime ∈ {edge_of_chaos, marginal_stable, weakly_chaotic})。
+
+*Last updated: 2026-03-08*
+
+### [2026-03-08] 吸引子维度分析 & DMD 科学定位修正 & 冗余代码清除
+
+#### 缺失的吸引子维度分析
+- **问题**: 移除 Wolf-GS（Step 15）后，Kaplan-Yorke 维度估计也丢失了，而该维度是吸引子分析的核心指标。
+- **修复**: Phase 3 新增步骤 3h（吸引子维度），提供三重估计：
+  1. **D₂ (Grassberger-Procaccia 关联维数)**: 非线性，直接从轨迹数据测量吸引子分形结构
+  2. **K-Y_linear (线性化 Kaplan-Yorke 维度)**: 从 DMD 特征值导出线性化 Lyapunov 谱 `λ_DMD_i = ln|μ_i|`，再用 K-Y 公式计算
+  3. **PCA n@90%**: 线性嵌入维度（吸引子维度的上界）
+- **H2 假设评估**现在综合使用三个维度指标。
+- **规则**: 吸引子维度优先序为 D₂ > K-Y_linear > PCA n@90%（非线性 > 线性化 > 线性）。
+
+#### DMD 科学定位修正 — 线性化分析 ≠ 非线性替代
+- **问题**: 旧文档声称"DMD 替代 Wolf-GS Lyapunov 谱"。但 DMD 拟合的是线性转移算子 A：x(t+1) ≈ A·x(t)，其特征值 μ_i 是**线性化动力学的特征值**，不是非线性 Lyapunov 指数。对非线性系统（如混沌吸引子上的折叠/拉伸），DMD 无法捕获。
+- **修复**:
+  - DMD 步骤从 "3e: DMD 谱" 重命名为 "3e: 线性化谱分析 (DMD)"
+  - README 完整重写，明确 DMD 是"结构互补工具"而非"混沌判据"
+  - 新增**非线性指数** Δ = |λ₁_Rosenstein - max(λ_DMD)| / |λ₁_Rosenstein|
+    - Δ < 0.5: 线性化近似有效
+    - Δ > 1.0: 非线性效应主导，DMD 仅做参考
+  - Phase 6 synthesis 报告新增 `lambda_dmd_max` 和 `nonlinearity_index` 字段
+- **关键科学框架**: Rosenstein λ₁ 是非线性混沌的唯一权威判据；DMD 提供互补的线性结构（ρ, 慢模态, Hopf 振荡, K-Y_linear）。两者一致时增强可信度，不一致时以 Rosenstein 为准。
+
+#### 冗余代码清除
+- **删除** `spectral_dynamics/b_lyapunov_spectrum.py` — 与 DMD (`jacobian_analysis.py`) 功能完全重叠（两者都拟合线性转移算子 A 并分析其谱）
+- **删除** `spectral_dynamics/run_all.py` 中的 `B_LYA` 实验及其导入
+- **删除** `twinbrain-dynamics/run_dynamics_analysis.py` Step 15（Wolf-GS Lyapunov 谱），替换为单行废弃通知
+- **删除** `twinbrain-dynamics/configs/dynamics_config.yaml` 中的 `lyapunov_spectrum` 配置段
+- **更新** `spectral_dynamics/__init__.py` 移除 b_lyapunov_spectrum 引用
+- **规则**: 已废弃的算法实现可以保留在库函数中（如 `lyapunov.py` 的 `lyapunov_spectrum_wolf()`），但管线集成代码（step runner、config entry、import）必须彻底删除，不留冗余入口。
+
+*Last updated: 2026-03-08*
