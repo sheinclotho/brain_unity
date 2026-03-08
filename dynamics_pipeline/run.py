@@ -92,6 +92,9 @@ _QUICK_OVERRIDES = {
         "surrogate_test": {"n_surrogates": 9, "n_traj_sample": 3},
         "embedding_dimension": {"fnn_max_dim": 4, "corr_dim": False},
     },
+    # n_segments=1: trades robustness (3-segment early/mid/late sampling) for
+    # speed. Acceptable in quick mode since with only 100 steps, segments would
+    # overlap heavily anyway. Full runs should use n_segments=3.
     "dynamics": {"lyapunov": {"n_segments": 1}},
 }
 

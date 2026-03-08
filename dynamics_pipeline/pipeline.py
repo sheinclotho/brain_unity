@@ -46,9 +46,15 @@ import numpy as np
 
 logger = logging.getLogger("dynamics_pipeline")
 
-# ── Burnin policy for power spectrum ──────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 _PS_BURNIN_MIN = 20
 _PS_BURNIN_FRACTION = 10
+
+# Regimes consistent with near-critical brain hypothesis (H3).
+# Must match classifications from analysis.lyapunov.run_lyapunov_analysis.
+_NEAR_CRITICAL_REGIMES = frozenset({
+    "edge_of_chaos", "marginal_stable", "weakly_chaotic",
+})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -268,17 +274,15 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
         except Exception as e:
             logger.warning("  Trajectory convergence failed: %s", e)
 
-    # 3d: Lyapunov exponent (Rosenstein)
+    # 3d: Lyapunov exponent (Rosenstein — zero extra model calls, no bias)
     lya_cfg = dyn_cfg.get("lyapunov", {})
     if lya_cfg.get("enabled", True):
         try:
             from analysis.lyapunov import run_lyapunov_analysis
-            modality = cfg.get("simulator", {}).get("modality", "fmri")
-            method = "rosenstein"
             lya = run_lyapunov_analysis(
                 trajectories=trajs,
                 simulator=simulator,
-                method=method,
+                method="rosenstein",
                 convergence_result=results.get("convergence"),
                 convergence_threshold=lya_cfg.get("convergence_threshold", 0.05),
                 n_segments=lya_cfg.get("n_segments", 3),
@@ -574,9 +578,12 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
     rho_dmd = dmd.get("spectral_radius")
 
     if mean_lle is not None and rho_dmd is not None:
-        # Rosenstein LLE > 0 implies chaos; DMD ρ ≈ 1.0 implies near-criticality
-        # They should be consistent: ρ < 1 ↔ λ < 0, ρ ≈ 1 ↔ λ ≈ 0, ρ > 1 ↔ λ > 0
-        # Note: DMD is linearized, so it may underestimate nonlinear chaos
+        # Rosenstein LLE > 0 implies chaos; DMD ρ ≈ 1.0 implies near-criticality.
+        # Consistency rule: only flag contradiction when signs clearly disagree:
+        #   ρ < 1 (subcritical) + λ > 0 (chaotic), or ρ > 1 (supercritical) + λ < 0.
+        # Near-zero/near-critical cases are treated as consistent with either
+        # regime — DMD is linearised and may not capture nonlinear effects, so
+        # a marginal mismatch is expected and not flagged.
         lle_sign = "positive" if mean_lle > 0.01 else (
             "negative" if mean_lle < -0.01 else "near_zero"
         )
@@ -693,7 +700,7 @@ def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:
     regime = lya.get("chaos_regime", {}).get("regime")
     lle = lya.get("mean_lyapunov")
     if regime is not None:
-        near_critical = regime in ("edge_of_chaos", "marginal_stable", "weakly_chaotic")
+        near_critical = regime in _NEAR_CRITICAL_REGIMES
         H["H3"] = {
             "name": "Near-critical dynamics",
             "verdict": "SUPPORTED" if near_critical else "NOT_SUPPORTED",

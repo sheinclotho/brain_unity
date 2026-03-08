@@ -126,8 +126,8 @@ Phase 6: Synthesis               → 假设评估 + 一致性检查 + 报告
 | 步骤 | 分析 | 关键指标 | 科学目的 |
 |------|------|---------|---------|
 | 3a | **稳定性分类** | fixed_point / limit_cycle / chaos | 基本动力学体制 |
-| 3b | **吸引子分析** | k 个吸引子盆地分布 | 单稳/多稳判断 |
-| 3c | **轨迹收敛** | distance_ratio, label | 吸引子存在性检测 |
+| 3b | **吸引子分析** | k 个吸引子盆地分布 | 离散吸引子盆地识别（KMeans 聚类） |
+| 3c | **轨迹收敛** | distance_ratio, label | 一般性吸引子行为检测（不依赖盆地结构） |
 | 3d | **Lyapunov 指数** | λ (Rosenstein), regime | 混沌/有序分类 |
 | 3e | **DMD 谱** | ρ_DMD, n_slow, n_Hopf, f_dom | 线性化动力学谱 |
 | 3f | **功率谱** | f_dom (Hz), 频段功率 | 振荡结构 |

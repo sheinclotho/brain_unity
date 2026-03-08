@@ -86,6 +86,7 @@ class TestConfigMerge(unittest.TestCase):
         """Wolf-GS Lyapunov spectrum should not be in defaults (replaced by DMD)."""
         from dynamics_pipeline.run import _DEFAULTS
         self.assertNotIn("lyapunov_spectrum", _DEFAULTS)
+        self.assertIn("dmd_spectrum", _DEFAULTS["dynamics"])
 
 
 class TestHypothesisEvaluation(unittest.TestCase):

@@ -63,7 +63,8 @@ dynamics:
     min_sep: 20                 # Minimum temporal separation for NN search
     n_segments: 3               # Multi-segment sampling (early/mid/late)
     convergence_threshold: 0.05 # Distance ratio threshold for stable shortcut
-    delay_embed_dim: 0          # 0=disabled; set to FNN dim for better NN quality
+    delay_embed_dim: 0          # 0=disabled; after running Phase 4c (embedding dimension),
+                                # set this to the FNN min_sufficient_dim for better NN quality
     delay_embed_tau: 1          # Delay embedding lag
   dmd_spectrum:
     enabled: true               # DMD-based linearized spectrum (replaces Wolf-GS)
