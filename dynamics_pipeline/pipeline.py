@@ -4,8 +4,14 @@
 dynamics_pipeline — Unified Brain Dynamics Analysis Pipeline
 ============================================================
 
-Combines ``twinbrain-dynamics`` (model-driven) and ``spectral_dynamics``
-(matrix-driven) into a single, config-driven orchestrator.
+Orchestrates the ``brain_dynamics`` support library through a single,
+config-driven pipeline.  ``brain_dynamics`` is the consolidated package that
+merges:
+  - the former ``twinbrain-dynamics`` (model-driven GNN analysis: simulator,
+    loader, analysis algorithms, experiments)
+  - the former ``spectral_dynamics`` (matrix-driven spectral analysis:
+    connectivity, community, modal projection, phase diagrams, etc.),
+    now available as ``brain_dynamics.spectral_dynamics``.
 
 Phases:
   1  Data generation   — free dynamics & response matrix (model calls)
@@ -35,10 +41,9 @@ os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_TD_DIR = _REPO_ROOT / "twinbrain-dynamics"
-_SD_DIR = _REPO_ROOT / "spectral_dynamics"
+_BD_DIR = _REPO_ROOT / "brain_dynamics"
 
-for _p in (_REPO_ROOT, _TD_DIR, _SD_DIR):
+for _p in (_REPO_ROOT, _BD_DIR):
     if _p.exists() and str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 

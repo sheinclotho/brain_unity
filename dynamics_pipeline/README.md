@@ -1,7 +1,7 @@
 # dynamics_pipeline — 统一脑动力学分析流程
 
 > **一个配置驱动的、分阶段的脑网络动力学测试流程。**
-> 将 `twinbrain-dynamics`（模型驱动）和 `spectral_dynamics`（矩阵驱动）合并为单一管线。
+> 基于 `brain_dynamics`（统一支持库）的配置驱动分析管线。
 
 ---
 

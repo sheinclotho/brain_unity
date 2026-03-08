@@ -23,11 +23,9 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-_TD_DIR = _REPO_ROOT / "twinbrain-dynamics"
-_SD_DIR = _REPO_ROOT / "spectral_dynamics"
-for _p in (_TD_DIR, _SD_DIR):
-    if _p.exists() and str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
+_BD_DIR = _REPO_ROOT / "brain_dynamics"
+if _BD_DIR.exists() and str(_BD_DIR) not in sys.path:
+    sys.path.insert(0, str(_BD_DIR))
 
 
 class TestConfigMerge(unittest.TestCase):

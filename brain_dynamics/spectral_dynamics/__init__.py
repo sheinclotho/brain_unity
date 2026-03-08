@@ -64,27 +64,25 @@ import sys
 from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Centralised sys.path setup — call _ensure_twinbrain_path() once at package
-# import time so that all sub-modules can do:
-#   from analysis.wc_dynamics import ...
-# without needing their own sys.path manipulation.
+# sys.path setup: ensure the parent brain_dynamics/ directory is on sys.path
+# so that sub-modules can do:  from analysis.xxx import ...
 # ─────────────────────────────────────────────────────────────────────────────
 
-_TD_DIR = Path(__file__).resolve().parent.parent / "twinbrain-dynamics"
+_BD_DIR = Path(__file__).resolve().parent.parent  # brain_dynamics/
 
 
-def _ensure_twinbrain_path() -> bool:
+def _ensure_brain_dynamics_path() -> bool:
     """
-    Add ``twinbrain-dynamics/`` to ``sys.path`` if not already present.
+    Add ``brain_dynamics/`` to ``sys.path`` if not already present.
 
     Returns True if the directory exists and was added (or already present).
     """
-    if not _TD_DIR.exists():
+    if not _BD_DIR.exists():
         return False
-    td_str = str(_TD_DIR)
-    if td_str not in sys.path:
-        sys.path.insert(0, td_str)
+    bd_str = str(_BD_DIR)
+    if bd_str not in sys.path:
+        sys.path.insert(0, bd_str)
     return True
 
 
-_TWINBRAIN_AVAILABLE = _ensure_twinbrain_path()
+_TWINBRAIN_AVAILABLE = _ensure_brain_dynamics_path()

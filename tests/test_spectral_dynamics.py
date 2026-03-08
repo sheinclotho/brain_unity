@@ -24,10 +24,14 @@ from pathlib import Path
 
 import numpy as np
 
-# Ensure spectral_dynamics is importable
+# Ensure spectral_dynamics (now inside brain_dynamics/) is importable
 _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+_BD_DIR = _REPO_ROOT / "brain_dynamics"
+if _BD_DIR.exists() and str(_BD_DIR) not in sys.path:
+    sys.path.insert(0, str(_BD_DIR))
 
 from spectral_dynamics.compute_connectivity import (
     compute_fc_from_trajectories,

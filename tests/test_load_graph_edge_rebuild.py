@@ -24,8 +24,8 @@ import torch
 from torch_geometric.data import HeteroData
 
 _REPO_ROOT = Path(__file__).parent.parent
-_TD_DIR = _REPO_ROOT / "twinbrain-dynamics"
-for _p in [str(_REPO_ROOT), str(_TD_DIR)]:
+_BD_DIR = _REPO_ROOT / "brain_dynamics"
+for _p in [str(_REPO_ROOT), str(_BD_DIR)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -65,7 +65,7 @@ def _make_v5_cache(
 def _write_and_load(graph: HeteroData, tmp_dir: Path, **kwargs) -> HeteroData:
     """Save graph to a temp .pt file and call load_graph_for_inference on it."""
     # Lazy import so we can patch _REPO_ROOT inside the module if needed
-    from twinbrain_dynamics_loader import load_graph_for_inference  # type: ignore[import]
+    from loader.load_model import load_graph_for_inference  # type: ignore[import]
     pt_path = tmp_dir / "test_graph.pt"
     torch.save(graph, str(pt_path))
     return load_graph_for_inference(pt_path, device="cpu", **kwargs)
@@ -74,7 +74,7 @@ def _write_and_load(graph: HeteroData, tmp_dir: Path, **kwargs) -> HeteroData:
 # We import the loader module-level so patching can target it directly.
 # Use a try/except so test collection doesn't fail when torch_geometric is absent.
 try:
-    from twinbrain_dynamics_loader import load_graph_for_inference as _LOAD_FN  # type: ignore[import]
+    from loader.load_model import load_graph_for_inference as _LOAD_FN  # type: ignore[import]
     _LOADER_AVAILABLE = True
 except Exception:
     _LOAD_FN = None
@@ -93,7 +93,7 @@ def _load_via_tmpfile(graph: HeteroData, **kwargs) -> HeteroData:
 # Import under a stable name so tests can reference the function directly
 # ══════════════════════════════════════════════════════════════════════════════
 try:
-    from twinbrain_dynamics_loader import load_graph_for_inference
+    from loader.load_model import load_graph_for_inference
 except Exception:
     load_graph_for_inference = None  # type: ignore[assignment]
 
@@ -352,7 +352,7 @@ class TestDocstringCorrectness(unittest.TestCase):
 
     def test_docstring_no_longer_says_stores_intra_modal_edges(self):
         """Old incorrect claim: cache stores same-modality edges."""
-        load_model_path = _TD_DIR / "loader" / "load_model.py"
+        load_model_path = _BD_DIR / "loader" / "load_model.py"
         src = load_model_path.read_text(encoding="utf-8")
         # Old wrong claim should be gone
         self.assertNotIn(
@@ -363,7 +363,7 @@ class TestDocstringCorrectness(unittest.TestCase):
 
     def test_docstring_explains_node_features_only(self):
         """New docstring must document that V5 caches store only node features."""
-        load_model_path = _TD_DIR / "loader" / "load_model.py"
+        load_model_path = _BD_DIR / "loader" / "load_model.py"
         src = load_model_path.read_text(encoding="utf-8")
         self.assertIn(
             "只存储节点特征",
@@ -373,7 +373,7 @@ class TestDocstringCorrectness(unittest.TestCase):
 
     def test_docstring_explains_diagonal_consequence(self):
         """Docstring must explain what happens without edges (diagonal matrix)."""
-        load_model_path = _TD_DIR / "loader" / "load_model.py"
+        load_model_path = _BD_DIR / "loader" / "load_model.py"
         src = load_model_path.read_text(encoding="utf-8")
         self.assertIn(
             "对角线",
@@ -383,7 +383,7 @@ class TestDocstringCorrectness(unittest.TestCase):
 
     def test_code_has_intra_modal_rebuild_for_fmri(self):
         """The code must contain fmri intra-modal edge rebuild logic."""
-        load_model_path = _TD_DIR / "loader" / "load_model.py"
+        load_model_path = _BD_DIR / "loader" / "load_model.py"
         src = load_model_path.read_text(encoding="utf-8")
         # The fix uses (nt, "connects", nt) in a loop over {"fmri": ..., "eeg": ...}
         self.assertIn(
