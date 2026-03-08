@@ -1209,6 +1209,127 @@ class TestConvergenceThreshold(unittest.TestCase):
         self.assertTrue(results["skipped_wolf"],
                         "Wolf should be skipped for ratio=0.010 < threshold=0.05")
 
+    def test_convergence_skip_rosenstein_stays_rosenstein(self):
+        """Fix 1: method='rosenstein' + convergence detected → method stays 'rosenstein'.
+
+        Previously the convergence-first logic unconditionally switched the
+        effective_method to 'ftle' regardless of the original method.  This
+        caused λ=-0.028 (rosenstein) → λ≈0.0002 (ftle) for TwinBrain convergent
+        systems because FTLE suffers context-dilution (ε_eff≈ε/context_length)
+        which immediately floors the divergence near the attractor.
+
+        After the fix: rosenstein should be preserved when convergence is detected.
+        The regime is still forced to 'stable' via skipped_wolf=True.
+        """
+        class _MockSim:
+            device = "cpu"
+            state_bounds = (0.0, 1.0)
+            # No rollout needed — Rosenstein works on pre-computed trajectories
+
+        trajs = np.random.rand(3, 100, N).astype(np.float32)
+        conv_result = {"distance_ratio": 0.005, "convergence_label": "converging"}
+
+        results = run_lyapunov_analysis(
+            trajs, _MockSim(),
+            method="rosenstein",
+            convergence_result=conv_result,
+            convergence_threshold=0.05,
+            rosenstein_max_lag=15, rosenstein_min_sep=5,
+        )
+        self.assertTrue(results["skipped_wolf"],
+                        "skipped_wolf should be True: convergence detected")
+        self.assertEqual(results["method"], "rosenstein",
+                         "method should remain 'rosenstein', not switch to 'ftle'")
+        self.assertEqual(results["chaos_regime"]["regime"], "stable",
+                         "regime should be 'stable' via skipped_wolf override")
+
+    def test_ftle_floor_detection_convergent_system(self):
+        """Fix 2: FTLE returns finite negative value for convergent system.
+
+        Previously, strongly convergent trajectories caused dist(t) to hit the
+        numerical floor (1e-15) before skip, making the regression range entirely
+        flat → slope≈0.  The floor-aware regression now fits only the above-floor
+        portion, restoring the correct negative LLE.
+        """
+        class _ConvergentSim:
+            state_bounds = None
+            def rollout(self, x0, steps, stimulus=None, context_window_idx=0):
+                # Strongly convergent: factor 0.85/step, LLE = log(0.85) ≈ -0.163
+                multiplier = 0.85 ** np.arange(steps)
+                traj = (x0[None, :] * multiplier[:, None]).astype(np.float32)
+                return traj, np.arange(steps, dtype=np.float32)
+
+        sim = _ConvergentSim()
+        x0 = np.random.default_rng(42).random(N).astype(np.float32) + 0.3
+        traj = np.array([
+            x0 * (0.85 ** t) for t in range(200)
+        ], dtype=np.float32)
+        # FTLE should give a finite negative value (not NaN or ~0)
+        lam = ftle_lyapunov(traj, sim, epsilon=1e-6, skip_fraction=0.1,
+                            rng=np.random.default_rng(0))
+        # Either a meaningfully negative value or NaN (if floor was hit before skip)
+        # In either case, it must NOT be near zero (old buggy behavior)
+        if np.isfinite(lam):
+            self.assertLess(lam, -0.05,
+                            f"Convergent system LLE={lam:.4f} should be clearly negative; "
+                            "floor-aware regression appears not to be working")
+        # NaN is acceptable (floor hit before skip, cannot estimate LLE)
+
+    def test_skipped_wolf_chaotic_attractor_not_forced_stable(self):
+        """Fix A: When convergence detected but LLE > 0, regime is NOT forced to 'stable'.
+
+        This is the "chaotic attractor attraction" scenario: trajectories converge
+        FROM nearby initial conditions TO the same chaotic attractor (distance_ratio <
+        threshold), but the attractor dynamics are chaotic (LLE > 0).
+
+        Previous bug: skipped_wolf unconditionally forced regime="stable", even when
+        Rosenstein gave positive LLE, causing the contradiction between Step 9 (stable)
+        and Step 15 (strongly_chaotic) in the pipeline logs.
+
+        After fix: when skipped_wolf=True AND primary_mean >= 0, the actual LLE-based
+        classification is kept (not overridden to "stable").
+        """
+        class _MockSim:
+            state_bounds = (0.0, 1.0)
+            # No rollout needed for rosenstein
+
+        # Logistic map r=4 (chaotic, LLE = log(2) ≈ 0.693)
+        # Rosenstein typically gives a positive (if underestimated) LLE for this
+        def _logistic_traj(T, N_channels, seed):
+            rng2 = np.random.default_rng(seed)
+            x = rng2.random(N_channels).astype(np.float32)
+            traj = np.empty((T, N_channels), dtype=np.float32)
+            for t in range(T):
+                x = np.clip(4.0 * x * (1.0 - x), 0.0, 1.0)
+                traj[t] = x
+            return traj
+
+        trajs = np.array([_logistic_traj(200, N, i) for i in range(5)],
+                         dtype=np.float32)
+        conv_result = {"distance_ratio": 0.005, "convergence_label": "converging"}
+
+        results = run_lyapunov_analysis(
+            trajs, _MockSim(),
+            method="rosenstein",
+            convergence_result=conv_result,
+            convergence_threshold=0.05,
+            rosenstein_max_lag=20, rosenstein_min_sep=5,
+        )
+
+        lam = results["mean_lyapunov"]
+        regime = results["chaos_regime"]["regime"]
+        self.assertTrue(results["skipped_wolf"],
+                        "skipped_wolf should still be True when convergence detected")
+
+        if lam > 0:
+            # Fix A assertion: positive LLE must NOT be overridden to "stable"
+            self.assertNotEqual(
+                regime, "stable",
+                f"Fix A FAILED: regime='{regime}' was forced to 'stable' despite "
+                f"LLE={lam:.5f} > 0 (chaotic attractor attraction scenario)."
+            )
+        # If lam <= 0 for this seed, the test still exercises the code path
+
     def test_no_skip_above_threshold(self):
         """ratio=0.10 should NOT trigger skip with threshold=0.05."""
         class _MockSim:

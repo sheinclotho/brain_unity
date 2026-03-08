@@ -207,9 +207,15 @@ _DEFAULTS = {
         # ── n_segments ────────────────────────────────────────────────────────
         # For Rosenstein, each extra segment adds negligible cost (pure NumPy);
         # 3 segments samples the attractor at early / mid / late trajectory
-        # positions, giving a more robust LLE estimate.  For Wolf/FTLE, each
-        # extra segment adds 2 model calls per trajectory (keep at 1 for speed).
-        "n_segments": 3,           # Changed from 1 → 3 for better Rosenstein coverage
+        # positions, giving a more robust LLE estimate.
+        #
+        # IMPORTANT: n_segments > 1 for FTLE on convergent TwinBrain systems
+        # is harmful: later segments start near the attractor, context-dilution
+        # immediately floors the divergence, and those segments give λ ≈ 0.
+        # With Fix 1 (convergence-first no longer switches rosenstein → ftle),
+        # this is moot for the default method='rosenstein'.  If you explicitly
+        # use method='wolf' or 'ftle', keep n_segments=1 for reliable results.
+        "n_segments": 3,           # 3 segments for robust Rosenstein coverage
         "rosenstein_max_lag": 50,  # Rosenstein method: max tracking lag
         "rosenstein_min_sep": 20,  # Rosenstein method: min temporal separation for NN search
         # ── Delay embedding (Takens) ──────────────────────────────────────────
@@ -704,6 +710,57 @@ def _run_single_modality(
                 lys_results["n_positive"],
                 lys_results["classification"],
             )
+
+            # ── Cross-step consistency check (Step 9 vs Step 15) ─────────────
+            # If Step 9 (run_lyapunov_analysis) classified the system as "stable"
+            # but Step 15 (Lyapunov spectrum) shows one or more positive exponents,
+            # there is a fundamental inconsistency.  Log it clearly so the user
+            # knows which result to trust.
+            #
+            # Most common cause: Step 9 convergence-first triggered on a CHAOTIC
+            # ATTRACTOR where all trajectories converge FROM nearby x0 TO the same
+            # attractor set (distance_ratio < threshold), but the attractor itself
+            # is chaotic (LLE > 0).  The surrogate test (Step 11) and Lyapunov
+            # spectrum (Step 15) are the more reliable indicators.
+            _step9 = results.get("lyapunov", {})
+            _step9_regime = _step9.get("chaos_regime", {}).get("regime", "unknown")
+            _step15_regime = lys_results.get("classification", "unknown")
+            _step9_lam = _step9.get("mean_lyapunov", float("nan"))
+            _step15_lam1 = lys_results.get("lambda1", float("nan"))
+
+            _step9_is_stable = _step9_regime in ("stable", "marginal_stable")
+            _step15_is_chaotic = lys_results.get("n_positive", 0) > 0
+
+            if _step9_is_stable and _step15_is_chaotic:
+                logger.warning(
+                    "\n  ╔══════════════════════════════════════════════════════╗\n"
+                    "  ║  ⚠  跨步骤一致性警告（步骤 9 vs 步骤 15）            ║\n"
+                    "  ║                                                        ║\n"
+                    "  ║  步骤  9 判断：%s（λ=%.4f）              ║\n"
+                    "  ║  步骤 15 判断：%s（λ₁=%.4f）             ║\n"
+                    "  ║                                                        ║\n"
+                    "  ║  可能原因（按可信度排序）：                            ║\n"
+                    "  ║  1. 混沌吸引子吸引效应：轨迹从相近 x0 汇入同一混沌   ║\n"
+                    "  ║     吸引子→distance_ratio 减小→步骤 9 误判为"稳定"    ║\n"
+                    "  ║  2. Wolf-GS 上下文稀释：步骤 15 所有 λ 偏正           ║\n"
+                    "  ║                                                        ║\n"
+                    "  ║  建议：以步骤 11（代替数据检验 LLE）为主要参考。       ║\n"
+                    "  ╚══════════════════════════════════════════════════════╝",
+                    _step9_regime.upper(), _step9_lam,
+                    _step15_regime.upper(), _step15_lam1,
+                )
+            elif not _step9_is_stable and not _step15_is_chaotic:
+                logger.info(
+                    "  ✓ 步骤 9（%s, λ=%.4f）与步骤 15（%s, λ₁=%.4f）结果一致。",
+                    _step9_regime.upper(), _step9_lam,
+                    _step15_regime.upper(), _step15_lam1,
+                )
+            else:
+                logger.info(
+                    "  步骤 9 (%s, λ=%.4f) — 步骤 15 (%s, λ₁=%.4f)。",
+                    _step9_regime.upper(), _step9_lam,
+                    _step15_regime.upper(), _step15_lam1,
+                )
         except Exception as exc:
             logger.warning("  Lyapunov 谱分析失败 (%s)，跳过。", exc)
     else:
