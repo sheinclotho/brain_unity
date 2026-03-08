@@ -689,8 +689,40 @@ r ≈ 0 的两个神经生物学合理原因：
 
 #### 规则
 - 统一管线中 Lyapunov 分析**只使用 Rosenstein**，不提供 Wolf/FTLE 选项。
-- DMD 谱（Phase 3e）替代 Wolf-GS 谱（原 Step 15），默认启用。
-- Phase 6 自动检查 Rosenstein LLE 符号与 DMD ρ 的一致性：λ > 0 应对应 ρ > 1，λ < 0 应对应 ρ < 1。
-- 假设评估阈值：H1 (PR/N < 0.3)、H2 (n@90%/N < 0.15)、H3 (regime ∈ {edge_of_chaos, marginal_stable, weakly_chaotic})。
+- DMD 提供**线性化谱分析**（不是非线性 Lyapunov 谱的替代品）。
+- Phase 6 自动检查 Rosenstein LLE 符号与 DMD ρ 的一致性 + 非线性指数。
+- 假设评估阈值：H1 (PR/N < 0.3)、H2 (n@90%/N < 0.15 + D₂ + K-Y_lin)、H3 (regime ∈ {edge_of_chaos, marginal_stable, weakly_chaotic})。
+
+*Last updated: 2026-03-08*
+
+### [2026-03-08] 吸引子维度分析 & DMD 科学定位修正 & 冗余代码清除
+
+#### 缺失的吸引子维度分析
+- **问题**: 移除 Wolf-GS（Step 15）后，Kaplan-Yorke 维度估计也丢失了，而该维度是吸引子分析的核心指标。
+- **修复**: Phase 3 新增步骤 3h（吸引子维度），提供三重估计：
+  1. **D₂ (Grassberger-Procaccia 关联维数)**: 非线性，直接从轨迹数据测量吸引子分形结构
+  2. **K-Y_linear (线性化 Kaplan-Yorke 维度)**: 从 DMD 特征值导出线性化 Lyapunov 谱 `λ_DMD_i = ln|μ_i|`，再用 K-Y 公式计算
+  3. **PCA n@90%**: 线性嵌入维度（吸引子维度的上界）
+- **H2 假设评估**现在综合使用三个维度指标。
+- **规则**: 吸引子维度优先序为 D₂ > K-Y_linear > PCA n@90%（非线性 > 线性化 > 线性）。
+
+#### DMD 科学定位修正 — 线性化分析 ≠ 非线性替代
+- **问题**: 旧文档声称"DMD 替代 Wolf-GS Lyapunov 谱"。但 DMD 拟合的是线性转移算子 A：x(t+1) ≈ A·x(t)，其特征值 μ_i 是**线性化动力学的特征值**，不是非线性 Lyapunov 指数。对非线性系统（如混沌吸引子上的折叠/拉伸），DMD 无法捕获。
+- **修复**:
+  - DMD 步骤从 "3e: DMD 谱" 重命名为 "3e: 线性化谱分析 (DMD)"
+  - README 完整重写，明确 DMD 是"结构互补工具"而非"混沌判据"
+  - 新增**非线性指数** Δ = |λ₁_Rosenstein - max(λ_DMD)| / |λ₁_Rosenstein|
+    - Δ < 0.5: 线性化近似有效
+    - Δ > 1.0: 非线性效应主导，DMD 仅做参考
+  - Phase 6 synthesis 报告新增 `lambda_dmd_max` 和 `nonlinearity_index` 字段
+- **关键科学框架**: Rosenstein λ₁ 是非线性混沌的唯一权威判据；DMD 提供互补的线性结构（ρ, 慢模态, Hopf 振荡, K-Y_linear）。两者一致时增强可信度，不一致时以 Rosenstein 为准。
+
+#### 冗余代码清除
+- **删除** `spectral_dynamics/b_lyapunov_spectrum.py` — 与 DMD (`jacobian_analysis.py`) 功能完全重叠（两者都拟合线性转移算子 A 并分析其谱）
+- **删除** `spectral_dynamics/run_all.py` 中的 `B_LYA` 实验及其导入
+- **删除** `twinbrain-dynamics/run_dynamics_analysis.py` Step 15（Wolf-GS Lyapunov 谱），替换为单行废弃通知
+- **删除** `twinbrain-dynamics/configs/dynamics_config.yaml` 中的 `lyapunov_spectrum` 配置段
+- **更新** `spectral_dynamics/__init__.py` 移除 b_lyapunov_spectrum 引用
+- **规则**: 已废弃的算法实现可以保留在库函数中（如 `lyapunov.py` 的 `lyapunov_spectrum_wolf()`），但管线集成代码（step runner、config entry、import）必须彻底删除，不留冗余入口。
 
 *Last updated: 2026-03-08*

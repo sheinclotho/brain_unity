@@ -34,9 +34,9 @@ python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --energy-
 | 假设 | 问题 | 对应分析 |
 |------|------|---------|
 | **H1** | 脑网络连接是否具有低秩谱结构？ | 特征值分解、参与比(PR)、谱半径 |
-| **H2** | 动力学是否低维？ | PCA 方差曲线、模态能量投影 |
-| **H3** | 系统是否处于近临界状态？ | Lyapunov 指数、DMD 谱半径 |
-| **H4** | 是否存在脑样振荡？ | 功率谱密度、频段分析 |
+| **H2** | 动力学是否低维？ | D₂(关联维数)、K-Y 维度(线性化)、PCA n@90% |
+| **H3** | 系统是否处于近临界状态？ | Rosenstein λ₁、DMD 谱半径 ρ |
+| **H4** | 是否存在脑样振荡？ | 功率谱密度、DMD Hopf 分岔频率 |
 | **H5** | 代谢能量约束是否维持临界性？ | L1 投影实验 |
 
 ### 为什么要合并两个模块？
@@ -45,17 +45,67 @@ python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --energy-
 且没有统一的假设评估和一致性检查。本管线消除冗余，用单一配置文件控制所有分析，
 并在最后自动进行跨步骤一致性验证。
 
-### 关于 Wolf-GS Lyapunov 谱的重要说明
+### 核心方法论：非线性与线性化分析的互补
 
-**Wolf-GS 方法在 TwinBrain 架构下存在不可修复的上下文稀释偏差。**
+本管线的动力学分析基于两类互补的方法：
 
-具体表现：所有 k 个 Lyapunov 指数几乎相同（如 0.126–0.133），D_KY 恰好等于 k，
-跨轨迹标准差接近零。这是因为 TwinBrain 的 ST-GCN 编码器对 200 步上下文窗口做
-注意力加权，单步扰动被 199 个相同历史步稀释为 ε/200 → 所有扰动方向看到相同
-增长率。
+**1. Rosenstein LLE (λ₁) — 非线性混沌指标（唯一权威来源）**
 
-**本管线用 DMD（Dynamic Mode Decomposition）谱分析替代 Wolf-GS。** DMD 直接从
-自由动力学轨迹提取线性转移算子的特征值，零额外模型调用，无上下文稀释问题。
+Rosenstein 方法在 N 维状态空间中寻找最近邻对，追踪它们的指数发散率。这是
+纯粹的非线性分析，直接从轨迹数据工作，不做任何线性化假设。λ₁ 是系统是否
+混沌的唯一可靠判据。
+
+**2. DMD 线性化谱分析 — 结构性互补工具**
+
+DMD 拟合最优线性转移算子 A: x(t+1) ≈ A·x(t)，其特征值 μ_i 给出系统在
+吸引子附近的**线性化动力学**。这**不是**对非线性 Lyapunov 谱的替代，而是
+一个结构性互补：
+
+  - λ_DMD_i = ln|μ_i| 给出**线性化 Lyapunov 谱**
+  - 线性化 K-Y 维度 = f(λ_DMD_1, ..., λ_DMD_N) 估计吸引子分形维度的线性近似
+  - Hopf 对 (复共轭 μ = re^{±iθ}) 揭示振荡模态频率
+  - 慢模态 (|Re(λ_ct)| < 0.05) 揭示长弛豫时间方向
+
+**两者的关系是验证性的，不是等价性的：**
+
+| 情景 | Rosenstein λ₁ | DMD λ_max | 解读 |
+|------|---------------|-----------|------|
+| 一致稳定 | < 0 | < 0 | 线性化近似有效 |
+| 一致临界 | ≈ 0 | ≈ 0 | 系统接近分岔点 |
+| 非线性主导 | > 0 | < 0 | 非线性折叠产生混沌，线性分析低估 |
+| 线性不稳定 | > 0 | > 0 | 全局不稳定（需检查有界性） |
+
+**非线性指数 Δ = |λ₁_Rosenstein - max(λ_DMD)| / |λ₁_Rosenstein|** 衡量线性化
+近似的偏差程度。Δ > 1 表示非线性效应主导，此时 DMD 结果仅做参考。
+
+### 吸引子维度估计
+
+吸引子维度回答："系统的长期动力学实际占据了多少维度？"
+
+本管线提供三个互补的维度估计：
+
+1. **D₂ (Grassberger-Procaccia 关联维数)** — 非线性、从轨迹数据直接计算。
+   测量吸引子的真实几何维度。D₂ = 3.2 表示类似 Lorenz 吸引子的低维混沌。
+
+2. **K-Y_linear (DMD 线性化 Kaplan-Yorke 维度)** — 从 DMD 线性化 Lyapunov 谱
+   计算。是线性近似下的吸引子维度估计。对弱非线性系统接近真实 K-Y 维度，
+   对强非线性系统可能低估。
+
+3. **PCA n@90%** — 解释 90% 方差所需的主成分数。这是吸引子维度的上界（线性
+   嵌入维度 ≥ 分形维度）。
+
+**科学上的优先序**：D₂ (非线性) > K-Y_linear (线性化) > PCA n@90% (线性上界)。
+当三者一致时，维度估计可信；当 D₂ << PCA n@90% 时，表明吸引子具有分形结构。
+
+### 关于 Wolf-GS Lyapunov 谱的历史说明
+
+Wolf-GS 方法在 TwinBrain 架构下存在不可修复的上下文稀释偏差（所有 k 个指数
+≈ 0.13，D_KY 恰好等于 k），已从管线中**移除**（非禁用）。相关的
+`spectral_dynamics/b_lyapunov_spectrum.py` 模块和 `run_dynamics_analysis.py`
+Step 15 均已删除。
+
+DMD **不是** Wolf-GS 的"替代品"。DMD 提供的是互补的线性化分析视角，
+Rosenstein LLE 是唯一的非线性混沌判据。
 
 ---
 
@@ -66,13 +116,13 @@ Phase 1: Data Generation        → 轨迹 + 响应矩阵
     ↓
 Phase 2: Network Structure      → 谱分析、社区、层次、模态能量
     ↓
-Phase 3: Dynamics Characterisation → 稳定性、LLE、DMD 谱、PSD、PCA
+Phase 3: Dynamics Characterisation → 稳定性、LLE(非线性)、DMD(线性化)、PSD、吸引子维度
     ↓
 Phase 4: Statistical Validation  → 代替检验、随机对照、嵌入维度
     ↓
 Phase 5: Advanced (optional)     → 刺激、能量约束、可控性、信息流
     ↓
-Phase 6: Synthesis               → 假设评估 + 一致性检查 + 报告
+Phase 6: Synthesis               → 非线性指数 + 假设评估 + 一致性检查 + 报告
 ```
 
 ---
@@ -127,15 +177,16 @@ Phase 6: Synthesis               → 假设评估 + 一致性检查 + 报告
 |------|------|---------|---------|
 | 3a | **稳定性分类** | fixed_point / limit_cycle / chaos | 基本动力学体制 |
 | 3b | **吸引子分析** | k 个吸引子盆地分布 | 离散吸引子盆地识别（KMeans 聚类） |
-| 3c | **轨迹收敛** | distance_ratio, label | 一般性吸引子行为检测（不依赖盆地结构） |
-| 3d | **Lyapunov 指数** | λ (Rosenstein), regime | 混沌/有序分类 |
-| 3e | **DMD 谱** | ρ_DMD, n_slow, n_Hopf, f_dom | 线性化动力学谱 |
+| 3c | **轨迹收敛** | distance_ratio, label | 一般性吸引子行为检测 |
+| 3d | **Lyapunov 指数** | λ (Rosenstein), regime | 非线性混沌/有序分类（**权威判据**） |
+| 3e | **线性化谱 (DMD)** | ρ_DMD, n_slow, n_Hopf, K-Y_lin | 线性化动力学结构 |
 | 3f | **功率谱** | f_dom (Hz), 频段功率 | 振荡结构 |
-| 3g | **PCA 维度** | n@90%, 方差曲线 | 有效动力学维度 |
+| 3g | **PCA 维度** | n@90%, 方差曲线 | 线性嵌入维度（上界） |
+| 3h | **吸引子维度** | D₂, K-Y_lin, PCA n@90% | 吸引子分形维度估计 |
 
 **核心方法说明：**
 
-#### 3d: Rosenstein Lyapunov 指数 (λ)
+#### 3d: Rosenstein Lyapunov 指数 (λ₁) — 非线性混沌的唯一可靠判据
 
 **为什么选 Rosenstein 而不是 Wolf？**
 - Rosenstein：从轨迹数据直接计算，零额外模型调用，无上下文稀释
@@ -155,21 +206,35 @@ Phase 6: Synthesis               → 假设评估 + 一致性检查 + 报告
 | `weakly_chaotic` | 0.01 ≤ λ < 0.1 | 弱混沌 |
 | `strongly_chaotic` | λ ≥ 0.1 | 强混沌 |
 
-#### 3e: DMD 谱分析（替代 Wolf-GS Lyapunov 谱）
+#### 3e: 线性化谱分析 (DMD) — 结构互补，非混沌判据
 
 **核心思想：** 从自由动力学轨迹中提取连续状态对 (x_t, x_{t+1})，用 Tikhonov
-正则化最小二乘拟合最优线性转移算子 A。A 的特征值直接给出线性化 Lyapunov 谱。
+正则化最小二乘拟合最优线性转移算子 A。
 
-**优势：**
-- 零额外模型调用（直接使用已有轨迹）
-- 无上下文稀释偏差
-- 同时提供慢模态数量 (n_slow)、Hopf 分岔对数 (n_Hopf)、主导振荡频率 (f_dom)
+**重要科学说明：** DMD 特征值 μ_i 是**线性化**动力学的特征值，不是非线性
+Lyapunov 指数。λ_DMD_i = ln|μ_i| 给出的是线性化 Lyapunov 谱，对非线性系统
+这是近似值。DMD **不能**检测非线性折叠/拉伸（混沌的核心机制），因此**不能**
+作为混沌判据。混沌/有序的判断仅依赖 Rosenstein LLE (3d)。
 
-**输出指标：**
-- ρ_DMD: DMD 谱半径。ρ<1 → 稳定；ρ≈1 → 近临界；ρ>1 → 不稳定
-- n_slow: |Re(λ)| < 0.05 的慢模态数量（对应弛豫时间 > 20 步的模态）
-- n_Hopf: 虚部 |Im(λ)| > 0.01 的特征值对数量（振荡模态）
-- f_dom: 主导振荡频率 (Hz/step)
+**DMD 提供的互补信息：**
+- ρ_DMD: 谱半径。ρ<1 → 局部稳定；ρ≈1 → 近临界；ρ>1 → 局部不稳定
+- n_slow: 慢模态数量（|Re(λ)| < 0.05，弛豫时间 > 20 步的方向）
+- n_Hopf: 振荡模态对数（复共轭特征值），频率由 Im(λ)/(2π) 给出
+- 线性化 Lyapunov 谱: λ_DMD_1 ≥ ... ≥ λ_DMD_N（从 ln|μ_i| 计算）
+- 线性化 K-Y 维度: 从 DMD 谱计算的 Kaplan-Yorke 维度
+
+**验证框架：** 若 max(λ_DMD) ≈ λ₁_Rosenstein，说明线性化是好的近似；
+若差异大（非线性指数 Δ >> 1），说明非线性效应主导，DMD 结论仅做参考。
+
+#### 3h: 吸引子维度 — 三重估计
+
+从三个独立视角估计吸引子有效维度：
+
+| 方法 | 类型 | 强度 | 局限 |
+|------|------|------|------|
+| D₂ (关联维数) | 非线性 | 直接测量吸引子分形结构 | 需足够长的轨迹 |
+| K-Y_linear | 线性化 | 利用 DMD 已有结果，零额外成本 | 对强非线性低估 |
+| PCA n@90% | 线性 | 简单、鲁棒 | 上界，可能高估 |
 
 ---
 
@@ -215,16 +280,19 @@ Phase 6: Synthesis               → 假设评估 + 一致性检查 + 报告
 
 自动执行以下检查：
 
-1. **Rosenstein LLE vs DMD ρ 一致性**
-   - λ > 0 应对应 ρ > 1（混沌）
-   - λ < 0 应对应 ρ < 1（稳定）
-   - 不一致 → 非线性效应可能将系统推过混沌边界
+1. **Rosenstein LLE vs DMD 一致性 + 非线性指数**
+   - λ_DMD_max = ln(ρ_DMD) ← DMD 给出的线性化最大 Lyapunov 指数
+   - 非线性指数 Δ = |λ₁_Rosenstein - λ_DMD_max| / |λ₁_Rosenstein|
+   - Δ < 0.5: 线性化近似有效，DMD 结构分析结论可信
+   - Δ > 1.0: 非线性效应主导，DMD 结论仅做参考
+   - 符号不一致（λ₁ > 0 但 ρ < 1）: 非线性折叠在线性稳定系统中产生混沌
 
 2. **代替检验交叉验证**
    - 代替检验显示 `is_nonlinear=True` 增强 LLE 分类的可信度
    - `is_nonlinear=False` 表明动力学可能可以用线性模型解释
 
 3. **假设评估 (H1–H5)**
+   - H2 现在综合 D₂、K-Y_linear、PCA n@90% 三重维度估计
    - 综合所有阶段结果，对每个假设给出 `SUPPORTED` / `NOT_SUPPORTED` / `INSUFFICIENT_DATA`
 
 ---
@@ -258,9 +326,11 @@ dynamics:
     n_segments: 3          # 三段采样
     delay_embed_dim: 0     # FNN 维度（0=禁用）
   dmd_spectrum:
-    enabled: true          # DMD 替代 Wolf-GS
+    enabled: true          # 线性化谱分析 (DMD)
   power_spectrum:
     enabled: true
+  attractor_dimension:
+    enabled: true          # D₂ + 线性化 K-Y 维度
 
 # 统计验证（Phase 4）
 validation:
@@ -317,16 +387,25 @@ outputs/dynamics_pipeline/
 
 ## 已知问题与解决方案
 
-### Wolf-GS Lyapunov 谱上下文稀释
+### Wolf-GS Lyapunov 谱上下文稀释（已删除）
 
 **问题：** TwinBrain 的 ST-GCN 编码器对完整上下文窗口做注意力加权。Wolf-GS 方法
 在每个重正化周期调用 `rollout()` 时重置上下文，导致 k 个扰动方向共享 199/200 的
 相同历史 → 所有 λ_i ≈ 常数（虚假结果）。
 
-**表现：** λ₁=0.133, λ₂=0.132, ..., λ₁₀=0.126, D_KY=10.00（恰好等于 k）。
+**解决：** Wolf-GS 相关代码已完全移除（`b_lyapunov_spectrum.py`、`Step 15`、
+`B_LYA` 实验）。系统的线性化谱结构由 DMD 提供，非线性混沌判据由 Rosenstein 提供。
 
-**解决：** 本管线用 DMD 谱替代 Wolf-GS。DMD 直接从轨迹数据提取线性转移算子，
-无需额外模型调用，无上下文稀释。
+### DMD 对非线性系统的局限性
+
+**问题：** DMD 是线性分析方法。对非线性系统，DMD 特征值仅反映吸引子附近的
+线性化动力学，不能捕获折叠/拉伸等非线性机制。
+
+**缓解措施：**
+- 非线性指数 Δ 自动量化线性化偏差程度
+- 当 Δ > 1 时，报告自动标注 DMD 结论"仅做参考"
+- Rosenstein LLE 始终是混沌判据的权威来源
+- D₂ (关联维数) 提供非线性的吸引子维度估计
 
 ### 混沌吸引子吸引效应
 
@@ -350,13 +429,13 @@ outputs/dynamics_pipeline/
 | Step 6: 响应矩阵 | Phase 1b | 前移到数据生成阶段 |
 | Step 7: 稳定性分析 | Phase 3a | 不变 |
 | Step 8: 轨迹收敛 | Phase 3c | 不变 |
-| Step 9: Lyapunov 指数 | Phase 3d | 固定为 Rosenstein |
+| Step 9: Lyapunov 指数 | Phase 3d | 固定为 Rosenstein（非线性权威） |
 | Step 10: 随机对照 | Phase 4b | 移到验证阶段 |
 | Step 11: 代替检验 | Phase 4a | 移到验证阶段 |
-| Step 12: 嵌入维度 | Phase 4c | 移到验证阶段 |
+| Step 12: 嵌入维度 | Phase 4c | D₂ 同时用于 Phase 3h 吸引子维度 |
 | Step 13: 功率谱 | Phase 3f | 不变 |
-| Step 14: Jacobian (DMD) | Phase 3e | 默认启用 |
-| **Step 15: Wolf-GS 谱** | **移除** | **用 DMD 替代** |
+| Step 14: Jacobian (DMD) | Phase 3e | 默认启用，重定位为线性化分析 |
+| **Step 15: Wolf-GS 谱** | **已删除** | **上下文稀释不可修复** |
 | Step 16: 能量约束 | Phase 5b | 不变 |
 
 | 旧实验 (spectral_dynamics) | 新阶段 | 备注 |
@@ -370,7 +449,7 @@ outputs/dynamics_pipeline/
 | E5: 相图 | Phase 5c | 默认禁用 |
 | E6: 随机对照 | Phase 4b | 合并到 twinbrain 随机对照 |
 | F: PCA | Phase 3g | 不变 |
-| B_LYA: Lyapunov 谱 | **移除** | **用 DMD 替代** |
+| **B_LYA: Lyapunov 谱** | **已删除** | **与 DMD (3e) 功能重叠** |
 | H: 功率谱 | Phase 3f | 使用 twinbrain 实现 |
 | I: 能量约束 | Phase 5b | 使用 twinbrain 实现 |
 
