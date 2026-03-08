@@ -4,35 +4,36 @@ I: Energy Constraint Experiment (spectral_dynamics 版)
 
 验证假设 H5：有限代谢能量是维持大脑近临界态的机制之一。
 
+本模块是 twinbrain-dynamics 能量约束实验的 spectral_dynamics 入口。
+它不运行任何动力学模拟——所有轨迹由 twinbrain-dynamics 管线生成，
+本模块只做结果分析和可视化。
+
 与 twinbrain-dynamics 的关系
 -----------------------------
-twinbrain-dynamics 版对真实 GNN 施加约束（见 energy_constraint.py）。
-本模块用 Wilson–Cowan 动力学替代 GNN，秒级运行，用于快速验证假设方向。
+twinbrain-dynamics 版（experiments/energy_constraint.py）：
+  - 用真实 GNN 模型运行带能量约束的动力学
+  - 生成轨迹 (n_traj, T, N)
+  - 调用 run_energy_budget_analysis() 分析结果
 
-科学原理（与 GNN 版完全一致）
-------------------------------
-每步：
-  y       = tanh(W · x(t))            ← WC 预测（无约束期望状态）
-  x(t+1) = proj_E(y)                  ← L1 球投影到能量可行集
+本模块：
+  - 接受已由 GNN 生成的轨迹作为输入
+  - 直接调用 run_energy_budget_analysis() 分析
+  - 在 spectral_dynamics 工作流中提供一致的接口
 
-能量可行集：E = {z ∈ [0,1]^N : mean(z) ≤ E_budget}
-投影解（软阈值）：x(t+1)_i = max(y_i - λ*, 0)，λ* 使 mean(x(t+1)) = E_budget
+科学原理
+--------
+能量可行集：E = {z : mean(|z|) ≤ E_budget}
 
-为什么是 L1 投影而不是均匀缩放：
-  - 均匀缩放 (g·y): 所有神经元等比例减小，拓扑不变，科学意义为零
-  - L1 投影 (proj_E(y)): 弱激活置零，强激活保留 → winner-takes-all
-    → 稀疏神经表征 → 改变吸引子拓扑 → 与 Olshausen & Field (1996) 稀疏编码一致
-
-约束边界即临界流形：
-  E_budget << E*: 约束总激活 → 系统被压制 → 固定点 (LLE << 0)
-  E_budget ≈ E*: 约束约 50% 激活 → 系统在边界振荡 → 近临界 (LLE ≈ 0)
-  E_budget >> E*: 约束从不激活 → 无约束 WC 动力学 (LLE 由 ρ(W) 决定)
-  理论临界点：E_budget* ≈ mean(tanh(W·x)) at x = x_ref
+建议工作流（GNN 版）：
+  1. 运行基线（无约束）：python run_dynamics_analysis.py ...
+  2. 分析基线能量：run_energy_budget() 报告 E* 和推荐预算
+  3. 以 --energy-budget X 重新运行，用 GNN 生成约束轨迹
+  4. 对比 LLE / PCA / oscillation amplitude
 
 输出文件
 --------
-  energy_constraint_{label}.json  — 各条件 LLE / 振荡幅度 / 均值活动 / 投影激活率
-  energy_constraint_{label}.png   — PCA 相空间 + LLE + 投影激活率 对比图
+  energy_budget_{label}.json  — E* / 推荐预算 / 分区域能量
+  energy_budget_{label}.png   — 能量分布直方图
 """
 
 from __future__ import annotations
@@ -40,197 +41,125 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Shared WC utilities — canonical implementations in twinbrain-dynamics
-from analysis.wc_dynamics import project_energy_l1_bounded as _project_energy_wc
-from analysis.lyapunov import rosenstein_lyapunov as _rosenstein_canonical
+__all__ = ["run_energy_budget"]
 
 
-def _rosenstein(traj: np.ndarray, max_lag: int = 30, min_sep: int = 10) -> float:
-    """Rosenstein LLE wrapper — delegates to canonical twinbrain-dynamics implementation."""
-    try:
-        v, _ = _rosenstein_canonical(traj, max_lag=max_lag, min_temporal_sep=min_sep)
-        return float(v)
-    except Exception:
-        from analysis.wc_dynamics import wolf_benettin_lle
-        return wolf_benettin_lle(traj)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main experiment
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_energy_constraint_wc(
-    W: np.ndarray,
-    E_budget_values: Optional[List[float]] = None,
-    n_traj: int = 15,
-    steps: int = 200,
-    warmup: int = 30,
-    max_lag: int = 30,
-    seed: int = 42,
+def run_energy_budget(
+    trajectories: np.ndarray,
+    state_bounds=None,
     output_dir: Optional[Path] = None,
-    label: str = "matrix",
+    label: str = "gnn",
 ) -> Dict:
     """
-    对 WC 模型施加能量约束，对比有/无约束的动力学差异。
+    分析 GNN 轨迹的能量分布，为 --energy-budget 参数提供参考值。
 
-    每步：y = tanh(W·x)，x(t+1) = proj_E(y)
-    对比条件由 E_budget_values 指定，None 或 inf 表示无约束。
-
-    # 计算成本
-    # ─────────────────────────────────────────────────────────────────────────
-    # N=190, 4 条件, n_traj=15, steps=200: ~1–3 秒（纯 NumPy，无 GPU）
-    # ─────────────────────────────────────────────────────────────────────────
+    委托给 twinbrain-dynamics 的 ``run_energy_budget_analysis``。
+    若 twinbrain-dynamics 不在 sys.path，则执行内置的简化版本。
 
     Args:
-        W:               连接矩阵 (N, N)。
-        E_budget_values: 各条件的能量预算（None 或 inf = 无约束基线）。
-                         默认 [None, 0.5, 0.35, 0.20]。
-                         建议先运行无约束版本观察 E* = mean(|x|)，
-                         再选 E_budget 为 E* 的倍数。
-        n_traj:  每条件轨迹数（默认 15）。
-        steps:   热身后记录步数（默认 200）。
-        warmup:  热身步数（默认 30）。
-        max_lag: LLE 最大追踪步。
-        seed:    随机种子。
-        output_dir: 保存目录。
-        label:   文件名标签。
+        trajectories:  GNN 自由动力学轨迹，shape (n_traj, T, N)。
+                       由 twinbrain-dynamics 管线（步骤 3）生成。
+        state_bounds:  (lo, hi) 或 None（z-scored 无界数据传 None）。
+        output_dir:    结果保存目录；None → 不保存。
+        label:         文件名标签。
 
     Returns:
-        dict 含 conditions（各条件 lle/osc/mean_activity/projection_rate），
-             E_star（无约束典型能量），rho_W，hypothesis_supported。
+        dict 包含：
+          E_mean, E_std, E_median, E_per_region,
+          recommended_budgets (tight/moderate/natural/relaxed)
     """
-    if E_budget_values is None:
-        E_budget_values = [None, 0.5, 0.35, 0.20]
-
-    rng = np.random.default_rng(seed)
-    N = W.shape[0]
-    W64 = W.astype(np.float64)
-    rho_W = float(np.abs(np.linalg.eigvals(W64)).max())
-
-    conditions: Dict[str, Dict] = {}
-    all_trajs: Dict[str, np.ndarray] = {}
-    E_star: float = float("nan")
-
-    for E_budget in E_budget_values:
-        unconstrained = E_budget is None or not np.isfinite(float(E_budget))
-        cname = "无约束（基线）" if unconstrained else f"E_budget={E_budget:.2f}"
-
-        trajs = np.empty((n_traj, steps, N), dtype=np.float32)
-        proj_active_counts = []
-
-        for i in range(n_traj):
-            x = rng.random(N)
-            # warmup
-            for _ in range(warmup):
-                y = np.tanh(W64 @ x)
-                if not unconstrained:
-                    x, _ = _project_energy_wc(y, E_budget)
-                else:
-                    x = np.clip(y, 0.0, 1.0)
-            # record
-            proj_active = 0
-            for t in range(steps):
-                trajs[i, t] = x
-                y = np.tanh(W64 @ x)
-                if not unconstrained:
-                    x, active = _project_energy_wc(y, E_budget)
-                    if active:
-                        proj_active += 1
-                else:
-                    x = np.clip(y, 0.0, 1.0)
-            proj_active_counts.append(proj_active / steps)
-
-        all_trajs[cname] = trajs
-
-        # Estimate E* from unconstrained condition
-        if unconstrained:
-            E_star = float(trajs.mean())
-
-        lles = [
-            _rosenstein(trajs[i], max_lag=max_lag, min_sep=max(5, steps // 10))
-            for i in range(n_traj)
-        ]
-        valid = [v for v in lles if np.isfinite(v)]
-        lle = float(np.median(valid)) if valid else float("nan")
-        proj_rate = float(np.mean(proj_active_counts))
-
-        conditions[cname] = {
-            "E_budget": None if unconstrained else E_budget,
-            "lle": round(lle, 5),
-            "osc_amplitude": round(float(trajs.std(axis=1).mean()), 5),
-            "mean_activity": round(float(trajs.mean()), 5),
-            "projection_rate": round(proj_rate, 4),  # fraction of steps where constraint was active
-        }
-        logger.debug("  %s: LLE=%.4f, proj_rate=%.2f", cname, lle, proj_rate)
-
-    logger.info(
-        "I: 能量约束实验 [%s]: ρ(W)=%.3f, E*=%.4f",
-        label, rho_W, E_star,
-    )
-    for cname, info in conditions.items():
-        logger.info(
-            "  %s: LLE=%.4f, osc=%.4f, proj_rate=%.2f",
-            cname, info["lle"], info["osc_amplitude"], info["projection_rate"],
+    try:
+        from experiments.energy_constraint import run_energy_budget_analysis
+        result = run_energy_budget_analysis(
+            trajectories=trajectories,
+            state_bounds=state_bounds,
+            output_dir=Path(output_dir) / label if output_dir else None,
         )
-
-    # Hypothesis: does some constrained condition have LLE closer to 0 than unconstrained?
-    baseline_lle = next(
-        (info["lle"] for info in conditions.values() if info["E_budget"] is None),
-        float("nan"),
-    )
-    constrained_lles = [
-        info["lle"] for info in conditions.values() if info["E_budget"] is not None
-    ]
-    valid_c = [v for v in constrained_lles if np.isfinite(v)]
-    hypothesis_supported = (
-        np.isfinite(baseline_lle) and bool(valid_c) and
-        min(abs(v) for v in valid_c) < abs(baseline_lle) - 0.01
-    )
-
-    result = {
-        "conditions": conditions,
-        "E_star": round(E_star, 5) if np.isfinite(E_star) else None,
-        "rho_W": round(rho_W, 4),
-        "label": label,
-        "hypothesis_supported": hypothesis_supported,
-    }
+    except ImportError:
+        logger.warning(
+            "run_energy_budget: experiments.energy_constraint not importable; "
+            "using built-in fallback."
+        )
+        result = _energy_budget_builtin(trajectories, state_bounds)
 
     if output_dir is not None:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
-        with open(out / f"energy_constraint_{label}.json", "w",
-                  encoding="utf-8") as fh:
-            json.dump(result, fh, indent=2, ensure_ascii=False)
-        _try_plot(all_trajs, conditions, rho_W, E_star, label,
-                  out / f"energy_constraint_{label}.png")
+        json_path = out / f"energy_budget_{label}.json"
+        # E_per_region is ndarray — convert to list for JSON
+        serialisable = {
+            k: v.tolist() if isinstance(v, np.ndarray) else v
+            for k, v in result.items()
+        }
+        with open(json_path, "w", encoding="utf-8") as fh:
+            json.dump(serialisable, fh, indent=2, ensure_ascii=False)
+        logger.info("保存能量预算分析: %s", json_path)
+        _try_plot(result, out / f"energy_budget_{label}.png", label)
 
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Built-in fallback (used when twinbrain-dynamics is not on sys.path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TIGHT    = 0.4
+_MODERATE = 0.7
+_NATURAL  = 1.0
+_RELAXED  = 1.3
+
+
+def _energy_budget_builtin(
+    trajectories: np.ndarray,
+    state_bounds=None,
+) -> Dict:
+    """
+    Minimal energy budget analysis without twinbrain-dynamics dependency.
+
+    Matches the output schema of ``run_energy_budget_analysis``.
+    """
+    n_traj, T, N = trajectories.shape
+    burnin = max(10, T // 10)
+    traj_valid = trajectories[:, burnin:, :]
+
+    E_traj = np.abs(traj_valid).mean(axis=(1, 2))
+    E_mean   = float(E_traj.mean())
+    E_std    = float(E_traj.std())
+    E_median = float(np.median(E_traj))
+    E_per_region = np.abs(traj_valid).mean(axis=(0, 1))
+
+    recommended = {
+        "tight_constraint":    round(_TIGHT    * E_mean, 6),
+        "moderate_constraint": round(_MODERATE * E_mean, 6),
+        "natural":             round(_NATURAL  * E_mean, 6),
+        "relaxed":             round(_RELAXED  * E_mean, 6),
+    }
+
+    logger.info("能量分析(builtin): E*=%.4f ± %.4f", E_mean, E_std)
+    return {
+        "E_mean":             E_mean,
+        "E_std":              E_std,
+        "E_median":           E_median,
+        "E_per_region":       E_per_region,
+        "recommended_budgets": recommended,
+        "n_traj":             n_traj,
+        "n_steps_used":       T - burnin,
+        "burnin":             burnin,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Visualisation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _try_plot(
-    all_trajs: Dict[str, np.ndarray],
-    conditions: Dict[str, Dict],
-    rho_W: float,
-    E_star: float,
-    label: str,
-    output_path: Path,
-) -> None:
-    """
-    3 行 × n_conditions 列：
-      行 1 — PCA 相空间（蓝→红时间渐变）
-      行 2 — 能量（mean活动）时序（观察约束激活情况）
-      行 3 — LLE / 投影激活率 汇总条形图
-    """
+def _try_plot(result: Dict, output_path: Path, label: str) -> None:
+    """能量分布直方图 + 推荐预算标注。"""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -238,113 +167,45 @@ def _try_plot(
     except ImportError:
         return
 
-    cond_names = list(conditions.keys())
-    n = len(cond_names)
-    if n == 0:
+    E_per_region = result.get("E_per_region")
+    if E_per_region is None:
         return
+    if isinstance(E_per_region, list):
+        E_per_region = np.array(E_per_region)
 
-    first = all_trajs[cond_names[0]]
-    X_fit = first.reshape(-1, first.shape[2])
-    X_fit_c = X_fit - X_fit.mean(0)
-    try:
-        from sklearn.decomposition import PCA as _PCA
-        pca = _PCA(n_components=2)
-        pca.fit(X_fit_c)
-        def _proj(X): return pca.transform(X - X.mean(0))
-    except ImportError:
-        _, _, Vt = np.linalg.svd(X_fit_c, full_matrices=False)
-        _V = Vt[:2]
-        def _proj(X): return (X - X.mean(0)) @ _V.T
+    rec = result.get("recommended_budgets", {})
+    E_mean = result.get("E_mean", float("nan"))
 
-    T_rec = first.shape[1]
-    t_norm = np.linspace(0, 1, T_rec)
-    cmap_time = plt.get_cmap("plasma")
-    cmap_cond = plt.get_cmap("tab10", n)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
 
-    fig = plt.figure(figsize=(4 * n, 11))
+    # Histogram of per-region mean energy
+    ax = axes[0]
+    ax.hist(E_per_region, bins=30, color="steelblue", alpha=0.75, edgecolor="k", lw=0.4)
+    ax.axvline(E_mean, ls="--", color="red", lw=1.5, label=f"E*={E_mean:.4f}")
+    ax.set_xlabel("脑区平均能量 E")
+    ax.set_ylabel("脑区数")
+    ax.set_title("脑区能量分布")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
 
-    # Row 1: PCA phase space
-    for j, cname in enumerate(cond_names):
-        ax = fig.add_subplot(3, n, j + 1)
-        trajs = all_trajs[cname]
-        n_t = trajs.shape[0]
-        for i in range(n_t):
-            pr = _proj(trajs[i])
-            for k in range(T_rec - 1):
-                ax.plot(pr[k:k+2, 0], pr[k:k+2, 1],
-                        color=cmap_time(t_norm[k]), lw=0.7, alpha=0.55)
-        info = conditions[cname]
-        ax.set_title(
-            f"{cname}\nLLE={info['lle']:.4f}  proj={info['projection_rate']:.0%}",
-            fontsize=8,
-        )
-        ax.set_xlabel("PC1", fontsize=7)
-        if j == 0:
-            ax.set_ylabel("PC2", fontsize=7)
-        ax.tick_params(labelsize=6)
-        ax.grid(True, alpha=0.2)
+    # Recommended budgets bar chart
+    ax2 = axes[1]
+    if rec:
+        keys = list(rec.keys())
+        vals = [rec[k] for k in keys]
+        colors = ["#d62728", "#ff7f0e", "#2ca02c", "#1f77b4"]
+        ax2.bar(keys, vals, color=colors[:len(keys)], alpha=0.8, edgecolor="k", lw=0.5)
+        ax2.axhline(E_mean, ls="--", color="gray", lw=1, label=f"E*={E_mean:.4f}")
+        ax2.set_ylabel("E_budget 推荐值")
+        ax2.set_title("推荐能量预算")
+        ax2.legend(fontsize=8)
+        ax2.set_xticklabels(keys, rotation=20, ha="right", fontsize=8)
+        for i, v in enumerate(vals):
+            ax2.text(i, v + 0.002, f"{v:.4f}", ha="center", va="bottom", fontsize=7)
+        ax2.grid(True, alpha=0.3, axis="y")
 
-    # Row 2: mean activity over time (shows whether constraint is binding)
-    for j, cname in enumerate(cond_names):
-        ax = fig.add_subplot(3, n, n + j + 1)
-        trajs = all_trajs[cname]
-        act = trajs.mean(axis=2)   # (n_traj, steps) — mean over neurons
-        ax.fill_between(
-            np.arange(T_rec),
-            act.min(axis=0), act.max(axis=0),
-            color=cmap_cond(j), alpha=0.25,
-        )
-        ax.plot(np.arange(T_rec), act.mean(axis=0),
-                color=cmap_cond(j), lw=1.5)
-        eb = conditions[cname].get("E_budget")
-        if eb is not None:
-            ax.axhline(eb, ls="--", color="red", lw=1.0,
-                       label=f"E_budget={eb:.2f}")
-            ax.legend(fontsize=6)
-        if np.isfinite(E_star):
-            ax.axhline(E_star, ls=":", color="gray", lw=0.8,
-                       label=f"E*={E_star:.2f}")
-        ax.set_ylabel("mean 活动" if j == 0 else "", fontsize=7)
-        ax.set_xlabel("步骤", fontsize=7)
-        ax.tick_params(labelsize=6)
-        ax.grid(True, alpha=0.2)
-
-    # Row 3: summary bars
-    ax_lle  = fig.add_subplot(3, 3, 7)
-    ax_proj = fig.add_subplot(3, 3, 8)
-    ax_osc  = fig.add_subplot(3, 3, 9)
-
-    x_pos = np.arange(n)
-    colors = [cmap_cond(j) for j in range(n)]
-    short = [c[:10] + ("…" if len(c) > 10 else "") for c in cond_names]
-
-    ax_lle.bar(x_pos, [conditions[c]["lle"] for c in cond_names],
-               color=colors, alpha=0.85)
-    ax_lle.axhline(0, ls="--", color="red", lw=1, label="临界 LLE=0")
-    ax_lle.set_xticks(x_pos); ax_lle.set_xticklabels(short, fontsize=6)
-    ax_lle.set_title("Lyapunov 指数", fontsize=8)
-    ax_lle.legend(fontsize=6); ax_lle.grid(True, alpha=0.3, axis="y")
-
-    ax_proj.bar(x_pos, [conditions[c]["projection_rate"] for c in cond_names],
-                color=colors, alpha=0.85)
-    ax_proj.set_xticks(x_pos); ax_proj.set_xticklabels(short, fontsize=6)
-    ax_proj.set_ylim(0, 1.05)
-    ax_proj.set_title("约束激活率\n(1=总是约束, 0=从不)", fontsize=7)
-    ax_proj.grid(True, alpha=0.3, axis="y")
-
-    ax_osc.bar(x_pos, [conditions[c]["osc_amplitude"] for c in cond_names],
-               color=colors, alpha=0.85)
-    ax_osc.set_xticks(x_pos); ax_osc.set_xticklabels(short, fontsize=6)
-    ax_osc.set_title("振荡幅度", fontsize=8)
-    ax_osc.grid(True, alpha=0.3, axis="y")
-
-    fig.suptitle(
-        f"能量约束实验（WC 版）[{label}]  ρ(W)={rho_W:.3f}  E*={E_star:.3f}\n"
-        "行1: PCA 相空间  行2: 均值活动时序（红虚线=E_budget）  行3: 汇总指标\n"
-        "科学预测：E_budget≈E* 时 LLE≈0（临界），约束激活率≈50%",
-        fontsize=8,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
-    fig.savefig(output_path, dpi=130, bbox_inches="tight")
+    fig.suptitle(f"能量约束预算分析  [{label}]", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
-    logger.info("I: 保存图: %s", output_path)
+    logger.info("保存: %s", output_path)
