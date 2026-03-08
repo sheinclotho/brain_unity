@@ -132,7 +132,7 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
     # 2a: Spectral decomposition
     if ns_cfg.get("spectral", {}).get("enabled", True):
         try:
-            from e1_spectral_analysis import run_spectral_analysis
+            from spectral_dynamics.e1_spectral_analysis import run_spectral_analysis
             spec = run_spectral_analysis(W, label=w_label, output_dir=struct_dir)
             results["spectral"] = spec
             logger.info(
@@ -147,7 +147,7 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
     comm_cfg = ns_cfg.get("community", {})
     if comm_cfg.get("enabled", True):
         try:
-            from c_community_structure import run_community_structure
+            from spectral_dynamics.c_community_structure import run_community_structure
             comm = run_community_structure(
                 W, k_range=comm_cfg.get("k_range", [3, 4, 5, 6, 7, 8]),
                 label=w_label, output_dir=struct_dir,
@@ -164,7 +164,7 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
     # 2c: Hierarchy
     if ns_cfg.get("hierarchy", {}).get("enabled", False):
         try:
-            from d_hierarchical_structure import run_hierarchical_structure
+            from spectral_dynamics.d_hierarchical_structure import run_hierarchical_structure
             hier = run_hierarchical_structure(W, label=w_label, output_dir=struct_dir)
             results["hierarchy"] = hier
             logger.info("  Hierarchy index: %.4f", hier.get("hierarchy_index", 0))
@@ -174,7 +174,7 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
     # 2d: Modal energy
     if ns_cfg.get("modal_energy", {}).get("enabled", True) and trajs is not None:
         try:
-            from e2_e3_modal_projection import run_modal_projection
+            from spectral_dynamics.e2_e3_modal_projection import run_modal_projection
             modal = run_modal_projection(
                 W, trajectories=trajs, label=w_label, output_dir=struct_dir,
             )
@@ -190,7 +190,7 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
     # 2e: Visualization
     if ns_cfg.get("visualization", {}).get("enabled", True):
         try:
-            from a_connectivity_visualization import run_connectivity_visualization
+            from spectral_dynamics.a_connectivity_visualization import run_connectivity_visualization
             comm_labels = results.get("community", {}).get("labels")
             run_connectivity_visualization(
                 W, community_labels=comm_labels,
@@ -340,7 +340,7 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
     # 3g: PCA dimensionality
     if dyn_cfg.get("pca", {}).get("enabled", True):
         try:
-            from f_pca_attractor import run_pca_attractor
+            from spectral_dynamics.f_pca_attractor import run_pca_attractor
             burnin = max(0, trajs.shape[1] // 10) if trajs.ndim >= 2 else 0
             pca = run_pca_attractor(
                 trajectories=trajs,
@@ -440,7 +440,7 @@ def run_phase4_validation(cfg: dict, results: Dict[str, Any],
         R = results.get("response_matrix")
         if R is not None:
             try:
-                from e4_structural_perturbation import run_structural_perturbation
+                from spectral_dynamics.e4_structural_perturbation import run_structural_perturbation
                 pert = run_structural_perturbation(R, output_dir=val_dir)
                 results["perturbation"] = pert
                 logger.info("  Structural perturbation: done (see report).")
@@ -504,7 +504,7 @@ def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
         R = results.get("response_matrix")
         if R is not None:
             try:
-                from e5_phase_diagram import run_phase_diagram
+                from spectral_dynamics.e5_phase_diagram import run_phase_diagram
                 pd_cfg = adv_cfg.get("phase_diagram", {})
                 phase = run_phase_diagram(
                     R, output_dir=adv_dir,

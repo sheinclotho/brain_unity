@@ -664,3 +664,33 @@ r ≈ 0 的两个神经生物学合理原因：
 - `lyapunov_spectrum_wolf` **必须**使用 `wolf_rollout_pair()` + 推进的 `wolf_context`（已检测 `hasattr(simulator, 'wolf_rollout_pair')`），不允许使用 `rollout()` 重置上下文。
 - 当 `initial_std < 0.087`（attractor_ambiguous）时，收敛检验结论必须注明歧义，以 LLE 符号为准。
 - 发现 Step 9 vs Step 15 矛盾时，**以 Step 11（代替数据检验）为主要参考**：surrogate test 对 LLE 符号的估计最鲁棒（对比相位随机化/shuffle/AR 代替序列）。
+
+### [2026-03-08] 统一动力学分析管线 `dynamics_pipeline`
+
+#### 背景与动机
+- **问题 1**: `twinbrain-dynamics`（16 步）和 `spectral_dynamics`（12 实验）存在显著功能重叠（LLE、功率谱、随机对照、PCA 各有两套实现），没有统一的假设评估。
+- **问题 2**: Wolf-GS Lyapunov 谱在 TwinBrain 架构下不可用（上下文稀释导致所有 k 个指数趋同），但仍保留在默认管线中。
+- **问题 3**: Step 9 和 Step 15 经常产生矛盾结论，缺乏自动一致性检查。
+
+#### 解决方案
+- **新增 `dynamics_pipeline/`**：6 阶段统一管线，单一 YAML 配置，合并两个模块。
+- **Phase 1 (Data)**: 自由动力学 + 响应矩阵。
+- **Phase 2 (Structure)**: 谱分析、社区检测、层次结构、模态能量、可视化。委托给 `spectral_dynamics` 模块。
+- **Phase 3 (Dynamics)**: 稳定性（Method C）、吸引子（KMeans）、收敛、**Rosenstein LLE**（固定方法）、**DMD 谱**（替代 Wolf-GS）、功率谱、PCA。委托给 `twinbrain-dynamics/analysis/` 模块。
+- **Phase 4 (Validation)**: 代替检验、随机对照、嵌入维度。
+- **Phase 5 (Advanced)**: 虚拟刺激、能量约束、相图、可控性、信息流、临界减速。
+- **Phase 6 (Synthesis)**: 假设评估（H1-H5）+ Rosenstein LLE vs DMD ρ 一致性检查。
+
+#### 关键设计决策
+1. **Wolf-GS 从默认管线移除**：DMD 谱分析提供等效信息（谱半径、慢模态、Hopf 分岔），零额外模型调用，无上下文稀释。旧的 `lyapunov_spectrum_wolf` 函数仍保留在库中但不被统一管线调用。
+2. **Rosenstein 作为唯一 LLE 方法**：在统一管线中不再提供 Wolf/FTLE 选项。原因：(a) Wolf 有上下文稀释偏差；(b) FTLE 有数值底层问题；(c) Rosenstein 零成本且无偏。
+3. **`--phases` 参数**：用户可选择只运行特定阶段（如 `--phases 1 3` 只运行数据生成和动力学特征化）。
+4. **旧管线保留**：`twinbrain-dynamics/run_dynamics_analysis.py` 和 `spectral_dynamics/run_all.py` 不删除，保持向后兼容。
+
+#### 规则
+- 统一管线中 Lyapunov 分析**只使用 Rosenstein**，不提供 Wolf/FTLE 选项。
+- DMD 谱（Phase 3e）替代 Wolf-GS 谱（原 Step 15），默认启用。
+- Phase 6 自动检查 Rosenstein LLE 符号与 DMD ρ 的一致性：λ > 0 应对应 ρ > 1，λ < 0 应对应 ρ < 1。
+- 假设评估阈值：H1 (PR/N < 0.3)、H2 (n@90%/N < 0.15)、H3 (regime ∈ {edge_of_chaos, marginal_stable, weakly_chaotic})。
+
+*Last updated: 2026-03-08*
