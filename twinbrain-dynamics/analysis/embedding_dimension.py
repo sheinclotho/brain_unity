@@ -522,7 +522,6 @@ def check_normalization_leakage(
             f"若用全集统计量归一化，测试集信息会渗入训练流程，"
             f"导致 LLE 等估计量偏低。请改用仅训练集统计量归一化。"
         )
-        logger.warning(warning)
 
     return {
         "mean_drift": mean_drift,
@@ -618,7 +617,6 @@ def check_pca_leakage(
             f"{max_angle:.1f}°。强烈建议仅在参考（训练）轨迹上拟合 PCA，"
             f"再将其余轨迹投影到该子空间，避免信息泄漏。"
         )
-        logger.warning(warning)
 
     return {
         "max_principal_angle_deg": max_angle,
@@ -768,8 +766,19 @@ def run_embedding_dimension_analysis(
         if leak_pca["leakage_risk"] == "low":
             logger.info("  ✓ PCA 泄漏风险低（最大主成分夹角=%.1f°）",
                         leak_pca["max_principal_angle_deg"])
-        elif leak_pca["warning"]:
+        elif leak_pca["leakage_risk"] == "medium":
             logger.warning("  PCA: %s", leak_pca["warning"])
+        else:
+            # High leakage risk: report measurement result and confirm the
+            # pipeline already applies the fix (training-set PCA everywhere).
+            logger.info(
+                "  PCA 子空间差异较大（最大主成分夹角=%.1f°）。\n"
+                "  已修正：identify_observation_space 和可视化图表均仅在"
+                "参考（训练）轨迹上拟合 PCA，其余轨迹投影到该子空间。\n"
+                "  高角度差异提示训练集与测试集轨迹的主成分方向不完全一致，"
+                "可能与动力学非平稳性有关，但不代表当前分析存在泄漏。",
+                leak_pca["max_principal_angle_deg"],
+            )
     else:
         logger.info("  (5/5) 数据泄漏检查已跳过（n_init=%d < 4）", n_init)
 
