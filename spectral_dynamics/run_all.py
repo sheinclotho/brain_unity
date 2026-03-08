@@ -203,6 +203,15 @@ def run_all(
     Returns:
         run_summary dict，含各实验结果摘要。
     """
+    # Warn if caller passes legacy WC params (they no longer have any effect)
+    if n_traj_lle or steps_lle or n_traj_phase or steps_phase:
+        import warnings
+        warnings.warn(
+            "n_traj_lle, steps_lle, n_traj_phase, steps_phase are ignored — "
+            "WC simulation has been removed. spectral_dynamics now operates "
+            "purely on GNN-generated trajectories and response matrices.",
+            DeprecationWarning, stacklevel=2,
+        )
     if experiments is None:
         experiments = _ALL_EXPERIMENTS
     # Normalize aliases (E1 → B_E1, B → B_E1)
