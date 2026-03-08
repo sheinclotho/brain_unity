@@ -358,6 +358,19 @@ def _run_single_modality(
             simulator.modality, simulator.n_regions, simulator.dt,
         )
 
+    # ── Energy constraint (optional) ─────────────────────────────────────────
+    ec_budget = cfg.get("energy_constraint", {}).get("E_budget")
+    if ec_budget is not None:
+        from experiments.energy_constraint import EnergyConstrainedSimulator
+        simulator = EnergyConstrainedSimulator(simulator, E_budget=float(ec_budget))
+        logger.info(
+            "⚡ 能量约束已启用: E_budget=%.4f\n"
+            "   机制：每步对 GNN 预测施加 L1 投影，使 mean(|x|) ≤ %.4f\n"
+            "   弱激活被置零（稀疏化），强激活保留——改变吸引子拓扑。\n"
+            "   对比实验：用不同 --energy-budget 值分别运行，比较 LLE 和 PCA 轨迹。",
+            ec_budget, ec_budget,
+        )
+
     results: dict = {}
 
     # ── Step 3: Free dynamics ─────────────────────────────────────────────────
@@ -1161,6 +1174,22 @@ def _parse_args() -> argparse.Namespace:
             "  Rosenstein 方法（推荐）不受此参数影响（始终并行）。"
         ),
     )
+    parser.add_argument(
+        "--energy-budget",
+        type=float,
+        default=None,
+        dest="energy_budget",
+        metavar="E",
+        help=(
+            "对 GNN 施加显式能量约束：每步将模型预测投影到能量可行集\n"
+            "  {x : mean(|x|) ≤ E}（L1 球投影 / 软阈值）。\n"
+            "  机制：弱激活被置零（稀疏化），强激活保留——改变吸引子拓扑。\n"
+            "  这不是均匀缩放（g·F(x)），而是 winner-takes-all 投影。\n"
+            "  建议先用 estimate_typical_energy() 估计 E*，再选 E ≈ E*。\n"
+            "  示例：--energy-budget 0.3 --output outputs/energy_constrained\n"
+            "  对比：不加此标志运行无约束基线，比较 LLE 和 PCA 轨迹。"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1206,6 +1235,8 @@ def main() -> None:
         cfg["model"]["device"] = args.device
     if args.n_workers is not None:
         cfg["lyapunov"]["n_workers"] = args.n_workers
+    if args.energy_budget is not None:
+        cfg["energy_constraint"]["E_budget"] = float(args.energy_budget)
 
     run(cfg)
 

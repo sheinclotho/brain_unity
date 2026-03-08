@@ -1015,8 +1015,8 @@ class TestPowerSpectrum(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════════
 
 from spectral_dynamics.i_energy_constraint import (
-    run_energy_alpha_scan,
-    run_dynamic_energy,
+    run_energy_constraint_wc,
+    _project_energy_wc,
 )
 
 
@@ -1026,116 +1026,131 @@ class TestEnergyConstraint(unittest.TestCase):
         N = 15
         rng = np.random.default_rng(11)
         W = rng.standard_normal((N, N)).astype(np.float32) * 0.25
-        eigvals = np.linalg.eigvals(W.astype(np.float64))
-        rho = float(np.abs(eigvals).max())
+        rho = float(np.abs(np.linalg.eigvals(W.astype(np.float64))).max())
         cls.W = (W * 0.9 / max(rho, 1e-6)).astype(np.float32)
         cls.N = N
 
-    def test_alpha_scan_keys(self):
-        result = run_energy_alpha_scan(
-            self.W, alpha_min=0.8, alpha_max=1.2, alpha_step=0.2,
-            n_traj=3, steps=50, warmup=10, seed=0,
+    # ── L1 projection tests ───────────────────────────────────────────────────
+
+    def test_project_energy_feasible_unchanged(self):
+        """If already feasible, projection returns input unchanged."""
+        rng = np.random.default_rng(0)
+        y = rng.random(self.N).astype(np.float32) * 0.2   # mean ≈ 0.1
+        x, active = _project_energy_wc(y, 0.5)            # E_budget=0.5 >> 0.1
+        self.assertFalse(active)
+        np.testing.assert_array_almost_equal(x, y.clip(0, 1), decimal=5)
+
+    def test_project_energy_budget_respected(self):
+        """After projection, mean(x) ≤ E_budget."""
+        rng = np.random.default_rng(1)
+        y = rng.random(self.N).astype(np.float32) * 0.9   # mean ≈ 0.45
+        E_budget = 0.20
+        x, active = _project_energy_wc(y, E_budget)
+        self.assertTrue(active)
+        self.assertLessEqual(float(x.mean()), E_budget + 1e-4)
+
+    def test_project_energy_sparse(self):
+        """Tight budget creates sparsity when inputs are heterogeneous."""
+        # Heterogeneous input: half neurons fire strongly, half fire weakly
+        y = np.zeros(self.N, dtype=np.float32)
+        y[:self.N // 2] = 0.8    # strong activations
+        y[self.N // 2:] = 0.05   # weak activations
+        # Budget tight enough to silence weak neurons
+        E_budget = 0.20
+        x, active = _project_energy_wc(y, E_budget)
+        self.assertTrue(active)
+        # Weak neurons should be silenced (the L1 projection sets them to 0)
+        n_zeros = int((x < 1e-5).sum())
+        self.assertGreater(n_zeros, 0, "L1 projection should silence weak neurons")
+
+    def test_project_energy_gradient_input(self):
+        """Gradient input: threshold λ* correctly partitions by activation strength."""
+        # Linearly increasing activations from 0.01 to 0.9
+        y = np.linspace(0.01, 0.9, self.N, dtype=np.float32)
+        E_budget = 0.15
+        x, active = _project_energy_wc(y, E_budget)
+        self.assertTrue(active)
+        # Verify budget is respected
+        self.assertLessEqual(float(x.mean()), E_budget + 1e-4)
+        # Verify threshold partitions by value: all zeroed neurons had smaller
+        # original activation than all surviving neurons
+        zeroed = y[x < 1e-5]
+        surviving = y[x >= 1e-5]
+        if len(zeroed) > 0 and len(surviving) > 0:
+            self.assertLess(float(zeroed.max()), float(surviving.min()) + 1e-4)
+
+    def test_project_energy_in_bounds(self):
+        """Output must stay in [0,1]."""
+        rng = np.random.default_rng(2)
+        y = rng.random(self.N).astype(np.float32)
+        x, _ = _project_energy_wc(y, 0.15)
+        self.assertGreaterEqual(float(x.min()), 0.0)
+        self.assertLessEqual(float(x.max()), 1.0 + 1e-6)
+
+    # ── run_energy_constraint_wc tests ────────────────────────────────────────
+
+    def test_constraint_wc_keys(self):
+        result = run_energy_constraint_wc(
+            self.W, E_budget_values=[None, 0.30],
+            n_traj=3, steps=40, warmup=5, seed=0,
         )
-        for key in ("alpha_values", "lles", "osc_amplitudes",
-                    "mean_activities", "critical_alpha", "bifurcation_found",
-                    "rho_W"):
+        for key in ("conditions", "E_star", "rho_W", "hypothesis_supported"):
             self.assertIn(key, result)
 
-    def test_alpha_scan_lengths_match(self):
-        result = run_energy_alpha_scan(
-            self.W, alpha_min=0.8, alpha_max=1.2, alpha_step=0.2,
-            n_traj=3, steps=50, warmup=10, seed=0,
+    def test_constraint_wc_conditions_have_required_fields(self):
+        result = run_energy_constraint_wc(
+            self.W, E_budget_values=[None, 0.30],
+            n_traj=3, steps=40, warmup=5, seed=0,
         )
-        n = len(result["alpha_values"])
-        self.assertEqual(len(result["lles"]), n)
-        self.assertEqual(len(result["osc_amplitudes"]), n)
-        self.assertEqual(len(result["mean_activities"]), n)
+        for cname, info in result["conditions"].items():
+            for field in ("lle", "osc_amplitude", "mean_activity", "projection_rate"):
+                self.assertIn(field, info, f"Missing {field!r} in condition {cname!r}")
 
-    def test_alpha_scan_saves_files(self):
+    def test_constraint_wc_projection_rate_zero_for_unconstrained(self):
+        """Unconstrained condition must have projection_rate=0."""
+        result = run_energy_constraint_wc(
+            self.W, E_budget_values=[None, 0.25],
+            n_traj=3, steps=40, warmup=5, seed=0,
+        )
+        baseline = next(info for info in result["conditions"].values()
+                        if info["E_budget"] is None)
+        self.assertAlmostEqual(baseline["projection_rate"], 0.0, places=5)
+
+    def test_constraint_wc_projection_rate_positive_when_constrained(self):
+        """Tight budget must cause constraint to activate."""
+        result = run_energy_constraint_wc(
+            self.W, E_budget_values=[None, 0.05],
+            n_traj=3, steps=40, warmup=5, seed=0,
+        )
+        tight = next(info for info in result["conditions"].values()
+                     if info["E_budget"] is not None)
+        self.assertGreater(tight["projection_rate"], 0.0)
+
+    def test_constraint_wc_mean_activity_respects_budget(self):
+        """With tight budget, mean_activity ≤ E_budget + tolerance."""
+        E_budget = 0.10
+        result = run_energy_constraint_wc(
+            self.W, E_budget_values=[None, E_budget],
+            n_traj=3, steps=40, warmup=5, seed=0,
+        )
+        tight = next(info for info in result["conditions"].values()
+                     if info["E_budget"] == E_budget)
+        self.assertLessEqual(tight["mean_activity"], E_budget + 0.02)
+
+    def test_constraint_wc_saves_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            run_energy_alpha_scan(
-                self.W, alpha_min=0.8, alpha_max=1.2, alpha_step=0.2,
-                n_traj=3, steps=50, warmup=10, seed=0,
+            run_energy_constraint_wc(
+                self.W, E_budget_values=[None, 0.30],
+                n_traj=3, steps=40, warmup=5, seed=0,
                 output_dir=Path(tmpdir), label="test",
             )
             self.assertTrue(
-                (Path(tmpdir) / "energy_alpha_scan_test.json").exists()
+                (Path(tmpdir) / "energy_constraint_test.json").exists()
             )
             self.assertTrue(
-                (Path(tmpdir) / "energy_alpha_scan_test.png").exists()
+                (Path(tmpdir) / "energy_constraint_test.png").exists()
             )
 
-    def test_dynamic_energy_keys(self):
-        result = run_dynamic_energy(
-            self.W, alpha=0.4, beta=0.4, E_ref=1.0,
-            steps=80, n_traj=3, seed=0,
-        )
-        for key in ("E_mean", "E_std", "activity_mean",
-                    "homeostasis_achieved", "alpha", "beta", "E_ref"):
-            self.assertIn(key, result)
-
-    def test_dynamic_energy_E_positive(self):
-        result = run_dynamic_energy(
-            self.W, alpha=0.4, beta=0.4, E_ref=1.0,
-            steps=80, n_traj=3, seed=0,
-        )
-        self.assertGreaterEqual(result["E_mean"], 0.0)
-
-    def test_dynamic_energy_saves_files(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            run_dynamic_energy(
-                self.W, alpha=0.4, beta=0.4, E_ref=1.0,
-                steps=80, n_traj=3, seed=0,
-                output_dir=Path(tmpdir), label="test",
-            )
-            self.assertTrue(
-                (Path(tmpdir) / "energy_dynamic_E_test.json").exists()
-            )
-            self.assertTrue(
-                (Path(tmpdir) / "energy_dynamic_E_test.png").exists()
-            )
-
-    def test_g_energy_at_E_ref_is_one(self):
-        """g(E_ref) must equal 1.0 (fixed bug: was 0.5 in old sigmoid formula)."""
-        from spectral_dynamics.i_energy_constraint import _g_energy
-        E_ref = 1.0
-        g = _g_energy(E_ref, E_ref)
-        self.assertAlmostEqual(g, 1.0, places=5)
-
-    def test_g_energy_at_zero_is_small(self):
-        """g(0) must be near 0 (energy-starved silence)."""
-        from spectral_dynamics.i_energy_constraint import _g_energy
-        g = _g_energy(0.0, 1.0)
-        self.assertLess(g, 0.1)
-
-    def test_energy_comparison_wc_keys(self):
-        from spectral_dynamics.i_energy_constraint import run_energy_comparison_wc
-        result = run_energy_comparison_wc(
-            self.W, alpha_low=0.5, alpha_high=1.5,
-            n_traj=3, steps=30, warmup=5, seed=0,
-        )
-        self.assertIn("conditions", result)
-        for cond in ("low", "normal", "high"):
-            self.assertIn(cond, result["conditions"])
-            self.assertIn("lle", result["conditions"][cond])
-            self.assertIn("osc_amplitude", result["conditions"][cond])
-
-    def test_energy_comparison_wc_saves_files(self):
-        from spectral_dynamics.i_energy_constraint import run_energy_comparison_wc
-        with tempfile.TemporaryDirectory() as tmpdir:
-            run_energy_comparison_wc(
-                self.W, alpha_low=0.5, alpha_high=1.5,
-                n_traj=3, steps=30, warmup=5, seed=0,
-                output_dir=Path(tmpdir), label="test",
-            )
-            self.assertTrue(
-                (Path(tmpdir) / "energy_comparison_test.json").exists()
-            )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# run_all integration: new experiments B_LYA, H, I
-# ══════════════════════════════════════════════════════════════════════════════
 
 class TestRunAllNewExperiments(unittest.TestCase):
     """Integration test: run_all correctly executes B_LYA, H, I."""
@@ -1181,8 +1196,7 @@ class TestRunAllNewExperiments(unittest.TestCase):
                 experiments=["I"],
             )
             self.assertIn("I", summary["results"])
-            self.assertIn("alpha_scan", summary["results"]["I"])
-            self.assertIn("dynamic_energy", summary["results"]["I"])
+            self.assertIn("conditions", summary["results"]["I"])
 
     def test_h5_hypothesis_populated(self):
         with tempfile.TemporaryDirectory() as tmpdir:

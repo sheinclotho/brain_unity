@@ -104,7 +104,7 @@ from .f_pca_attractor import run_pca_attractor
 # New analyses (B_LYA, H, I)
 from .b_lyapunov_spectrum import run_lyapunov_spectrum
 from .h_power_spectrum import run_power_spectrum
-from .i_energy_constraint import run_energy_alpha_scan, run_dynamic_energy
+from .i_energy_constraint import run_energy_constraint_wc
 
 _ALL_EXPERIMENTS = ["A", "B_E1", "C", "D", "E2E3", "E4", "E5", "E6", "F",
                     "B_LYA", "H", "I"]
@@ -497,48 +497,29 @@ def run_all(
     # ── I: Energy constraint experiment ───────────────────────────────────────
     if "I" in experiments and W_main is not None:
         t0 = time.time()
-        logger.info("═══ I: 能量约束实验（α 扫描 + 动态 E(t)）═══")
+        logger.info("═══ I: 能量约束实验（L1 投影 vs 无约束对比）═══")
         try:
-            # Experiment A: α scan
-            rI_scan = run_energy_alpha_scan(
-                W_main, alpha_min=0.5, alpha_max=1.5, alpha_step=0.1,
+            rI = run_energy_constraint_wc(
+                W_main,
+                E_budget_values=[None, 0.5, 0.35, 0.20],
                 n_traj=10, steps=200, warmup=50,
                 seed=seed, output_dir=output_dir, label=W_label,
             )
-            # Experiment B: dynamic energy variable
-            rI_dyn = run_dynamic_energy(
-                W_main, alpha=0.5, beta=0.5, E_ref=1.0,
-                steps=300, n_traj=5,
-                seed=seed, output_dir=output_dir, label=W_label,
-            )
-            run_summary["results"]["I"] = {
-                "alpha_scan": {
-                    k: v for k, v in rI_scan.items()
-                    if k not in ("alpha_values", "lles", "osc_amplitudes",
-                                 "mean_activities")
-                },
-                "dynamic_energy": rI_dyn,
-            }
+            run_summary["results"]["I"] = rI
             run_summary["hypotheses"].setdefault(
                 "H5_energy_constraint_criticality", {}
             ).update({
-                "critical_alpha": rI_scan["critical_alpha"],
-                "bifurcation_found": rI_scan["bifurcation_found"],
-                "rho_W": rI_scan.get("rho_W"),
-                "homeostasis_achieved": rI_dyn["homeostasis_achieved"],
-                "E_mean": rI_dyn["E_mean"],
-                "h5_supported": (
-                    rI_scan["bifurcation_found"]
-                    or rI_dyn["homeostasis_achieved"]
-                ),
+                "hypothesis_supported": rI["hypothesis_supported"],
+                "E_star": rI.get("E_star"),
+                "rho_W": rI.get("rho_W"),
+                "h5_supported": rI["hypothesis_supported"],
+                "bifurcation_found": rI["hypothesis_supported"],
             })
             logger.info(
-                "I 完成 (%.1fs): critical_α=%.2f, bifurcation=%s, "
-                "homeostasis=%s",
+                "I 完成 (%.1fs): hypothesis_supported=%s, E*=%.4f",
                 time.time() - t0,
-                rI_scan["critical_alpha"],
-                rI_scan["bifurcation_found"],
-                rI_dyn["homeostasis_achieved"],
+                rI["hypothesis_supported"],
+                rI.get("E_star") or float("nan"),
             )
         except Exception as exc:
             logger.warning("I 失败: %s", exc)
