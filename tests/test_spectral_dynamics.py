@@ -1095,6 +1095,43 @@ class TestEnergyConstraint(unittest.TestCase):
                 (Path(tmpdir) / "energy_dynamic_E_test.png").exists()
             )
 
+    def test_g_energy_at_E_ref_is_one(self):
+        """g(E_ref) must equal 1.0 (fixed bug: was 0.5 in old sigmoid formula)."""
+        from spectral_dynamics.i_energy_constraint import _g_energy
+        E_ref = 1.0
+        g = _g_energy(E_ref, E_ref)
+        self.assertAlmostEqual(g, 1.0, places=5)
+
+    def test_g_energy_at_zero_is_small(self):
+        """g(0) must be near 0 (energy-starved silence)."""
+        from spectral_dynamics.i_energy_constraint import _g_energy
+        g = _g_energy(0.0, 1.0)
+        self.assertLess(g, 0.1)
+
+    def test_energy_comparison_wc_keys(self):
+        from spectral_dynamics.i_energy_constraint import run_energy_comparison_wc
+        result = run_energy_comparison_wc(
+            self.W, alpha_low=0.5, alpha_high=1.5,
+            n_traj=3, steps=30, warmup=5, seed=0,
+        )
+        self.assertIn("conditions", result)
+        for cond in ("low", "normal", "high"):
+            self.assertIn(cond, result["conditions"])
+            self.assertIn("lle", result["conditions"][cond])
+            self.assertIn("osc_amplitude", result["conditions"][cond])
+
+    def test_energy_comparison_wc_saves_files(self):
+        from spectral_dynamics.i_energy_constraint import run_energy_comparison_wc
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_energy_comparison_wc(
+                self.W, alpha_low=0.5, alpha_high=1.5,
+                n_traj=3, steps=30, warmup=5, seed=0,
+                output_dir=Path(tmpdir), label="test",
+            )
+            self.assertTrue(
+                (Path(tmpdir) / "energy_comparison_test.json").exists()
+            )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # run_all integration: new experiments B_LYA, H, I
