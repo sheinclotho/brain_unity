@@ -726,3 +726,46 @@ r ≈ 0 的两个神经生物学合理原因：
 - **规则**: 已废弃的算法实现可以保留在库函数中（如 `lyapunov.py` 的 `lyapunov_spectrum_wolf()`），但管线集成代码（step runner、config entry、import）必须彻底删除，不留冗余入口。
 
 *Last updated: 2026-03-08*
+
+### [2026-03-08] spectral_dynamics ↔ twinbrain-dynamics 代码统合
+
+#### 删除的重复实现
+
+以下 7 处独立实现已被删除，改为统一调用 `twinbrain-dynamics/analysis/wc_dynamics.py`：
+
+| 删除位置 | 函数名 | 行数 | 合并到 |
+|---------|--------|------|--------|
+| `e4_structural_perturbation` | `_wc_step` | 2 | `wc_dynamics.wc_step` |
+| `e4_structural_perturbation` | `_rosenstein_lle_on_wc` | 25 | `wc_dynamics.rosenstein_lle_on_wc` |
+| `e4_structural_perturbation` | `_simple_lle` (Wolf-Benettin fallback) | 30 | `wc_dynamics._wolf_benettin_lle` |
+| `e5_phase_diagram` | `_wc_trajectories` | 20 | `wc_dynamics.wc_simulate` |
+| `e5_phase_diagram` | `_rosenstein_from_twinbrain` | 12 | `wc_dynamics.rosenstein_lle_on_wc` |
+| `e5_phase_diagram` | `_simple_rosenstein` (fallback) | 50 | `wc_dynamics._wolf_benettin_lle` |
+| `i_energy_constraint` | `_project_energy_wc` | 20 | `wc_dynamics.project_energy_l1_bounded` |
+| `i_energy_constraint` | `_rosenstein` (fallback) | 40 | `analysis.lyapunov.rosenstein_lyapunov` |
+| `h_power_spectrum` | `_run_power_spectrum_builtin` (全 FFT 实现) | 110 | `analysis.power_spectrum.run_power_spectrum_analysis` |
+| 4 × `sys.path.insert(0, ...)` | per-file path hack | 12 (×4) | `__init__._ensure_twinbrain_path()` |
+
+**合计删除约 340 行重复代码。**
+
+#### 新增的统一入口
+
+- **`twinbrain-dynamics/analysis/wc_dynamics.py`** (新文件)：
+  - `wc_step(x, W, g)` — 单步 WC 动力学
+  - `wc_simulate(W, ...)` — 批量轨迹生成
+  - `rosenstein_lle_on_wc(W, ...)` — WC 系统 LLE 估计
+  - `project_energy_l1_bounded(y, E_budget)` — 有界 L1 球投影
+  - `_wolf_benettin_lle(traj)` — 唯一的 Wolf-Benettin fallback
+
+- **`spectral_dynamics/__init__.py`** 新增 `_ensure_twinbrain_path()`：
+  - 包级 sys.path 设置，子模块无需再单独设置
+  - 暴露 `_TWINBRAIN_AVAILABLE` 布尔标志
+
+#### 接口变更
+
+- `spectral_dynamics/e5_phase_diagram._lle_from_trajs` 替换原 `_simple_rosenstein` + `_rosenstein_from_twinbrain`：
+  - 参数：`(trajs: ndarray [n_traj, T, N], max_lag, min_sep) → float`（批量输入，与旧 `_simple_rosenstein` 不同）
+  - 测试需相应更新：`_simple_rosenstein(trajs[0])` → `_lle_from_trajs(trajs[:1])`
+
+- **规则**: `spectral_dynamics` 中不得再出现 WC step / Rosenstein LLE / L1 投影的本地实现；
+  所有此类功能必须通过 `from analysis.wc_dynamics import ...` 调用。

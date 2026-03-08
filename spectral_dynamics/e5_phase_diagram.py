@@ -54,43 +54,15 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+# Shared WC utilities — canonical implementations in twinbrain-dynamics
+from analysis.wc_dynamics import wc_simulate as _wc_simulate, rosenstein_lle_on_wc as _rosenstein_lle_on_wc
+
 logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WC dynamics + metrics per g
+# Metrics per g
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _wc_trajectories(
-    W: np.ndarray,
-    g: float,
-    n_traj: int,
-    steps: int,
-    warmup: int,
-    seed: int,
-) -> np.ndarray:
-    """
-    为给定耦合强度 g 生成 WC 轨迹。
-
-    Returns:
-        trajs: shape (n_traj, steps, N), float32
-    """
-    rng = np.random.default_rng(seed)
-    N = W.shape[0]
-    gW = (g * W).astype(np.float64)
-    trajs = np.empty((n_traj, steps, N), dtype=np.float32)
-
-    for i in range(n_traj):
-        x = rng.random(N)
-        # Warm up (not recorded)
-        for _ in range(warmup):
-            x = np.clip(np.tanh(gW @ x), 0.0, 1.0)
-        # Record
-        for t in range(steps):
-            trajs[i, t] = x.astype(np.float32)
-            x = np.clip(np.tanh(gW @ x), 0.0, 1.0)
-
-    return trajs
 
 
 def _compute_oscillation_amplitude(trajs: np.ndarray) -> float:
@@ -110,77 +82,26 @@ def _compute_oscillation_amplitude(trajs: np.ndarray) -> float:
     return float(per_traj_per_region_std.mean())
 
 
-def _rosenstein_from_twinbrain(trajs: np.ndarray, max_lag: int = 30, min_sep: int = 10) -> float:
-    """调用 twinbrain-dynamics 的 rosenstein_lyapunov（若可导入），否则用内置简化版。"""
-    import sys
-    _td = Path(__file__).parent.parent / "twinbrain-dynamics"
-    if str(_td) not in sys.path:
-        sys.path.insert(0, str(_td))
+def _lle_from_trajs(trajs: np.ndarray, max_lag: int = 30, min_sep: int = 10) -> float:
+    """
+    Compute median LLE over pre-generated WC trajectories.
+
+    Delegates to ``analysis.wc_dynamics.rosenstein_lle_on_wc`` (canonical
+    implementation); the duplicate ``_rosenstein_from_twinbrain`` and
+    ``_simple_rosenstein`` functions have been removed.
+    """
     try:
         from analysis.lyapunov import rosenstein_lyapunov
-        lles = [rosenstein_lyapunov(trajs[i], max_lag=max_lag, min_temporal_sep=min_sep)[0]
-                for i in range(len(trajs))]
+        lles = [
+            rosenstein_lyapunov(trajs[i], max_lag=max_lag, min_temporal_sep=min_sep)[0]
+            for i in range(len(trajs))
+        ]
     except ImportError:
-        lles = [_simple_rosenstein(trajs[i], max_lag=max_lag) for i in range(len(trajs))]
+        from analysis.wc_dynamics import wolf_benettin_lle
+        lles = [wolf_benettin_lle(trajs[i]) for i in range(len(trajs))]
 
     valid = [v for v in lles if np.isfinite(v)]
     return float(np.median(valid)) if valid else float("nan")
-
-
-def _simple_rosenstein(ts: np.ndarray, max_lag: int = 30, min_sep: int = 10) -> float:
-    """
-    简化 Rosenstein LLE（N 维时序），无需 twinbrain-dynamics。
-
-    使用主成分 PC1 的 1D 投影来估计最近邻，然后追踪距离演化。
-    """
-    T, N = ts.shape
-    # Project to PC1 for efficiency
-    ts_c = ts - ts.mean(axis=0, keepdims=True)
-    _, _, Vt = np.linalg.svd(ts_c, full_matrices=False)
-    proj = ts_c @ Vt[0]  # (T,)
-
-    max_lag = min(max_lag, T // 4)
-    min_sep = min(min_sep, (T - max_lag - 1) // 2)
-    if min_sep < 2 or max_lag < 5:
-        return float("nan")
-
-    # Precompute pairwise squared distances on projection
-    diff = proj[:, None] - proj[None, :]  # (T, T)
-    D2 = diff ** 2
-
-    # Mask temporal neighbours
-    for k in range(min(min_sep, T)):
-        for sign in (-1, 1):
-            idx = np.arange(T) + sign * k
-            valid = (idx >= 0) & (idx < T)
-            D2[np.arange(T)[valid], idx[valid]] = np.inf
-
-    nn = np.argmin(D2, axis=1)  # (T,)
-
-    divergence = np.zeros(max_lag)
-    counts = np.zeros(max_lag, dtype=int)
-    for t in range(T - max_lag):
-        nn_t = nn[t]
-        if not np.isfinite(D2[t, nn_t]):
-            continue
-        d0 = np.sqrt(D2[t, nn_t]) + 1e-20
-        for lag in range(1, max_lag + 1):
-            if t + lag >= T or nn_t + lag >= T:
-                break
-            d_lag = abs(proj[t + lag] - proj[nn_t + lag])
-            divergence[lag - 1] += np.log(d_lag / d0 + 1e-20)
-            counts[lag - 1] += 1
-
-    valid_mask = counts > 3
-    if not valid_mask.any():
-        return float("nan")
-    divergence[valid_mask] /= counts[valid_mask]
-
-    # Fit slope of divergence curve (= LLE)
-    lags_valid = np.where(valid_mask)[0]
-    slope, _ = np.polyfit(lags_valid[:min(10, len(lags_valid))],
-                          divergence[lags_valid[:min(10, len(lags_valid))]], 1)
-    return float(slope)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,9 +163,9 @@ def run_phase_diagram(
         rho_gW = float(np.abs(np.linalg.eigvals(gW)).max())
         spectral_radii.append(rho_gW)
 
-        trajs = _wc_trajectories(W, g, n_traj=n_traj, steps=steps,
-                                 warmup=warmup, seed=seed)
-        lle = _rosenstein_from_twinbrain(trajs, max_lag=max_lag)
+        trajs = _wc_simulate(W, n_traj=n_traj, steps=steps, g=g,
+                             warmup=warmup, seed=seed)
+        lle = _lle_from_trajs(trajs, max_lag=max_lag)
         osc = _compute_oscillation_amplitude(trajs)
 
         lles.append(lle)

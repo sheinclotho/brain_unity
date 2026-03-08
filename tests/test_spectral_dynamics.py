@@ -68,7 +68,10 @@ from spectral_dynamics.e4_structural_perturbation import (
 )
 from spectral_dynamics.e5_phase_diagram import (
     _compute_oscillation_amplitude,
-    _simple_rosenstein,
+    # _simple_rosenstein was consolidated into _lle_from_trajs (batch interface).
+    # Tests still use the old name as an alias; the call site is updated to pass
+    # a full batch (n_traj, T, N) rather than a single trajectory (T, N).
+    _lle_from_trajs as _simple_rosenstein,
     run_phase_diagram,
 )
 from spectral_dynamics.e6_random_comparison import (
@@ -404,7 +407,8 @@ class TestPhaseDiagram(unittest.TestCase):
 
     def test_simple_rosenstein_finite(self):
         trajs = _wc_trajectories(self.W)
-        lle = _simple_rosenstein(trajs[0], max_lag=15)
+        # _lle_from_trajs (formerly _simple_rosenstein) now takes a batch
+        lle = _simple_rosenstein(trajs, max_lag=15)
         self.assertTrue(np.isfinite(lle) or np.isnan(lle))  # may be nan for short series
 
     def test_run_phase_diagram_keys(self):
@@ -919,8 +923,8 @@ class TestPowerSpectrum(unittest.TestCase):
 
 from spectral_dynamics.i_energy_constraint import (
     run_energy_constraint_wc,
-    _project_energy_wc,
 )
+from analysis.wc_dynamics import project_energy_l1_bounded as _project_energy_wc
 
 
 class TestEnergyConstraint(unittest.TestCase):

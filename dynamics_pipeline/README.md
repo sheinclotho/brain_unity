@@ -562,3 +562,50 @@ done
 ```
 
 比较不同 E_budget 下的 LLE 和 PCA 轨迹。预期：E ≈ E* 时 LLE ≈ 0（临界边缘）。
+
+---
+
+## 代码统合说明（spectral_dynamics ↔ twinbrain-dynamics）
+
+### 统合前的冗余
+
+两个历史模块之间存在以下**重复实现**（截至合并前）：
+
+| 重复功能 | spectral_dynamics 旧位置 | twinbrain-dynamics 权威位置 |
+|---------|------------------------|--------------------------|
+| WC 单步动力学 `clip(tanh(g·W·x), 0, 1)` | `e4._wc_step` | → `analysis/wc_dynamics.wc_step` |
+| 生成 WC 轨迹批次 | `e5._wc_trajectories` | → `analysis/wc_dynamics.wc_simulate` |
+| Rosenstein LLE on WC（含 Fallback） | `e4._rosenstein_lle_on_wc` + `_simple_lle` | → `analysis/wc_dynamics.rosenstein_lle_on_wc` |
+| Rosenstein LLE on WC（含 Fallback） | `e5._rosenstein_from_twinbrain` + `_simple_rosenstein` | → `analysis/wc_dynamics.rosenstein_lle_on_wc` |
+| Rosenstein LLE on 单条轨迹 | `i._rosenstein` (40 行 fallback) | → `analysis/lyapunov.rosenstein_lyapunov` |
+| L1 球投影（有界非负状态） | `i._project_energy_wc` | → `analysis/wc_dynamics.project_energy_l1_bounded` |
+| FFT 功率谱全实现（100+ 行） | `h._run_power_spectrum_builtin` | → `analysis/power_spectrum.run_power_spectrum_analysis` |
+| `sys.path` 设置（4 个文件各自添加） | `e4/e5/h/i` 中的内联 hack | → `spectral_dynamics/__init__._ensure_twinbrain_path()` |
+
+### 统合后的架构
+
+```
+twinbrain-dynamics/              ← 模型驱动分析（GNN + simulator）
+├── analysis/
+│   ├── wc_dynamics.py           ← NEW: WC 工具函数的统一库（供 spectral_dynamics 调用）
+│   ├── lyapunov.py              ← 权威 Rosenstein LLE 实现
+│   ├── power_spectrum.py        ← 权威功率谱实现（h_power_spectrum 的单一上游）
+│   └── ...
+└── experiments/ ...
+
+spectral_dynamics/               ← 矩阵驱动分析（无 GNN 依赖）
+├── __init__.py                  ← 调用 _ensure_twinbrain_path()，统一管理 sys.path
+├── e4_structural_perturbation.py ← 从 wc_dynamics 导入 wc_step / rosenstein_lle_on_wc
+├── e5_phase_diagram.py          ← 从 wc_dynamics 导入 wc_simulate / rosenstein_lle_on_wc
+├── h_power_spectrum.py          ← 只委托给 twinbrain power_spectrum（无内置副本）
+├── i_energy_constraint.py       ← 从 wc_dynamics 导入 project_energy_l1_bounded
+└── ...
+
+dynamics_pipeline/               ← 统一编排管线（调用以上两者）
+```
+
+### Wolf-Benettin Fallback（单一副本）
+
+当 `analysis.lyapunov.rosenstein_lyapunov` 不可导入时，`wc_dynamics._wolf_benettin_lle`
+提供轻量级 Wolf-Benettin 回退方案。这是整个代码库中**唯一**的 Wolf-Benettin 实现。
+此前，`e4._simple_lle`、`e5._simple_rosenstein`、`i._rosenstein` 各自维护一份独立副本。

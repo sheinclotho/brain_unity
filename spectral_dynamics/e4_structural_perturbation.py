@@ -62,6 +62,8 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .e1_spectral_analysis import compute_spectral_metrics
+# Shared WC utilities — canonical implementations in twinbrain-dynamics
+from analysis.wc_dynamics import wc_step as _wc_step, rosenstein_lle_on_wc as _rosenstein_lle_on_wc
 
 logger = logging.getLogger(__name__)
 
@@ -170,100 +172,6 @@ def low_rank_truncation(W: np.ndarray, k: int) -> np.ndarray:
     U, sv, Vt = np.linalg.svd(W.astype(np.float64), full_matrices=False)
     W_lr = (U[:, :k] * sv[:k]) @ Vt[:k, :]
     return W_lr.astype(np.float32)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WC-based LLE estimation for perturbed matrices
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _wc_step(x: np.ndarray, W: np.ndarray, g: float = 0.9) -> np.ndarray:
-    """One-step WC dynamics: clip(tanh(g * W @ x), 0, 1)."""
-    return np.clip(np.tanh(g * (W @ x)), 0.0, 1.0)
-
-
-def _rosenstein_lle_on_wc(
-    W: np.ndarray,
-    n_traj: int = 30,
-    steps: int = 300,
-    max_lag: int = 30,
-    min_sep: int = 10,
-    g: float = 0.9,
-    seed: int = 42,
-) -> float:
-    """
-    对 WC 模型（W 矩阵，耦合强度 g）运行 Rosenstein 算法估计 LLE。
-
-    生成 n_traj 条轨迹，每条从随机初始状态出发，
-    然后调用 twinbrain-dynamics 的 rosenstein_lyapunov 函数。
-
-    Returns:
-        mean LLE（负=稳定，正=混沌，≈0=边缘混沌）
-    """
-    import sys
-    _td = Path(__file__).parent.parent / "twinbrain-dynamics"
-    if str(_td) not in sys.path:
-        sys.path.insert(0, str(_td))
-    try:
-        from analysis.lyapunov import rosenstein_lyapunov
-    except ImportError:
-        logger.warning("无法导入 rosenstein_lyapunov，使用内置简化版本。")
-        return _simple_lle(W, n_traj=n_traj, steps=steps, g=g, seed=seed)
-
-    rng = np.random.default_rng(seed)
-    N = W.shape[0]
-    trajs = np.empty((n_traj, steps, N), dtype=np.float32)
-    for i in range(n_traj):
-        x = rng.random(N).astype(np.float32)
-        for t in range(steps):
-            trajs[i, t] = x
-            x = _wc_step(x, W, g).astype(np.float32)
-
-    lles = [rosenstein_lyapunov(trajs[i], max_lag=max_lag, min_temporal_sep=min_sep)[0]
-            for i in range(n_traj)]
-    valid = [v for v in lles if np.isfinite(v)]
-    return float(np.mean(valid)) if valid else float("nan")
-
-
-def _simple_lle(
-    W: np.ndarray,
-    n_traj: int = 20,
-    steps: int = 200,
-    g: float = 0.9,
-    seed: int = 42,
-) -> float:
-    """
-    简化版 Wolf-Benettin LLE（当 twinbrain-dynamics 不可导入时的备用）。
-
-    对 WC 系统 x(t+1) = clip(tanh(g*W@x), 0, 1) 运行 Wolf 方法。
-    """
-    rng = np.random.default_rng(seed)
-    N = W.shape[0]
-    eps = 1e-6
-    renorm = 20
-    log_growths: list[float] = []
-
-    for _ in range(n_traj):
-        x = rng.random(N).astype(np.float64)
-        # Warm up
-        for _ in range(50):
-            x = _wc_step(x, W, g)
-        d = rng.standard_normal(N)
-        d = d / (np.linalg.norm(d) + 1e-30)
-        x_p = x + eps * d
-
-        for step in range(steps):
-            x = _wc_step(x, W, g)
-            x_p = _wc_step(x_p, W, g)
-            if (step + 1) % renorm == 0:
-                delta = x_p - x
-                r = np.linalg.norm(delta)
-                if r > 1e-30:
-                    log_growths.append(np.log(r / eps))
-                    x_p = x + eps * delta / r
-
-    if not log_growths:
-        return 0.0
-    return float(np.mean(log_growths)) / renorm
 
 
 # ─────────────────────────────────────────────────────────────────────────────

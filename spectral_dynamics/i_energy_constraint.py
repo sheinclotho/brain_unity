@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -47,81 +46,19 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_TD_DIR = Path(__file__).parent.parent / "twinbrain-dynamics"
-if _TD_DIR.exists() and str(_TD_DIR) not in sys.path:
-    sys.path.insert(0, str(_TD_DIR))
+# Shared WC utilities — canonical implementations in twinbrain-dynamics
+from analysis.wc_dynamics import project_energy_l1_bounded as _project_energy_wc
+from analysis.lyapunov import rosenstein_lyapunov as _rosenstein_canonical
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# L1-ball projection (same logic as GNN version)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _project_energy_wc(y: np.ndarray, E_budget: float) -> Tuple["np.ndarray", bool]:
-    """
-    将 WC 输出 y ∈ [0,1]^N 投影到 {z : mean(z) ≤ E_budget}。
-
-    返回 (x_projected: np.ndarray, constraint_was_active: bool)。
-
-    # 计算成本：50 次二分法迭代，每次 O(N)；N=190 时 < 0.1 ms
-    """
-    current = float(y.mean())
-    if current <= E_budget:
-        return y.astype(np.float32), False  # feasible, no constraint
-
-    lo, hi = 0.0, float(y.max())
-    for _ in range(50):
-        lam = (lo + hi) * 0.5
-        proj = np.maximum(y - lam, 0.0)
-        if float(proj.mean()) <= E_budget:
-            hi = lam
-        else:
-            lo = lam
-
-    result = np.clip(np.maximum(y - (lo + hi) * 0.5, 0.0), 0.0, 1.0)
-    return result.astype(np.float32), True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LLE helper
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _rosenstein(traj: np.ndarray, max_lag: int = 30, min_sep: int = 10) -> float:
-    """Rosenstein LLE，优先调用 twinbrain-dynamics 实现。"""
+    """Rosenstein LLE wrapper — delegates to canonical twinbrain-dynamics implementation."""
     try:
-        from analysis.lyapunov import rosenstein_lyapunov
-        v, _ = rosenstein_lyapunov(traj, max_lag=max_lag, min_temporal_sep=min_sep)
+        v, _ = _rosenstein_canonical(traj, max_lag=max_lag, min_temporal_sep=min_sep)
         return float(v)
     except Exception:
-        pass
-    T, N = traj.shape
-    ts_c = traj - traj.mean(axis=0)
-    _, _, Vt = np.linalg.svd(ts_c, full_matrices=False)
-    proj = ts_c @ Vt[0]
-    max_lag = min(max_lag, T // 4)
-    min_sep = min(min_sep, (T - max_lag - 1) // 2)
-    if min_sep < 2 or max_lag < 5:
-        return float("nan")
-    D2 = (proj[:, None] - proj[None, :]) ** 2
-    for k in range(min(min_sep, T)):
-        for sign in (-1, 1):
-            idx = np.arange(T) + sign * k
-            valid = (idx >= 0) & (idx < T)
-            D2[np.arange(T)[valid], idx[valid]] = np.inf
-    nn = np.argmin(D2, axis=1)
-    div, cnt = np.zeros(max_lag), np.zeros(max_lag, dtype=int)
-    for t in range(T - max_lag):
-        d0 = np.sqrt(D2[t, nn[t]]) + 1e-20
-        for lag in range(1, max_lag + 1):
-            if t + lag >= T or nn[t] + lag >= T:
-                break
-            div[lag - 1] += np.log(abs(proj[t + lag] - proj[nn[t] + lag]) / d0 + 1e-20)
-            cnt[lag - 1] += 1
-    m = cnt > 3
-    if not m.any():
-        return float("nan")
-    div[m] /= cnt[m]
-    lags = np.where(m)[0][:min(10, m.sum())]
-    return float(np.polyfit(lags, div[lags], 1)[0])
+        from analysis.wc_dynamics import wolf_benettin_lle
+        return wolf_benettin_lle(traj)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
