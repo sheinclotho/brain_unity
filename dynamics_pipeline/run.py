@@ -17,6 +17,15 @@ import logging
 import sys
 from pathlib import Path
 
+# Allow running this file directly (e.g. ``python dynamics_pipeline/run.py``)
+# in addition to the standard module invocation
+# (``python -m dynamics_pipeline.run``).  The relative import below requires
+# ``__package__`` to be set, which Python only sets automatically for the
+# module-invocation style.
+if __name__ == "__main__" and __package__ is None:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = "dynamics_pipeline"
+
 from .pipeline import run_pipeline
 
 logger = logging.getLogger("dynamics_pipeline")
