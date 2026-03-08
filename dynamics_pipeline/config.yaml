@@ -1,0 +1,136 @@
+# =============================================================================
+# dynamics_pipeline — Unified Configuration
+# =============================================================================
+# Controls all phases of the brain dynamics analysis pipeline.
+# See README.md for detailed documentation of each phase and parameter.
+#
+# Quick start:
+#   python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt
+#
+# Quick mode (reduced parameters for fast iteration):
+#   python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --quick
+# =============================================================================
+
+# ── Model & Data ─────────────────────────────────────────────────────────────
+model:
+  path: null                    # Required: path to best_model.pt
+  graph_path: null              # Required: path to graph cache .pt file
+  config_path: null             # Optional: training config.yaml (auto-detected)
+  device: "auto"                # "auto" | "cuda" | "cpu"
+
+# ── Simulator ────────────────────────────────────────────────────────────────
+simulator:
+  modality: "fmri"              # "fmri" | "eeg" | "both" | "joint"
+
+# ── Phase 1: Data Generation ────────────────────────────────────────────────
+data_generation:
+  n_init: 100                   # Number of random initial trajectories
+  steps: 500                    # Prediction steps per trajectory (fMRI TRs)
+  seed: 42
+
+# ── Phase 2: Network Structure ──────────────────────────────────────────────
+# Analyses the connectivity/response matrix for structural properties.
+network_structure:
+  enabled: true
+  spectral:
+    enabled: true               # Eigenvalue decomposition, participation ratio, ρ(W)
+  community:
+    enabled: true               # Louvain/spectral community detection
+    k_range: [3, 4, 5, 6, 7, 8]
+  hierarchy:
+    enabled: false              # Hierarchical clustering dendrogram
+  modal_energy:
+    enabled: true               # Modal projection & energy distribution
+  visualization:
+    enabled: true               # Connectivity heatmaps
+
+# ── Phase 3: Dynamics Characterization ──────────────────────────────────────
+# Characterises the dynamical regime from trajectory data.
+dynamics:
+  stability:
+    enabled: true               # Stability classification (Method C: adaptive)
+    delay_dt: 50                # Delay lag for distance method
+  attractor:
+    enabled: true               # KMeans attractor basin analysis
+    tail_steps: 50              # Final steps for clustering
+    k_candidates: [2, 3, 4, 5, 6]
+  convergence:
+    enabled: true               # Pairwise trajectory convergence
+    n_pairs: 50
+  lyapunov:
+    enabled: true               # Rosenstein LLE estimation
+    max_lag: 50                 # Maximum tracking lag
+    min_sep: 20                 # Minimum temporal separation for NN search
+    n_segments: 3               # Multi-segment sampling (early/mid/late)
+    convergence_threshold: 0.05 # Distance ratio threshold for stable shortcut
+    delay_embed_dim: 0          # 0=disabled; set to FNN dim for better NN quality
+    delay_embed_tau: 1          # Delay embedding lag
+  dmd_spectrum:
+    enabled: true               # DMD-based linearized spectrum (replaces Wolf-GS)
+    tail_steps: 20              # Final trajectory steps for attractor state sampling
+    n_states: 3                 # Number of attractor states to analyse
+  power_spectrum:
+    enabled: true               # FFT power spectral density & band analysis
+  pca:
+    enabled: true               # PCA dimensionality (variance curve)
+
+# ── Phase 4: Statistical Validation ─────────────────────────────────────────
+validation:
+  surrogate_test:
+    enabled: true               # Surrogate data testing (nonlinearity significance)
+    n_surrogates: 19            # 19 → rank test p < 0.05
+    types: ["phase_randomize", "shuffle", "ar"]
+    n_traj_sample: 5
+  random_comparison:
+    enabled: true               # Random network baseline comparison
+    spectral_radii: [0.9, 1.5, 2.0]  # stable / critical / chaotic
+    n_seeds: 5
+  embedding_dimension:
+    enabled: true               # FNN analysis, correlation dimension, Takens check
+    fnn_max_dim: 8
+    corr_dim: true
+    check_leakage: true
+    train_fraction: 0.7
+  perturbation:
+    enabled: false              # Structural perturbation (weight shuffle, rewire)
+
+# ── Phase 5: Advanced (optional, expensive) ─────────────────────────────────
+advanced:
+  stimulation:
+    enabled: true               # Virtual stimulation experiments
+    target_nodes: [0, 100]
+    amplitude: 0.5
+    frequency: 10.0
+    duration: 30                # Steps
+    patterns: ["sine"]
+  response_matrix:
+    enabled: true               # Full N×N stimulation response matrix
+    n_nodes: 10                 # Source nodes to stimulate (full N is slow)
+    stim_amplitude: 0.5
+  energy_constraint:
+    enabled: false              # Energy budget analysis from trajectories
+  phase_diagram:
+    enabled: false              # g-sweep phase diagram
+  controllability:
+    enabled: false              # Network controllability (AC/MC/BC)
+  information_flow:
+    enabled: false              # Transfer entropy
+    n_source_regions: 20
+    n_target_regions: 20
+  critical_slowing_down:
+    enabled: false              # Early warning signals
+
+# ── Output ───────────────────────────────────────────────────────────────────
+output:
+  directory: "outputs/dynamics_pipeline"
+  save_trajectories: true
+  save_plots: true
+
+# ── Quick mode presets (applied via --quick flag) ────────────────────────────
+# These are NOT read directly; they are applied programmatically by run.py.
+# Listed here for documentation only.
+# quick_overrides:
+#   data_generation: { n_init: 20, steps: 100 }
+#   advanced.response_matrix: { n_nodes: 10 }
+#   validation.surrogate_test: { n_surrogates: 9, n_traj_sample: 3 }
+#   validation.embedding_dimension: { fnn_max_dim: 4, corr_dim: false }
