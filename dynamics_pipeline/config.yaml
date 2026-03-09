@@ -115,6 +115,36 @@ dynamics:
       min_r2: 0.90              # Minimum R² to accept a D₂ estimate
       seed: 42
 
+  # ── Experiment 1: Full Lyapunov Spectrum ──────────────────────────────────
+  # Extracts the complete linearised Lyapunov spectrum from DMD eigenvalues
+  # and assesses whether the system exhibits strange attractor dynamics.
+  # Zero extra model calls (uses DMD from Phase 3e).
+  # Outputs: lyapunov_spectrum.npy, lyapunov_spectrum_report.json
+  lyapunov_spectrum:
+    enabled: true               # Always enabled if Phase 3e (dmd_spectrum) runs
+
+  # ── Experiment 3: Node Contribution Analysis ──────────────────────────────
+  # Identifies which brain regions are the primary drivers of the
+  # low-dimensional dynamical manifold.
+  # Zero extra model calls (PCA on trajectories + DMD slow modes + response matrix).
+  # Outputs: node_contribution_rank.csv, top_nodes_report.json
+  node_contribution:
+    enabled: true
+    top_k: 20                   # Top-k nodes to report in detail
+    n_pca_components: 10        # Number of PCA components for loading
+
+  # ── Experiment 2: Attractor Basin Test (OPTIONAL, expensive) ──────────────
+  # Tests for a single global attractor using diverse initial conditions
+  # (task states / Gaussian random / uniform random).
+  # Requires n_diverse × 3 × T extra model calls — disabled by default.
+  # Outputs: basin_pca_projection.npy, basin_cluster_report.json
+  basin_test:
+    enabled: false
+    n_diverse: 50               # Trajectories per initialisation type
+    T: 300                      # Prediction steps
+    tail_steps: 50              # Steps for tail-state extraction
+    dominant_thresh: 0.75       # Fraction threshold for "single attractor"
+
 # ── Phase 4: Statistical Validation ─────────────────────────────────────────
 validation:
   surrogate_test:
@@ -139,6 +169,43 @@ validation:
     max_points: 2000            # Max points per segment for kNN search
   perturbation:
     enabled: false              # Structural perturbation (weight shuffle, rewire)
+
+  # ── Experiment 5: Hub Perturbation (OPTIONAL) ─────────────────────────────
+  # Remove top-k hub nodes from connectivity matrix, recompute spectral metrics.
+  # Tests whether hub nodes control the dynamical manifold.
+  # No extra model calls (operates on response matrix or FC).
+  # Outputs: hub_perturbation_report.json
+  hub_perturbation:
+    enabled: false
+    top_k_list: [5, 10]         # Number of hub nodes to remove in each condition
+
+  # ── Experiment 6: Weight Randomisation (OPTIONAL) ─────────────────────────
+  # Shuffle edge weights while preserving sparsity pattern (topology).
+  # Tests whether weight structure (not just topology) determines dynamics.
+  # No extra model calls.
+  # Outputs: weight_randomisation_report.json
+  weight_randomisation:
+    enabled: false
+    n_shuffles: 5               # Number of independent permutations
+
+  # ── Experiment 7: Subnetwork Scaling (OPTIONAL) ──────────────────────────
+  # Extract random subnetworks of different sizes and verify dynamics stability.
+  # Tests scale invariance — whether results generalise beyond full-graph size.
+  # No extra model calls.
+  # Outputs: subnetwork_scaling_report.json
+  subnetwork_scaling:
+    enabled: false
+    scales: [120, 160, 200]     # Subnetwork sizes (auto-adjusted to < N)
+    n_subnetworks: 10           # Random subnetworks per scale
+
+  # ── Experiment 4: Structure-Preserving Random Network (OPTIONAL) ──────────
+  # Generate random networks preserving sparsity + weight magnitude distribution
+  # but with rewired connections. Complements the existing random_comparison.
+  # No extra model calls.
+  # Outputs: random_network_report.json
+  structure_preserving_random:
+    enabled: false
+    n_random: 5                 # Number of random realisations
 
 # ── Phase 5: Advanced (optional, expensive) ─────────────────────────────────
 advanced:
