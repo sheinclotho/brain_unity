@@ -79,9 +79,7 @@ _DEFAULT_ORDER: int = 1
 _EPS: float = 1e-12
 
 # Epsilon added to the last bin edge in _discretize so that the maximum value
-# (exactly 1.0 in normalised [0,1] data) falls into the last bin rather than
-# creating a spurious extra bin.  Must be < floating-point noise (≈ 1e-7) but
-# large enough not to be optimised away: 1e-9 satisfies both.
+# falls into the last bin rather than creating a spurious extra bin.
 _BIN_EDGE_EPSILON: float = 1e-9
 
 
@@ -90,10 +88,53 @@ _BIN_EDGE_EPSILON: float = 1e-9
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _discretize(x: np.ndarray, n_bins: int) -> np.ndarray:
-    """Bin a continuous time series in [0, 1] to integer indices [0, n_bins)."""
-    bins = np.linspace(0.0, 1.0, n_bins + 1)
-    bins[-1] += _BIN_EDGE_EPSILON  # ensure max value falls in last bin
-    return np.digitize(x, bins) - 1  # → [0, n_bins-1]
+    """
+    Bin a continuous time series to integer indices in ``[0, n_bins)``.
+
+    Uses **equal-frequency (percentile-based) bins** rather than fixed-width
+    ``[0, 1]`` bins.  Advantages over the old fixed-range approach:
+
+    1. **Any data range**: works correctly for z-scored signals (≈ ±3σ),
+       ``[0, 1]``-normalised signals, and any other real-valued input.
+       The previous fixed ``[0, 1]`` bins caused:
+         - Negative z-score values → index −1 (NumPy wraps to last bin),
+           silently mis-classifying ~50 % of z-scored samples into bin n-1.
+         - Values > 1.0 → index n_bins (out of range → IndexError with
+           ``np.add.at`` for arrays of size n_bins).
+    2. **Equal sample frequency**: each bin contains ≈ T/n_bins samples,
+       keeping the conditional-entropy estimator variance low (Faes et al.
+       2017, Phys Rev X 7:041042 §II.B).
+    3. Scientifically consistent with the standard "equiquantile"
+       discretisation used in KSG / histogram TE literature.
+
+    Args:
+        x:      1-D time series (any real-valued range).
+        n_bins: Number of discrete symbols.
+
+    Returns:
+        Discretised index array in ``{0, …, n_bins−1}``.
+    """
+    # np.percentile with n_bins+1 evenly-spaced quantiles gives the n_bins
+    # equal-frequency bin edges.  Using np.linspace(0,100,…) directly is
+    # slightly faster than np.quantile(x, np.linspace(0,1,…)) on older NumPy.
+    percentiles = np.linspace(0.0, 100.0, n_bins + 1)
+    bins = np.percentile(x, percentiles)
+
+    # Degenerate case: flat signal → all values in bin 0.
+    if bins[-1] <= bins[0]:
+        return np.zeros(len(x), dtype=np.int32)
+
+    # Add a tiny epsilon to the last edge so that x.max() itself falls into
+    # the last bin (without this, np.digitize would place it one step past the
+    # valid range, requiring the clip below to correct it).
+    bins[-1] += _BIN_EDGE_EPSILON
+
+    # np.digitize: returns i such that bins[i-1] ≤ x < bins[i].
+    # Subtract 1 → range [-1, n_bins].  np.clip is the safety guard for any
+    # remaining edge case (e.g. duplicate percentile edges with degenerate
+    # sub-ranges) and adds negligible cost.
+    raw = np.digitize(x, bins) - 1
+    return np.clip(raw, 0, n_bins - 1).astype(np.int32)
 
 
 def _cond_entropy_from_joint(joint: np.ndarray) -> float:
@@ -291,7 +332,11 @@ def compute_net_information_flow(te_matrix: np.ndarray) -> np.ndarray:
     return te_matrix - te_matrix.T
 
 
-def compute_information_flow_centrality(te_matrix: np.ndarray) -> Dict:
+def compute_information_flow_centrality(
+    te_matrix: np.ndarray,
+    n_src: Optional[int] = None,
+    n_tgt: Optional[int] = None,
+) -> Dict:
     """
     计算每个脑区的信息流中心性指标。
 
@@ -306,6 +351,12 @@ def compute_information_flow_centrality(te_matrix: np.ndarray) -> Dict:
 
     Args:
         te_matrix: shape (N, N)，TE[i,j] = TE(i→j)。
+        n_src:     实际计算的源节点数（None → N）。用于将摘要统计限定在
+                   已计算的子矩阵 ``te_matrix[:n_src, :n_tgt]`` 上，避免
+                   用大量填零格稀释 mean_te 和 te_asymmetry。
+                   例：n_src=20、n_tgt=20、N=190 时，若不限定子矩阵，
+                   mean_te 会被稀释约 (190/20)²≈90× 导致输出接近 0。
+        n_tgt:     实际计算的目标节点数（None → N）。
 
     Returns:
         结果字典（标量列表，可序列化为 JSON）。
@@ -321,10 +372,43 @@ def compute_information_flow_centrality(te_matrix: np.ndarray) -> Dict:
 
     hub_score = np.maximum(out_te, in_te)
 
-    k = min(5, N)
     top_source_region = int(np.argsort(out_te)[-1])
     top_sink_region   = int(np.argsort(in_te)[-1])
     top_driver_region = int(np.argsort(net_te)[-1])
+
+    # ── Summary statistics: restrict to the actually-computed submatrix ───────
+    # Only te_off[:_n_src, :_n_tgt] contains real estimates; remaining cells are
+    # zero because those pairs were never computed.  Computing mean/asymmetry
+    # over the full N×N matrix dilutes by a factor of (N²)/(n_src×n_tgt), e.g.
+    # ~90× when n_src=n_tgt=20 and N=190, making mean_te appear near-zero even
+    # when the computed values are substantial.
+    _n_src = n_src if (n_src is not None and 0 < n_src <= N) else N
+    _n_tgt = n_tgt if (n_tgt is not None and 0 < n_tgt <= N) else N
+    sub = te_off[:_n_src, :_n_tgt]
+
+    # Max TE: largest value in the computed block
+    max_te_val = float(sub.max()) if sub.size > 0 else 0.0
+
+    # Mean TE: average over off-diagonal computed pairs
+    if _n_src == _n_tgt and _n_src > 1:
+        diag_mask = ~np.eye(_n_src, dtype=bool)
+        computed_vals = sub[diag_mask]
+        mean_te_val = float(computed_vals.mean()) if computed_vals.size > 0 else 0.0
+    elif sub.size > 0:
+        mean_te_val = float(sub.mean())
+    else:
+        mean_te_val = 0.0
+
+    # Asymmetry |TE[i,j] - TE[j,i]|: only meaningful when both directions are
+    # computed, i.e. i,j < min(n_src, n_tgt).
+    n_both = min(_n_src, _n_tgt)
+    if n_both > 1:
+        sub_sq = te_off[:n_both, :n_both]
+        diag_mask_sq = ~np.eye(n_both, dtype=bool)
+        asym_vals = np.abs(sub_sq - sub_sq.T)[diag_mask_sq]
+        te_asym_val = float(asym_vals.mean()) if asym_vals.size > 0 else 0.0
+    else:
+        te_asym_val = 0.0
 
     return {
         "out_te":           out_te.tolist(),
@@ -334,9 +418,9 @@ def compute_information_flow_centrality(te_matrix: np.ndarray) -> Dict:
         "top_source_region":   top_source_region,
         "top_sink_region":     top_sink_region,
         "top_net_driver_region": top_driver_region,
-        "mean_te":          float(te_off.mean()),
-        "max_te":           float(te_off.max()),
-        "te_asymmetry":     float(np.abs(te_off - te_off.T).mean()),
+        "mean_te":          mean_te_val,
+        "max_te":           max_te_val,
+        "te_asymmetry":     te_asym_val,
     }
 
 
@@ -379,24 +463,28 @@ def run_information_flow_analysis(
     """
     output_dir = Path(output_dir) if output_dir is not None else None
 
+    n_regions = trajectories.shape[2]
+    n_src = min(n_source_regions, n_regions) if n_source_regions is not None else n_regions
+    n_tgt = min(n_target_regions, n_regions) if n_target_regions is not None else n_regions
+
     te_matrix = compute_transfer_entropy_matrix(
         trajectories=trajectories,
-        n_source_regions=n_source_regions,
-        n_target_regions=n_target_regions,
+        n_source_regions=n_src,
+        n_target_regions=n_tgt,
         order=order,
         n_bins=n_bins,
         output_dir=output_dir,
     )
 
     net_flow = compute_net_information_flow(te_matrix)
-    centrality = compute_information_flow_centrality(te_matrix)
-
-    n_src = n_source_regions or trajectories.shape[2]
-    n_tgt = n_target_regions or trajectories.shape[2]
+    # Pass n_src/n_tgt so that mean_te and te_asymmetry are computed over the
+    # actually-estimated block, not the full (mostly-zero) N×N matrix.
+    centrality = compute_information_flow_centrality(te_matrix, n_src=n_src, n_tgt=n_tgt)
 
     report: Dict = {
         "n_source_regions": n_src,
         "n_target_regions": n_tgt,
+        "n_total_regions":  n_regions,
         "order":            order,
         "n_bins":           n_bins,
         "mean_te":          centrality["mean_te"],
@@ -406,7 +494,8 @@ def run_information_flow_analysis(
         "top_sink_region":      centrality["top_sink_region"],
         "top_net_driver_region": centrality["top_net_driver_region"],
         "interpretation_zh": (
-            f"信息流分析完成。平均 TE = {centrality['mean_te']:.4f} nats/步，"
+            f"信息流分析完成（{n_src}×{n_tgt} 源×目标，共 {n_regions} 个脑区）。"
+            f"平均 TE = {centrality['mean_te']:.4f} nats/步，"
             f"最大 TE = {centrality['max_te']:.4f} nats/步，"
             f"TE 非对称性（方向性指标）= {centrality['te_asymmetry']:.4f}。"
             f"主要信息广播枢纽：脑区 {centrality['top_source_region']}，"
@@ -424,7 +513,9 @@ def run_information_flow_analysis(
         logger.info("  信息流报告已保存: %s", report_path)
 
     logger.info(
-        "信息流分析完成: 平均 TE=%.4f nats, 最大 TE=%.4f nats, 非对称性=%.4f",
+        "信息流分析完成 (%d×%d 源×目标 / %d 脑区): "
+        "平均 TE=%.4f nats, 最大 TE=%.4f nats, 非对称性=%.4f",
+        n_src, n_tgt, n_regions,
         centrality["mean_te"], centrality["max_te"], centrality["te_asymmetry"],
     )
 

@@ -159,7 +159,19 @@ def run_phase1_data(cfg: dict, simulator, output_dir: Path,
     rm_cfg = adv.get("response_matrix", {})
     if rm_cfg.get("enabled", True):
         from analysis.response_matrix import compute_response_matrix
-        n_nodes = min(rm_cfg.get("n_nodes", simulator.n_regions), simulator.n_regions)
+        n_nodes_cfg = rm_cfg.get("n_nodes", None)
+        if n_nodes_cfg is None:
+            n_nodes = simulator.n_regions
+        else:
+            try:
+                n_nodes = min(int(n_nodes_cfg), simulator.n_regions)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "advanced.response_matrix.n_nodes=%r is not a valid integer; "
+                    "falling back to all %d regions.",
+                    n_nodes_cfg, simulator.n_regions,
+                )
+                n_nodes = simulator.n_regions
         response_matrix = compute_response_matrix(
             simulator=simulator,
             n_nodes=n_nodes,
