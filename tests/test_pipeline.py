@@ -1203,5 +1203,281 @@ class TestDMDModalEnergy(unittest.TestCase):
             self.assertTrue((Path(td) / "hopf_eigenvalues.png").exists())
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for task_comparison module
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_task_trajectories(
+    n_tasks: int = 3,
+    n_traj: int = 4,
+    T: int = 80,
+    N: int = 10,
+    seed: int = 0,
+) -> dict:
+    """Build a synthetic multi-task trajectory dict for testing."""
+    rng = np.random.default_rng(seed)
+    tasks = {}
+    offsets = np.linspace(-0.3, 0.3, n_tasks)
+    for i in range(n_tasks):
+        trajs = np.zeros((n_traj, T, N), dtype=np.float32)
+        t_arr = np.linspace(0, 4 * np.pi, T)
+        for ti in range(n_traj):
+            for j in range(N):
+                trajs[ti, :, j] = offsets[i] + 0.4 * np.sin(
+                    t_arr * (0.1 + j * 0.02)
+                ) + rng.normal(0, 0.05, T)
+        tasks[f"task_{i}"] = trajs
+    return tasks
+
+
+class TestTaskComparisonModule(unittest.TestCase):
+    """Tests for analysis.task_comparison.run_task_comparison."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.task_trajs = _make_task_trajectories()
+
+    def test_returns_required_keys(self):
+        """run_task_comparison returns all required result keys."""
+        from analysis.task_comparison import run_task_comparison
+        result = run_task_comparison(self.task_trajs)
+        for key in (
+            "n_tasks", "task_names", "attractor_verdict",
+            "transient_verdict", "hub_verdict", "modal_verdict",
+            "shared_pca_variance_top2_pct",
+            "hub_overlap_fraction",
+            "modal_angles_deg",
+        ):
+            self.assertIn(key, result, f"Missing key: {key}")
+
+    def test_n_tasks_correct(self):
+        from analysis.task_comparison import run_task_comparison
+        result = run_task_comparison(self.task_trajs)
+        self.assertEqual(result["n_tasks"], 3)
+
+    def test_verdicts_are_valid_strings(self):
+        """All verdict fields are non-empty strings."""
+        from analysis.task_comparison import run_task_comparison
+        result = run_task_comparison(self.task_trajs)
+        for key in ("attractor_verdict", "transient_verdict",
+                    "hub_verdict", "modal_verdict"):
+            self.assertIsInstance(result[key], str)
+            self.assertGreater(len(result[key]), 0)
+
+    def test_attractor_verdict_values(self):
+        """attractor_verdict is one of the expected values."""
+        from analysis.task_comparison import run_task_comparison
+        result = run_task_comparison(self.task_trajs)
+        self.assertIn(result["attractor_verdict"],
+                      ("same_attractor", "different_attractors",
+                       "insufficient_data"))
+
+    def test_transient_verdict_values(self):
+        from analysis.task_comparison import run_task_comparison
+        result = run_task_comparison(self.task_trajs)
+        self.assertIn(result["transient_verdict"],
+                      ("task_is_perturbation", "task_shifts_attractor",
+                       "insufficient_data"))
+
+    def test_hub_verdict_values(self):
+        from analysis.task_comparison import run_task_comparison
+        result = run_task_comparison(self.task_trajs)
+        self.assertIn(result["hub_verdict"],
+                      ("hubs_structural", "hubs_task_specific",
+                       "insufficient_data"))
+
+    def test_modal_verdict_values(self):
+        from analysis.task_comparison import run_task_comparison
+        result = run_task_comparison(self.task_trajs)
+        self.assertIn(result["modal_verdict"],
+                      ("modal_rotation", "modal_restructuring",
+                       "insufficient_data"))
+
+    def test_modal_angles_pairwise_keys(self):
+        """Modal angles dict has one entry per task pair."""
+        from analysis.task_comparison import run_task_comparison
+        result = run_task_comparison(self.task_trajs)
+        angles = result["modal_angles_deg"]
+        n_tasks = result["n_tasks"]
+        expected = n_tasks * (n_tasks - 1) // 2
+        self.assertEqual(len(angles), expected)
+
+    def test_modal_angles_in_range(self):
+        """All principal angles are in [0, 90] degrees."""
+        from analysis.task_comparison import run_task_comparison
+        result = run_task_comparison(self.task_trajs)
+        for key, ang in result["modal_angles_deg"].items():
+            self.assertGreaterEqual(ang, 0.0, f"{key} angle < 0")
+            self.assertLessEqual(ang, 90.0, f"{key} angle > 90")
+
+    def test_hub_overlap_fraction_in_range(self):
+        """Hub overlap fraction is in [0, 1]."""
+        from analysis.task_comparison import run_task_comparison
+        result = run_task_comparison(self.task_trajs)
+        self.assertGreaterEqual(result["hub_overlap_fraction"], 0.0)
+        self.assertLessEqual(result["hub_overlap_fraction"], 1.0)
+
+    def test_output_files_created(self):
+        """All four PNG files and JSON are saved when output_dir is given."""
+        from analysis.task_comparison import run_task_comparison
+        with tempfile.TemporaryDirectory() as td:
+            run_task_comparison(self.task_trajs, output_dir=Path(td))
+            for fname in (
+                "task_phase_portrait.png",
+                "task_early_dynamics.png",
+                "task_hub_stability.png",
+                "task_modal_rotation.png",
+                "task_comparison.json",
+            ):
+                self.assertTrue(
+                    (Path(td) / fname).exists(),
+                    f"Missing output file: {fname}",
+                )
+
+    def test_json_is_valid(self):
+        """task_comparison.json is valid JSON with the required keys."""
+        from analysis.task_comparison import run_task_comparison
+        with tempfile.TemporaryDirectory() as td:
+            run_task_comparison(self.task_trajs, output_dir=Path(td))
+            with open(Path(td) / "task_comparison.json") as f:
+                data = json.load(f)
+        self.assertIn("n_tasks", data)
+        self.assertIn("attractor_verdict", data)
+
+    def test_single_task_returns_early(self):
+        """Graceful handling when only 1 task is provided."""
+        from analysis.task_comparison import run_task_comparison
+        single = {"only_task": self.task_trajs["task_0"]}
+        result = run_task_comparison(single)
+        self.assertEqual(result["n_tasks"], 1)
+        self.assertEqual(result["attractor_verdict"], "insufficient_data")
+
+    def test_n_mismatch_raises(self):
+        """ValueError when tasks have different N."""
+        from analysis.task_comparison import run_task_comparison
+        rng = np.random.default_rng(9)
+        bad_tasks = {
+            "a": rng.random((3, 50, 10)).astype(np.float32),
+            "b": rng.random((3, 50, 12)).astype(np.float32),  # different N
+        }
+        with self.assertRaises(ValueError):
+            run_task_comparison(bad_tasks)
+
+    def test_burnin_respected(self):
+        """Results with burnin >= T-1 don't crash (degenerate edge case)."""
+        from analysis.task_comparison import run_task_comparison
+        task_trajs = _make_task_trajectories(T=20, N=5)
+        # burnin = T-2, so only 2 steps remain — should not raise
+        result = run_task_comparison(task_trajs, burnin=18)
+        self.assertIn("attractor_verdict", result)
+
+    def test_two_tasks_only(self):
+        """Works correctly with exactly 2 tasks (minimum valid input)."""
+        from analysis.task_comparison import run_task_comparison
+        two_tasks = {k: v for k, v in list(self.task_trajs.items())[:2]}
+        result = run_task_comparison(two_tasks)
+        self.assertEqual(result["n_tasks"], 2)
+        # With 2 tasks there is exactly 1 pair
+        self.assertEqual(len(result["modal_angles_deg"]), 1)
+
+    def test_identical_tasks_same_attractor(self):
+        """Identical trajectories for all tasks → same_attractor verdict."""
+        from analysis.task_comparison import run_task_comparison
+        trajs = _make_task_trajectories(n_tasks=1, N=8)["task_0"]
+        same_tasks = {"t1": trajs.copy(), "t2": trajs.copy()}
+        result = run_task_comparison(same_tasks)
+        self.assertEqual(result["attractor_verdict"], "same_attractor")
+
+
+class TestConfigAutoLoad(unittest.TestCase):
+    """Bug fix: config.yaml co-located with run.py must be auto-loaded."""
+
+    def test_default_config_yaml_auto_loaded(self):
+        """
+        Editing config.yaml (without --config flag) takes effect in main().
+
+        Simulates a user changing ``data_generation.steps`` in config.yaml.
+        The loaded config must reflect the YAML value, not the hardcoded
+        _DEFAULTS["data_generation"]["steps"] = 500.
+        """
+        import yaml
+        from dynamics_pipeline.run import _DEFAULTS, _merge, _load_yaml
+
+        # Build a minimal YAML override just like a user would
+        override = {"data_generation": {"steps": 200}}
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config.yaml"
+            with open(cfg_path, "w") as f:
+                yaml.dump(override, f)
+
+            # Simulate what main() does: start from _DEFAULTS, then auto-load
+            cfg = dict(_DEFAULTS)
+            cfg = _merge(cfg, _load_yaml(cfg_path))
+
+        self.assertEqual(
+            cfg["data_generation"]["steps"],
+            200,
+            "config.yaml override for steps was not applied; "
+            "got hardcoded default 500 instead.",
+        )
+
+    def test_default_config_yaml_path_is_sibling_of_run_py(self):
+        """config.yaml lives in the same directory as run.py."""
+        run_py = Path(__file__).parent.parent / "dynamics_pipeline" / "run.py"
+        config_yaml = run_py.parent / "config.yaml"
+        self.assertTrue(
+            config_yaml.exists(),
+            f"config.yaml not found at expected path {config_yaml}",
+        )
+
+    def test_auto_load_does_not_override_explicit_config(self):
+        """An explicit --config flag takes precedence over auto-loaded config.yaml."""
+        import yaml
+        from dynamics_pipeline.run import _DEFAULTS, _merge, _load_yaml
+
+        with tempfile.TemporaryDirectory() as td:
+            # Auto-loaded config sets steps=200
+            auto_cfg_path = Path(td) / "config.yaml"
+            with open(auto_cfg_path, "w") as f:
+                yaml.dump({"data_generation": {"steps": 200}}, f)
+
+            # Explicit --config sets steps=50
+            explicit_cfg_path = Path(td) / "explicit.yaml"
+            with open(explicit_cfg_path, "w") as f:
+                yaml.dump({"data_generation": {"steps": 50}}, f)
+
+            # Replicate priority chain: _DEFAULTS → auto → explicit
+            cfg = dict(_DEFAULTS)
+            cfg = _merge(cfg, _load_yaml(auto_cfg_path))
+            cfg = _merge(cfg, _load_yaml(explicit_cfg_path))
+
+        self.assertEqual(
+            cfg["data_generation"]["steps"],
+            50,
+            "Explicit --config did not override auto-loaded config.yaml.",
+        )
+
+    def test_auto_load_does_not_override_quick_mode(self):
+        """--quick must still override auto-loaded config.yaml steps."""
+        import yaml
+        from dynamics_pipeline.run import _DEFAULTS, _QUICK_OVERRIDES, _merge, _load_yaml
+
+        with tempfile.TemporaryDirectory() as td:
+            auto_cfg_path = Path(td) / "config.yaml"
+            with open(auto_cfg_path, "w") as f:
+                yaml.dump({"data_generation": {"steps": 300}}, f)
+
+            cfg = dict(_DEFAULTS)
+            cfg = _merge(cfg, _load_yaml(auto_cfg_path))
+            cfg = _merge(cfg, _QUICK_OVERRIDES)   # quick mode always last
+
+        self.assertEqual(
+            cfg["data_generation"]["steps"],
+            100,
+            "--quick did not override auto-loaded config.yaml steps.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

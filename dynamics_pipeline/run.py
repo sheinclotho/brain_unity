@@ -227,7 +227,16 @@ def main() -> None:
     args = _parse_args()
 
     # Build config
+    # Priority (highest to lowest):
+    #   1. CLI flags (--steps, --n-init, etc.)
+    #   2. --config <path>  (explicit user override)
+    #   3. config.yaml co-located with this file  (auto-detected)
+    #   4. _DEFAULTS  (hardcoded fallback)
     cfg = dict(_DEFAULTS)
+    _default_cfg_path = Path(__file__).parent / "config.yaml"
+    if _default_cfg_path.exists():
+        cfg = _merge(cfg, _load_yaml(_default_cfg_path))
+        logger.debug("Auto-loaded default config: %s", _default_cfg_path)
     if args.config:
         cfg = _merge(cfg, _load_yaml(args.config))
     if args.quick:
