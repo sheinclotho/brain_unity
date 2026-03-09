@@ -164,6 +164,8 @@ def _try_plot_variance_curve(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -175,9 +177,9 @@ def _try_plot_variance_curve(
     # Bar: individual explained variance
     ax1.bar(ranks[:min(30, n)], np.array(evr[:min(30, n)]) * 100,
             color="steelblue", alpha=0.8, edgecolor="k", lw=0.3)
-    ax1.set_xlabel("主成分序号")
-    ax1.set_ylabel("解释方差 (%)")
-    ax1.set_title(f"PCA 解释方差（前30个PC）  [{label}]")
+    ax1.set_xlabel("PC Rank")
+    ax1.set_ylabel("Explained Variance (%)")
+    ax1.set_title(f"PCA Explained Variance (Top 30 PCs)  [{label}]")
 
     # Cumulative
     ax2.plot(ranks, np.array(cumul) * 100, "o-", ms=3, lw=1.5)
@@ -186,9 +188,9 @@ def _try_plot_variance_curve(
     ax2.axhline(95, ls="--", color="darkred", lw=1, label="95%")
     ax2.axvline(n_components_90pct, ls=":", color="green", lw=1,
                 label=f"90%@PC{n_components_90pct}")
-    ax2.set_xlabel("主成分数量")
-    ax2.set_ylabel("累积解释方差 (%)")
-    ax2.set_title(f"累积解释方差  [{label}]")
+    ax2.set_xlabel("Number of PCs")
+    ax2.set_ylabel("Cumulative Explained Variance (%)")
+    ax2.set_title(f"Cumulative Explained Variance  [{label}]")
     ax2.legend(fontsize=8)
 
     fig.tight_layout()
@@ -210,6 +212,8 @@ def _try_plot_attractor_2d(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -240,12 +244,12 @@ def _try_plot_attractor_2d(
     sm = plt.cm.ScalarMappable(cmap=cmap,
                                 norm=plt.Normalize(vmin=0, vmax=T))
     sm.set_array([])
-    plt.colorbar(sm, ax=ax, label="时间步")
+    plt.colorbar(sm, ax=ax, label="Time Step")
 
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
-    ax.set_title(f"吸引子投影（PC1 vs PC2，{n_show} 条轨迹）\n"
-                 f"蓝=起点，红×=终点，颜色=时间  [{label}]")
+    ax.set_title(f"Attractor Projection (PC1 vs PC2, {n_show} traj)\n"
+                 f"Blue=start, Red x=end, color=time  [{label}]")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -266,6 +270,8 @@ def _try_plot_attractor_3d(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -300,7 +306,7 @@ def _try_plot_attractor_3d(
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
     ax.set_zlabel("PC3")
-    ax.set_title(f"吸引子 3D 投影（PC1-PC3, {n_show} 条轨迹）  [{label}]")
+    ax.set_title(f"Attractor 3D Projection (PC1-PC3, {n_show} traj)  [{label}]")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)

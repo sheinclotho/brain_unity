@@ -71,8 +71,10 @@ def plot_connectivity_raw(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
-        logger.warning("matplotlib 未安装，跳过 A1 绘图。")
+        logger.warning("matplotlib not installed; skipping A1 plot.")
         return
 
     N = W.shape[0]
@@ -84,10 +86,10 @@ def plot_connectivity_raw(
     fig, ax = plt.subplots(figsize=(7, 6))
     im = ax.imshow(W, cmap="RdBu_r", vmin=-vabs, vmax=vabs, aspect="auto",
                    interpolation="none" if N <= 300 else "bilinear")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="连接权重")
-    ax.set_title(f"连接矩阵（原始值）  N={N}  [{label}]")
-    ax.set_xlabel("目标节点")
-    ax.set_ylabel("源节点")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Connection Weight")
+    ax.set_title(f"Connectivity Matrix (raw)  N={N}  [{label}]")
+    ax.set_xlabel("Target Node")
+    ax.set_ylabel("Source Node")
     fig.tight_layout()
     path1 = out / f"connectivity_matrix_raw_{label}.png"
     fig.savefig(path1, dpi=150, bbox_inches="tight")
@@ -99,10 +101,10 @@ def plot_connectivity_raw(
     fig, ax = plt.subplots(figsize=(7, 6))
     im = ax.imshow(log_abs, cmap="viridis", aspect="auto",
                    interpolation="none" if N <= 300 else "bilinear")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="log₁₀(|W|)")
-    ax.set_title(f"连接矩阵（log|W|，揭示弱连接）  N={N}  [{label}]")
-    ax.set_xlabel("目标节点")
-    ax.set_ylabel("源节点")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="log10(|W|)")
+    ax.set_title(f"Connectivity Matrix (log|W|)  N={N}  [{label}]")
+    ax.set_xlabel("Target Node")
+    ax.set_ylabel("Source Node")
     fig.tight_layout()
     path2 = out / f"connectivity_matrix_log_abs_{label}.png"
     fig.savefig(path2, dpi=150, bbox_inches="tight")
@@ -136,6 +138,8 @@ def plot_connectivity_reordered(
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -160,7 +164,7 @@ def plot_connectivity_reordered(
     fig, ax = plt.subplots(figsize=(8, 7))
     im = ax.imshow(W_reordered, cmap="RdBu_r", vmin=-vabs, vmax=vabs,
                    aspect="auto", interpolation="none" if N <= 300 else "bilinear")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="连接权重")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Connection Weight")
 
     # Draw community boundary boxes
     n_communities = len(boundaries)
@@ -173,11 +177,11 @@ def plot_connectivity_reordered(
         ax.add_patch(rect)
 
     ax.set_title(
-        f"连接矩阵（按 {n_communities} 个社区排序后）  N={N}  [{label}]\n"
-        f"彩色框 = 社区边界"
+        f"Connectivity Matrix ({n_communities} communities)  N={N}  [{label}]\n"
+        f"colored boxes = community boundaries"
     )
-    ax.set_xlabel("节点（按社区排序）")
-    ax.set_ylabel("节点（按社区排序）")
+    ax.set_xlabel("Node (community order)")
+    ax.set_ylabel("Node (community order)")
     fig.tight_layout()
     path = Path(output_dir) / f"connectivity_matrix_reordered_{label}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -187,15 +191,15 @@ def plot_connectivity_reordered(
     # Also save a combined figure (raw vs reordered)
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     for ax_r, mat, title in [
-        (axes[0], W, "原始顺序"),
-        (axes[1], W_reordered, f"社区排序（{n_communities} 个社区）"),
+        (axes[0], W, "Original order"),
+        (axes[1], W_reordered, f"Community order ({n_communities} communities)"),
     ]:
         im_r = ax_r.imshow(mat, cmap="RdBu_r", vmin=-vabs, vmax=vabs,
                            aspect="auto",
                            interpolation="none" if N <= 300 else "bilinear")
         ax_r.set_title(title)
-        ax_r.set_xlabel("节点")
-        ax_r.set_ylabel("节点")
+        ax_r.set_xlabel("Node")
+        ax_r.set_ylabel("Node")
         plt.colorbar(im_r, ax=ax_r, fraction=0.046, pad=0.04)
 
     # Add community boxes to reordered panel
@@ -206,7 +210,7 @@ def plot_connectivity_reordered(
                           linewidth=1.5, edgecolor=color, facecolor="none", alpha=0.8)
         axes[1].add_patch(rect)
 
-    fig.suptitle(f"连接矩阵可视化  [{label}]", fontsize=12)
+    fig.suptitle(f"Connectivity Visualization  [{label}]", fontsize=12)
     fig.tight_layout()
     combined_path = Path(output_dir) / f"connectivity_matrix_sorted_{label}.png"
     fig.savefig(combined_path, dpi=150, bbox_inches="tight")

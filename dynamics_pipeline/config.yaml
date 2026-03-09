@@ -106,6 +106,14 @@ dynamics:
     enabled: true               # PCA dimensionality (variance curve)
   attractor_dimension:
     enabled: true               # D₂ (correlation dim) + linearised K-Y from DMD
+    d2:
+      enabled: true             # D₂ robustness: multi-trajectory/window distribution
+      k_traj: 10                # Trajectories sampled for D₂
+      m_windows: 5              # Windows per trajectory
+      window_len: 300           # Segment length (steps); capped to available T
+      burnin_fraction: 0.10     # Skip initial fraction of each trajectory
+      min_r2: 0.90              # Minimum R² to accept a D₂ estimate
+      seed: 42
 
 # ── Phase 4: Statistical Validation ─────────────────────────────────────────
 validation:
@@ -124,6 +132,11 @@ validation:
     corr_dim: true
     check_leakage: true
     train_fraction: 0.7
+  intrinsic_dimension:
+    enabled: true               # TwoNN local intrinsic dimension (P1-1)
+    k_traj: 10                  # Trajectories sampled for estimation
+    burnin_fraction: 0.10       # Skip initial fraction of each trajectory
+    max_points: 2000            # Max points per segment for kNN search
   perturbation:
     enabled: false              # Structural perturbation (weight shuffle, rewire)
 
@@ -151,7 +164,7 @@ advanced:
     n_source_regions: 20
     n_target_regions: 20
   critical_slowing_down:
-    enabled: false              # Early warning signals
+    enabled: true               # Early warning signals (H3 evidence, enabled by default)
 
 # ── Output ───────────────────────────────────────────────────────────────────
 output:

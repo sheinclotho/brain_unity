@@ -116,13 +116,15 @@ def compute_spectral_metrics(W: np.ndarray, symmetric: bool = False) -> Dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _try_plot_complex(eigvals: np.ndarray, output_path: Path, label: str) -> None:
-    """复平面特征值散点图。"""
+    """Scatter plot of eigenvalues in the complex plane."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
-        logger.warning("matplotlib 未安装，跳过绘图。")
+        logger.warning("matplotlib not installed; skipping plot.")
         return
 
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -138,7 +140,7 @@ def _try_plot_complex(eigvals: np.ndarray, output_path: Path, label: str) -> Non
     ax.plot(np.cos(theta), np.sin(theta), "k--", lw=0.8, alpha=0.4, label="unit circle")
     ax.set_xlabel("Re(λ)")
     ax.set_ylabel("Im(λ)")
-    ax.set_title(f"特征值复平面分布  [{label}]")
+    ax.set_title(f"Eigenvalue Complex Plane  [{label}]")
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(output_path, dpi=120, bbox_inches="tight")
@@ -147,11 +149,13 @@ def _try_plot_complex(eigvals: np.ndarray, output_path: Path, label: str) -> Non
 
 
 def _try_plot_rank(mags: np.ndarray, output_path: Path, label: str) -> None:
-    """特征值幅值按秩排序图（幂律 vs 平坦谱的直观对比）。"""
+    """Eigenvalue magnitude ranked plot (power-law vs flat spectrum)."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -163,17 +167,17 @@ def _try_plot_rank(mags: np.ndarray, output_path: Path, label: str) -> None:
     # Linear scale
     axes[0].plot(ranks, mags, "o-", ms=3, lw=1.5)
     axes[0].axhline(mags[0] * _DOMINANT_THRESHOLD, ls="--", color="red",
-                    label=f"阈值 {_DOMINANT_THRESHOLD:.0%}×|λ₁|")
-    axes[0].set_xlabel("秩（按 |λ| 降序）")
+                    label=f"threshold {_DOMINANT_THRESHOLD:.0%}x|λ₁|")
+    axes[0].set_xlabel("Rank (|λ| descending)")
     axes[0].set_ylabel("|λ|")
-    axes[0].set_title(f"特征值幅值排名（线性）  [{label}]")
+    axes[0].set_title(f"Eigenvalue Magnitude Rank (linear)  [{label}]")
     axes[0].legend(fontsize=8)
 
     # Log scale
     axes[1].semilogy(ranks, mags + 1e-12, "o-", ms=3, lw=1.5)
-    axes[1].set_xlabel("秩")
+    axes[1].set_xlabel("Rank")
     axes[1].set_ylabel("|λ|  (log)")
-    axes[1].set_title(f"特征值幅值排名（对数）  [{label}]")
+    axes[1].set_title(f"Eigenvalue Magnitude Rank (log)  [{label}]")
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=120, bbox_inches="tight")

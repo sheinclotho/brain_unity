@@ -148,14 +148,24 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
     # connectivity matrix derived from the free-dynamics trajectories.
     W = None
     w_label = "response_matrix"
+    # P0-4: evidence grading
+    #   A: response_matrix (N×N causal/interventional, strongest)
+    #   B: graph_cache structural connectivity (physical meaning, if present)
+    #   C: FC (Pearson correlation, statistical only — weakest)
+    connectivity_source: Optional[str] = None
+    evidence_grade: Optional[str] = None
     if R is not None and R.ndim == 2 and R.shape[0] == R.shape[1]:
         W = R
+        connectivity_source = "response_matrix"
+        evidence_grade = "A"
     elif trajs is not None:
         # Compute functional connectivity from trajectories
         stacked = trajs.reshape(-1, trajs.shape[-1])
         W = np.corrcoef(stacked.T)
         W = np.nan_to_num(W, nan=0.0)
         w_label = "fc"
+        connectivity_source = "fc"
+        evidence_grade = "C"
         if R is not None:
             logger.info(
                 "  Response matrix is non-square (%s); using FC from "
@@ -168,6 +178,17 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
     if W is None:
         logger.warning("  No connectivity matrix available, skipping Phase 2.")
         return
+
+    # Store evidence grade for Phase 6 reporting
+    results["connectivity_source"] = connectivity_source
+    results["evidence_grade"] = evidence_grade
+    if evidence_grade == "C":
+        logger.info(
+            "  Evidence grade: C (FC only). Spectral radius/eigenvalues "
+            "cannot be interpreted as Jacobian/causal stability boundary."
+        )
+    elif evidence_grade == "A":
+        logger.info("  Evidence grade: A (response_matrix, N×N causal).")
 
     struct_dir = output_dir / "structure"
     struct_dir.mkdir(exist_ok=True)
@@ -444,21 +465,112 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
     ad_cfg = dyn_cfg.get("attractor_dimension", {})
     if ad_cfg.get("enabled", True):
         dim_results: Dict[str, Any] = {}
-        # D₂ from Grassberger-Procaccia
-        try:
-            from analysis.embedding_dimension import correlation_dimension
-            ref_idx = trajs.shape[0] // 2
-            ref_traj = trajs[ref_idx]
-            burnin = max(0, ref_traj.shape[0] // 10)
-            d2_out = correlation_dimension(ref_traj[burnin:])
-            dim_results["D2"] = d2_out.get("D2", float("nan"))
-            dim_results["D2_fit_r2"] = d2_out.get("fit_r2", float("nan"))
-            logger.info(
-                "  Attractor dim: D₂=%.2f (R²=%.3f)",
-                dim_results["D2"], dim_results["D2_fit_r2"],
-            )
-        except Exception as e:
-            logger.warning("  D₂ computation failed: %s", e)
+
+        # ── D₂ robustness: multi-trajectory / multi-window distribution ───────
+        # P0-1: instead of a single trajectory, sample K trajectories × M windows
+        # and report distribution statistics (mean/std/fail_rate/r2 quality).
+        d2_cfg = ad_cfg.get("d2", {})
+        if d2_cfg.get("enabled", True):
+            try:
+                from analysis.embedding_dimension import correlation_dimension
+                rng_d2 = np.random.default_rng(d2_cfg.get("seed", 42))
+                k_traj = min(d2_cfg.get("k_traj", 10), trajs.shape[0])
+                m_windows = d2_cfg.get("m_windows", 5)
+                window_len = d2_cfg.get("window_len", 300)
+                burnin_frac = d2_cfg.get("burnin_fraction", 0.1)
+                min_r2 = d2_cfg.get("min_r2", 0.90)
+
+                T = trajs.shape[1]
+                burnin_steps = max(0, int(T * burnin_frac))
+                eff_T = T - burnin_steps
+                window_len = min(window_len, eff_T)
+
+                traj_indices = rng_d2.choice(trajs.shape[0], size=k_traj, replace=False)
+                d2_values: List[float] = []
+                r2_values: List[float] = []
+                d2_n_total = 0
+                d2_failures: List[str] = []
+
+                for ti in traj_indices:
+                    traj_i = trajs[ti, burnin_steps:, :]  # (eff_T, N)
+                    if eff_T < window_len:
+                        # Not enough steps: use full trajectory
+                        window_starts = [0]
+                    else:
+                        # Sample m_windows non-overlapping start positions
+                        possible = np.arange(0, eff_T - window_len + 1)
+                        if len(possible) < m_windows:
+                            window_starts = possible.tolist()
+                        else:
+                            window_starts = rng_d2.choice(
+                                possible, size=m_windows, replace=False
+                            ).tolist()
+
+                    for ws in window_starts:
+                        d2_n_total += 1
+                        seg = traj_i[ws:ws + window_len]
+                        try:
+                            out = correlation_dimension(seg)
+                            d2_val = out.get("D2", float("nan"))
+                            r2_val = out.get("fit_r2", float("nan"))
+                            if not np.isfinite(d2_val):
+                                d2_failures.append("non-finite D2")
+                                continue
+                            if np.isfinite(r2_val) and r2_val < min_r2:
+                                d2_failures.append(f"low_r2={r2_val:.3f}")
+                                continue
+                            d2_values.append(float(d2_val))
+                            r2_values.append(float(r2_val) if np.isfinite(r2_val) else float("nan"))
+                        except Exception as exc:
+                            d2_failures.append(str(exc)[:200])
+
+                d2_n_valid = len(d2_values)
+                fail_rate = (d2_n_total - d2_n_valid) / max(d2_n_total, 1)
+
+                if d2_n_valid > 0:
+                    arr = np.array(d2_values)
+                    r2_arr = np.array([v for v in r2_values if np.isfinite(v)])
+                    dim_results["D2_mean"] = round(float(arr.mean()), 3)
+                    dim_results["D2_std"] = round(float(arr.std()), 3)
+                    dim_results["D2_median"] = round(float(np.median(arr)), 3)
+                    dim_results["D2_iqr"] = round(
+                        float(np.percentile(arr, 75) - np.percentile(arr, 25)), 3
+                    )
+                    dim_results["D2_n_total"] = d2_n_total
+                    dim_results["D2_n_valid"] = d2_n_valid
+                    dim_results["D2_fail_rate"] = round(fail_rate, 3)
+                    dim_results["D2_r2_mean"] = round(float(r2_arr.mean()), 3) if len(r2_arr) > 0 else None
+                    dim_results["D2_r2_min"] = round(float(r2_arr.min()), 3) if len(r2_arr) > 0 else None
+                    # Backward-compat scalar for H2 evaluation
+                    dim_results["D2"] = dim_results["D2_mean"]
+                    dim_results["D2_fit_r2"] = dim_results["D2_r2_mean"]
+                    logger.info(
+                        "  Attractor dim: D₂=%.2f±%.2f (n=%d/%d, fail=%.0f%%, R²_mean=%.3f)",
+                        dim_results["D2_mean"], dim_results["D2_std"],
+                        d2_n_valid, d2_n_total,
+                        fail_rate * 100,
+                        dim_results["D2_r2_mean"] or float("nan"),
+                    )
+                    if fail_rate > 0.5:
+                        logger.warning(
+                            "  D₂ fail_rate=%.0f%% > 50%%: H2 evidence grade downgraded.",
+                            fail_rate * 100,
+                        )
+                        dim_results["D2_h2_reliable"] = False
+                    else:
+                        dim_results["D2_h2_reliable"] = True
+                else:
+                    logger.warning(
+                        "  D₂: all %d windows failed (%s …). H2 D₂ evidence unavailable.",
+                        d2_n_total,
+                        (d2_failures[0] if d2_failures else "unknown"),
+                    )
+                    dim_results["D2_n_total"] = d2_n_total
+                    dim_results["D2_n_valid"] = 0
+                    dim_results["D2_fail_rate"] = 1.0
+                    dim_results["D2_h2_reliable"] = False
+            except Exception as e:
+                logger.warning("  D₂ distribution computation failed: %s", e)
 
         # K-Y from linearised DMD spectrum (already in dmd_spectrum)
         dmd = results.get("dmd_spectrum", {})
@@ -567,6 +679,30 @@ def run_phase4_validation(cfg: dict, results: Dict[str, Any],
                 logger.info("  Structural perturbation: done (see report).")
             except Exception as e:
                 logger.warning("  Structural perturbation failed: %s", e)
+
+    # 4e: Local intrinsic dimension (TwoNN, P1-1)
+    id_cfg = val_cfg.get("intrinsic_dimension", {})
+    if id_cfg.get("enabled", True):
+        try:
+            from analysis.intrinsic_dimension import run_intrinsic_dimension
+            id_result = run_intrinsic_dimension(
+                trajectories=trajs,
+                k_traj=id_cfg.get("k_traj", 10),
+                burnin_fraction=id_cfg.get("burnin_fraction", 0.10),
+                max_points=id_cfg.get("max_points", 2000),
+                seed=id_cfg.get("seed", seed),
+                output_dir=val_dir,
+            )
+            results["intrinsic_dimension"] = id_result
+            logger.info(
+                "  TwoNN intrinsic dim: d=%.2f±%.2f (n=%d/%d)",
+                id_result.get("d_mean", float("nan")),
+                id_result.get("d_std", float("nan")),
+                id_result.get("n_valid", 0),
+                id_result.get("n_total", 0),
+            )
+        except Exception as e:
+            logger.warning("  Intrinsic dimension (TwoNN) failed: %s", e)
 
 
 def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
@@ -696,15 +832,22 @@ def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
         except Exception as e:
             logger.warning("  Information flow failed: %s", e)
 
-    # 5f: Critical slowing down
-    if adv_cfg.get("critical_slowing_down", {}).get("enabled", False) and trajs is not None:
+    # 5f: Critical slowing down (P0-3: enabled by default as H3 evidence)
+    if adv_cfg.get("critical_slowing_down", {}).get("enabled", True) and trajs is not None:
         try:
             from analysis.critical_slowing_down import run_critical_slowing_down_analysis
+            csd_cfg = adv_cfg.get("critical_slowing_down", {})
             csd = run_critical_slowing_down_analysis(
                 trajectories=trajs, output_dir=adv_dir,
             )
             results["critical_slowing_down"] = csd
-            logger.info("  Critical slowing down: done.")
+            logger.info(
+                "  Critical slowing down: ar1_tau=%.3f (p=%.3f), var_tau=%.3f (p=%.3f)",
+                csd.get("ar1_trend_tau", float("nan")),
+                csd.get("ar1_trend_p", float("nan")),
+                csd.get("var_trend_tau", float("nan")),
+                csd.get("var_trend_p", float("nan")),
+            )
         except Exception as e:
             logger.warning("  Critical slowing down failed: %s", e)
 
@@ -714,7 +857,40 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
     """Phase 6: Synthesis — consistency checks & hypothesis evaluation."""
     _step(6, "Synthesis & Report")
 
-    report: Dict[str, Any] = {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
+    # ── P2-1: Run metadata ────────────────────────────────────────────────────
+    import hashlib
+    dg = cfg.get("data_generation", {})
+    sim_cfg = cfg.get("simulator", {})
+    try:
+        cfg_hash = hashlib.sha256(
+            json.dumps(cfg, sort_keys=True, default=str).encode()
+        ).hexdigest()[:12]
+    except Exception:
+        cfg_hash = "unknown"
+
+    report: Dict[str, Any] = {
+        "run_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "metadata": {
+            "seed": dg.get("seed", 42),
+            "n_init": dg.get("n_init"),
+            "steps": dg.get("steps"),
+            "modality": sim_cfg.get("modality", "fmri"),
+            "cfg_hash": cfg_hash,
+            "output_dir": str(output_dir),
+        },
+        # P0-4: evidence grading
+        "connectivity_source": results.get("connectivity_source") or "unknown",
+        "evidence_grade": results.get("evidence_grade") or "unknown",
+    }
+
+    # ── P0-2: DMD interpretation note ─────────────────────────────────────────
+    report["dmd_interpretation_note"] = (
+        "DMD operator A is a least-squares linear approximation of the "
+        "dynamics on the attractor sample; it is NOT equivalent to the "
+        "point-wise Jacobian. Eigenvalues reflect linearised structure "
+        "(Koopman finite-dimensional projection). For chaos assessment, "
+        "use Rosenstein LLE as the primary indicator."
+    )
 
     # ── Consistency check: Rosenstein LLE vs DMD spectral radius ──────────────
     lya = results.get("lyapunov", {})
@@ -756,6 +932,13 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
             nonlinearity_index = abs(lambda_dmd_max)
         report["consistency"]["lambda_dmd_max"] = lambda_dmd_max
         report["consistency"]["nonlinearity_index"] = round(nonlinearity_index, 4)
+        # P0-2: flag high nonlinearity → DMD conclusions are reference only
+        if nonlinearity_index > 1.0:
+            report["consistency"]["dmd_note"] = (
+                "nonlinearity_index > 1.0: DMD linearised approximation "
+                "deviates strongly from nonlinear dynamics. "
+                "DMD spectral conclusions are for reference only."
+            )
         if consistent:
             logger.info(
                 "  ✓ Consistency: Rosenstein λ=%.5f (%s) ↔ DMD ρ=%.4f (%s)"
@@ -794,6 +977,25 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
             h_id, h_info["verdict"], h_info["summary"],
         )
 
+    # ── P0-4: Confidence flags (auto-downgrade when evidence_grade == C) ──────
+    evidence_grade = results.get("evidence_grade") or "unknown"
+    confidence_flags: Dict[str, str] = {}
+    for h_id, h_info in hypotheses.items():
+        verdict = h_info.get("verdict", "INSUFFICIENT_DATA")
+        # Downgrade H1 (structural) when only FC is available (no causal interpretation)
+        if evidence_grade == "C" and h_id == "H1":
+            confidence_flags[h_id] = "LOW (FC only — no causal interpretation)"
+        elif verdict == "SUPPORTED":
+            confidence_flags[h_id] = "HIGH" if evidence_grade == "A" else (
+                "MEDIUM" if evidence_grade == "B" else "LOW"
+            )
+        elif verdict == "NOT_SUPPORTED":
+            confidence_flags[h_id] = "HIGH" if evidence_grade == "A" else "MEDIUM"
+        else:
+            confidence_flags[h_id] = "INSUFFICIENT_DATA"
+    report["confidence_flags"] = confidence_flags
+    logger.info("  Confidence flags: %s", confidence_flags)
+
     # ── Regime summary ────────────────────────────────────────────────────────
     regime = lya.get("chaos_regime", {}).get("regime", "unknown")
     report["regime"] = regime
@@ -818,34 +1020,53 @@ def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:
     pr = spec.get("participation_ratio")
     n_dom = spec.get("n_dominant")
     N = spec.get("n_regions")
+    evidence_grade = results.get("evidence_grade") or "unknown"
     if pr is not None and N is not None and N > 0:
         ratio = pr / N
         supported = ratio < 0.3
+        h1_note = ""
+        if evidence_grade == "C":
+            h1_note = (
+                " [Grade C: FC only — spectral structure reflects "
+                "correlational, not causal/Jacobian, connectivity.]"
+            )
         H["H1"] = {
             "name": "Low-rank spectral structure",
             "verdict": "SUPPORTED" if supported else "NOT_SUPPORTED",
             "summary": f"PR/N={ratio:.2f} ({'<' if supported else '≥'}0.30), "
-                       f"n_dominant={n_dom}",
+                       f"n_dominant={n_dom}{h1_note}",
             "PR": float(pr),
             "PR_N_ratio": float(ratio),
+            "evidence_grade": evidence_grade,
         }
     else:
         H["H1"] = {"name": "Low-rank spectral structure",
                     "verdict": "INSUFFICIENT_DATA", "summary": "No spectral data."}
 
     # H2: Low-dimensional dynamics
-    # Evidence: PCA n@90%, correlation dimension D₂, linearised K-Y dimension
+    # Evidence: PCA n@90%, correlation dimension D₂ (distribution), linearised K-Y dimension
     pca = results.get("pca", {})
     n90 = pca.get("n_components_90")
     ad = results.get("attractor_dimension", {})
-    d2 = ad.get("D2")
+    d2 = ad.get("D2")  # scalar mean (backward-compat)
+    d2_mean = ad.get("D2_mean", d2)
+    d2_std = ad.get("D2_std")
+    d2_fail_rate = ad.get("D2_fail_rate")
+    d2_reliable = ad.get("D2_h2_reliable", True)
     ky_lin = ad.get("KY_linearised")
     if n90 is not None and N is not None and N > 0:
         dim_ratio = n90 / N
         supported = dim_ratio < 0.15
         summary_parts = [f"n@90%/N={dim_ratio:.2f} ({'<' if supported else '≥'}0.15)"]
-        if d2 is not None and np.isfinite(d2):
-            summary_parts.append(f"D₂={d2:.2f}")
+        if d2_mean is not None and np.isfinite(d2_mean):
+            d2_str = f"D₂={d2_mean:.2f}"
+            if d2_std is not None:
+                d2_str += f"±{d2_std:.2f}"
+            if d2_fail_rate is not None:
+                d2_str += f" (fail={d2_fail_rate:.0%})"
+            if not d2_reliable:
+                d2_str += " [unreliable: high fail rate]"
+            summary_parts.append(d2_str)
         if ky_lin is not None:
             summary_parts.append(f"K-Y_lin={ky_lin:.2f}")
         H["H2"] = {
@@ -854,7 +1075,10 @@ def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:
             "summary": ", ".join(summary_parts),
             "n_components_90": n90,
             "dim_ratio": float(dim_ratio),
-            "D2": float(d2) if d2 is not None and np.isfinite(d2) else None,
+            "D2": float(d2_mean) if d2_mean is not None and np.isfinite(d2_mean) else None,
+            "D2_std": float(d2_std) if d2_std is not None else None,
+            "D2_fail_rate": float(d2_fail_rate) if d2_fail_rate is not None else None,
+            "D2_reliable": d2_reliable,
             "KY_linearised": float(ky_lin) if ky_lin is not None else None,
         }
     else:
@@ -862,18 +1086,59 @@ def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:
                     "verdict": "INSUFFICIENT_DATA", "summary": "No PCA data."}
 
     # H3: Near-critical dynamics
+    # P0-3: Include CSD (critical slowing down) as a parallel evidence stream.
     lya = results.get("lyapunov", {})
     regime = lya.get("chaos_regime", {}).get("regime")
     lle = lya.get("mean_lyapunov")
+    csd = results.get("critical_slowing_down", {})
     if regime is not None:
         near_critical = regime in _NEAR_CRITICAL_REGIMES
-        H["H3"] = {
+        summary_parts = [
+            f"regime={regime}",
+            f"λ={lle:.5f}" if lle is not None else "",
+        ]
+        h3_entry: Dict[str, Any] = {
             "name": "Near-critical dynamics",
             "verdict": "SUPPORTED" if near_critical else "NOT_SUPPORTED",
-            "summary": f"regime={regime}, λ={lle:.5f}" if lle is not None else f"regime={regime}",
             "regime": regime,
             "lle": float(lle) if lle is not None else None,
         }
+        # CSD evidence for H3 (P0-3)
+        if csd:
+            ar1_tau = csd.get("ar1_trend_tau")
+            ar1_p = csd.get("ar1_trend_p")
+            var_tau = csd.get("var_trend_tau")
+            var_p = csd.get("var_trend_p")
+            ews_score = csd.get("ews_score_mean")
+            csd_parts = []
+            if ar1_tau is not None:
+                csd_parts.append(f"AR1_tau={ar1_tau:.2f}(p={ar1_p:.3f})")
+            if var_tau is not None:
+                csd_parts.append(f"Var_tau={var_tau:.2f}(p={var_p:.3f})")
+            if ews_score is not None:
+                csd_parts.append(f"EWS={ews_score:.2f}")
+            if csd_parts:
+                summary_parts.append("CSD:[" + ", ".join(csd_parts) + "]")
+            h3_entry["csd"] = {
+                "ar1_trend_tau": ar1_tau,
+                "ar1_trend_p": ar1_p,
+                "var_trend_tau": var_tau,
+                "var_trend_p": var_p,
+                "ews_score_mean": ews_score,
+            }
+            # Consistent CSD (rising AR1/variance near criticality) strengthens H3
+            csd_consistent = (
+                ar1_tau is not None and ar1_tau > 0 and
+                var_tau is not None and var_tau > 0
+            )
+            h3_entry["csd_consistent_with_criticality"] = csd_consistent
+            if csd_consistent:
+                summary_parts.append("CSD_consistent=True")
+        else:
+            summary_parts.append("CSD: not available")
+
+        h3_entry["summary"] = ", ".join(p for p in summary_parts if p)
+        H["H3"] = h3_entry
     else:
         H["H3"] = {"name": "Near-critical dynamics",
                     "verdict": "INSUFFICIENT_DATA", "summary": "No Lyapunov data."}
