@@ -469,84 +469,195 @@ class BrainVisualizationServer:
                 self.logger.warning(f"Filtered {len(target_regions) - len(valid_regions)} invalid region IDs")
                 target_regions = valid_regions
 
-            # ── Path 1: TwinBrainDigitalTwin GNN simulation ────────────────
-            # Requires: trained model (_twin) + edge-reconstructed graph
-            # (_loaded_graph, set when the user loads a cache file).
-            # Returns causal_effect (perturbed − baseline) tensors which are
-            # converted to per-frame activity arrays for the timeline.
+            # ── Path 1: BrainDynamicsSimulator with TwinBrainDigitalTwin ──────
+            # Creates a proper autoregressive rollout using the GNN model.
+            # Steps = model.prediction_steps (adaptive to training configuration).
+            # Both stimulated and counterfactual trajectories start from the same
+            # context window, so their difference is exclusively due to stimulation.
+            # Real data frames for the same time window are included for comparison.
             if self._twin is not None and self._loaded_graph is not None:
                 try:
-                    self.logger.info("TwinBrainDigitalTwin 仿真中…")
-                    # Determine which modality to stimulate (prefer fMRI)
-                    _stim_modality = (
-                        "fmri" if "fmri" in self._loaded_graph.node_types else
-                        self._loaded_graph.node_types[0]
+                    import sys as _sys
+                    _repo_root = self._PROJECT_ROOT
+                    if str(_repo_root) not in _sys.path:
+                        _sys.path.insert(0, str(_repo_root))
+                    from brain_dynamics.simulator.brain_dynamics_simulator import (
+                        BrainDynamicsSimulator,
+                        SinStimulus, StepStimulus, RampStimulus,
                     )
-                    interventions = {
-                        _stim_modality: (list(target_regions), float(amplitude))
-                    }
-                    twin_result = self._twin.simulate_intervention(
-                        baseline_data=self._loaded_graph,
-                        interventions=interventions,
-                        num_prediction_steps=int(duration),
+
+                    # Determine modality: use what the frontend is showing, fall
+                    # back to whatever is available in the loaded graph.
+                    active_mod = str(stimulation.get("active_modality", "fmri"))
+                    if active_mod not in self._loaded_graph.node_types:
+                        active_mod = (
+                            "fmri" if "fmri" in self._loaded_graph.node_types
+                            else str(list(self._loaded_graph.node_types)[0])
+                        )
+
+                    sim = BrainDynamicsSimulator(
+                        model=self._twin,
+                        base_graph=self._loaded_graph,
+                        modality=active_mod,
                     )
-                    # ── Convert to visualisation frames ──────────────────
-                    _mod = _stim_modality
-                    perturbed_t = twin_result["perturbed"][_mod]    # [N, steps, C]
-                    baseline_t  = twin_result["baseline"][_mod]     # [N, steps, C]
-                    causal_t    = twin_result["causal_effect"][_mod] # [N, steps, C]
 
-                    pert_np  = perturbed_t.detach().cpu().float().numpy()[:, :, 0]  # [N, steps]
-                    base_np  = baseline_t.detach().cpu().float().numpy()[:, :, 0]   # [N, steps]
-                    caus_np  = causal_t.detach().cpu().float().numpy()[:, :, 0]     # [N, steps]
+                    # Adaptive prediction length: use the model's trained chunk size.
+                    _inner = getattr(self._twin, "model", None)
+                    prediction_steps = int(getattr(_inner, "prediction_steps", 17))
+                    context_length   = sim._get_context_length()
 
-                    N_model, steps = pert_np.shape
-                    # Percentile-normalise perturbed and baseline to [0,1] using
-                    # the same scale so the two are directly comparable.
-                    flat = np.concatenate([pert_np.ravel(), base_np.ravel()])
-                    _p5, _p95 = np.percentile(flat, 5), np.percentile(flat, 95)
-                    _scale = max(float(_p95 - _p5), 1e-6)
+                    # Compute context window index from current_frame_idx so the
+                    # rollout uses the historical context ending near the frame the
+                    # user selected in the timeline.
+                    current_frame_idx = int(stimulation.get("current_frame_idx", -1))
+                    if (current_frame_idx >= 0
+                            and self._loaded_time_series is not None
+                            and active_mod in self._loaded_graph.node_types):
+                        n_display = len(self._loaded_time_series)
+                        T_data = int(self._loaded_graph[active_mod].x.shape[1])
+                        # Map display-frame index → data-frame index (accounts for
+                        # linspace subsampling if T_data > _MAX_FRAMES_PER_MODALITY).
+                        # Clamp to [0, T_data-1] to guard against n_display==1 or
+                        # any other edge case that could push data_fi out of range.
+                        data_fi = min(
+                            round(
+                                current_frame_idx * (T_data - 1) / max(n_display - 1, 1)
+                            ),
+                            T_data - 1,
+                        )
+                        # window_idx such that the context window ends near data_fi
+                        stride = sim._get_stride()
+                        end_target = min(data_fi + 1, T_data)
+                        window_idx = max(
+                            0,
+                            round((T_data - end_target) / stride)
+                        )
+                        window_idx = min(
+                            window_idx, max(0, sim.n_temporal_windows - 1)
+                        )
+                    else:
+                        window_idx = 0  # default: most recent context
 
-                    def _twin_to_frames(x_np):
-                        norms = np.clip((x_np - _p5) / _scale, 0.0, 1.0).astype(np.float32)
+                    # Build Stimulus objects for all target regions.
+                    # Stimulation runs for the full prediction window (onset=0).
+                    stimuli_objs = []
+                    for rid in valid_regions:
+                        if 0 <= rid < sim.n_regions:
+                            if pattern == "ramp":
+                                s = RampStimulus(
+                                    node=rid, amplitude=float(amplitude),
+                                    duration=prediction_steps, onset=0,
+                                )
+                            elif pattern in ("constant", "pulse"):
+                                s = StepStimulus(
+                                    node=rid, amp=float(amplitude),
+                                    duration=prediction_steps, onset=0,
+                                )
+                            else:  # sine (default)
+                                s = SinStimulus(
+                                    node=rid, freq=float(frequency),
+                                    amp=float(amplitude),
+                                    duration=prediction_steps, onset=0,
+                                )
+                            stimuli_objs.append(s)
+
+                    if not stimuli_objs:
+                        raise ValueError(
+                            f"No valid stimulus nodes within model's region range "
+                            f"[0, {sim.n_regions}); target_regions={valid_regions}"
+                        )
+
+                    # Run stimulated rollout
+                    stim_traj, _ = sim.rollout_multi_stim(
+                        steps=prediction_steps,
+                        stimuli=stimuli_objs,
+                        context_window_idx=window_idx,
+                    )  # [steps, n_model_regions]
+
+                    # Run counterfactual (no-stim) rollout from the same context
+                    cf_traj, _ = sim.rollout(
+                        steps=prediction_steps,
+                        stimulus=None,
+                        context_window_idx=window_idx,
+                    )  # [steps, n_model_regions]
+
+                    # Normalise both to [0,1] using shared percentiles so they
+                    # are directly comparable.
+                    combined_flat = np.concatenate(
+                        [stim_traj.ravel(), cf_traj.ravel()]
+                    )
+                    _p5  = float(np.percentile(combined_flat, 5))
+                    _p95 = float(np.percentile(combined_flat, 95))
+                    _scale = max(_p95 - _p5, 1e-6)
+                    N_model = stim_traj.shape[1]
+
+                    def _traj_to_frames(traj_np: "np.ndarray") -> list:
+                        """[steps, N_model] → list of {"activity": [200 floats]}"""
+                        norm = np.clip(
+                            (traj_np - _p5) / _scale, 0.0, 1.0
+                        ).astype(np.float32)
                         if N_model == n_regions:
-                            return [{"activity": norms[:, t].tolist()} for t in range(steps)]
+                            return [{"activity": row.tolist()} for row in norm]
                         src = np.linspace(0.0, 1.0, N_model)
                         dst = np.linspace(0.0, 1.0, n_regions)
                         return [
-                            {"activity": np.interp(dst, src, norms[:, t]).astype(np.float32).tolist()}
-                            for t in range(steps)
+                            {"activity": np.interp(dst, src, row).astype(
+                                np.float32
+                            ).tolist()}
+                            for row in norm
                         ]
 
-                    frames    = _twin_to_frames(pert_np)
-                    cf_frames = _twin_to_frames(base_np)
+                    frames    = _traj_to_frames(stim_traj)
+                    cf_frames = _traj_to_frames(cf_traj)
 
-                    # Peak frame: step where mean absolute causal effect is largest
-                    peak_idx = int(np.argmax(np.abs(caus_np).mean(axis=0)))
+                    # Real data frames for the same time window — lets the user
+                    # compare model predictions against actual recorded activity.
+                    real_frames: list = []
+                    if self._loaded_time_series is not None:
+                        n_ts    = len(self._loaded_time_series)
+                        r_start = min(max(0, current_frame_idx), n_ts - 1)
+                        r_end   = min(r_start + prediction_steps, n_ts)
+                        real_frames = [
+                            {"activity": row.tolist()}
+                            for row in self._loaded_time_series[r_start:r_end]
+                        ]
 
-                    tw_top_affected, tw_peak_delta = _compute_top_affected(
+                    # Find the peak frame (maximum mean |stim − cf| difference)
+                    delta_np = stim_traj - cf_traj       # [steps, N_model]
+                    peak_idx = int(
+                        np.argmax(np.abs(delta_np).mean(axis=1))
+                    )
+
+                    bd_top_affected, bd_peak_delta = _compute_top_affected(
                         frames, cf_frames, peak_idx, valid_regions
                     )
                     self.logger.info(
-                        f"✓ TwinBrainDigitalTwin 仿真完成: {steps} 帧, "
-                        f"峰值帧={peak_idx}"
+                        "✓ BrainDynamicsSimulator 仿真完成: "
+                        f"{prediction_steps} 步, 峰值帧={peak_idx}, "
+                        f"模态={active_mod}, context_len={context_length}, "
+                        f"window_idx={window_idx}, "
+                        f"real_frames={len(real_frames)}"
                     )
                     return {
-                        "type":                "simulation_result",
-                        "success":             True,
-                        "n_frames":            len(frames),
-                        "frames":              frames,
+                        "type":                  "simulation_result",
+                        "success":               True,
+                        "n_frames":              len(frames),
+                        "frames":                frames,
                         "counterfactual_frames": cf_frames,
-                        "modality":            "simulation",
-                        "method":              "digital_twin",
-                        "start_frame":         peak_idx,
-                        "top_affected":        tw_top_affected,
-                        "peak_delta":          tw_peak_delta,
+                        "real_frames":           real_frames,
+                        "modality":              "simulation",
+                        "method":                "brain_dynamics_simulator",
+                        "start_frame":           peak_idx,
+                        "top_affected":          bd_top_affected,
+                        "peak_delta":            bd_peak_delta,
+                        "prediction_steps":      prediction_steps,
+                        "context_length":        context_length,
                     }
                 except Exception as _exc:
                     self.logger.warning(
-                        f"TwinBrainDigitalTwin 仿真失败 ({_exc})，"
-                        "尝试 EC 代理模型路径"
+                        f"BrainDynamicsSimulator 仿真失败 ({_exc})，"
+                        "尝试 EC 代理模型路径",
+                        exc_info=True,
                     )
 
             # ── Path 2: Data-driven surrogate path (requires prior EC inference)
