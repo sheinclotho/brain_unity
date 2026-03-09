@@ -201,14 +201,48 @@ def run_free_dynamics(
 
     trajectories = np.empty((n_init, steps, n_regions), dtype=np.float32)
     log_interval = max(1, n_init // 10)
+
+    # ── Compute context-end-aligned step indices for each temporal window ────
+    # For temporal window k:
+    #   context_window_k  = data[:, T - ctx - k*s : T - k*s]
+    #   x0_natural        = data[:, T - k*s]       (step immediately after context)
+    #
+    # Injecting x0 = data[:, T - k*s] makes context + x0 a CONTIGUOUS BOLD
+    # segment, so the model encoder sees internally consistent temporal structure
+    # with zero spatial-structure mismatch.  This eliminates the long
+    # "correction transient" that otherwise dominates PC1.
+    #
+    # For window 0: T - 0*s = T, clamped to T-1 (last available BOLD step).
+    # The resulting x0 = context[-1] effectively re-uses the last context step,
+    # which is identical to running with x0=None — the model immediately
+    # produces a natural continuation without any correction.
+    try:
+        _stride_fd  = simulator._get_stride()   # canonical: max(1, ctx_len // 4)
+        _nt_fd = simulator.modality if simulator.modality != "joint" else "fmri"
+        _T_fd = (int(simulator.base_graph[_nt_fd].x.shape[1])
+                 if _nt_fd in simulator.base_graph.node_types
+                 and hasattr(simulator.base_graph[_nt_fd], "x")
+                 else 0)
+    except Exception:
+        _stride_fd  = 50
+        _T_fd       = 0
+
+    def _x0_step_for_window(w_idx: int) -> Optional[int]:
+        """Return the context-aligned step index for temporal window w_idx."""
+        if _T_fd <= 0:
+            return None  # no data available; fall back to random step
+        step = _T_fd - w_idx * _stride_fd
+        return int(max(0, min(step, _T_fd - 1)))
+
     for i in range(n_init):
         window_idx = i % eff_windows
-        # Use the simulator's own data-sample mode to generate diverse initial
-        # states that preserve spatial correlation structure of real BOLD/EEG data.
-        # Sampling from actual time steps (from_data=True) avoids the long
-        # "spatial-structure correction" transient that dominates PC1 when
-        # isotropic mean+noise initial states are used (see AGENTS.md).
-        x0 = simulator.sample_random_state(rng, from_data=True)
+        # Context-end-aligned initial state: x0 is the BOLD step that immediately
+        # follows the context window being used.  This makes context+x0 a
+        # temporally contiguous segment, so the model predicts naturally from the
+        # first step, producing oscillatory/chaotic orbits rather than a long
+        # correction drift toward the free-run attractor.
+        x0_step = _x0_step_for_window(window_idx)
+        x0 = simulator.sample_random_state(rng, from_data=True, step_idx=x0_step)
         traj, _ = simulator.rollout(
             x0=x0, steps=steps, stimulus=None,
             context_window_idx=window_idx,

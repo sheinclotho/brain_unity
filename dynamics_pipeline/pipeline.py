@@ -443,17 +443,11 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
     if dyn_cfg.get("pca", {}).get("enabled", True):
         try:
             from spectral_dynamics.f_pca_attractor import run_pca_attractor
-            # Burnin must cover at least the context-washout period
-            # (context_length steps until model is in pure free-run mode).
-            # T // 10 alone (50 for T=500) is insufficient; use the larger value.
-            # Cap to T // 3 so short test trajectories still work.
+            # With context-end-aligned x0 (from_data=True, step_idx=context_end),
+            # the initial state IS the natural BOLD continuation of the context.
+            # No large correction transient → small burnin (T//10) is sufficient.
             _T = trajs.shape[1] if trajs.ndim >= 2 else 0
-            try:
-                _ctx_len = int(simulator._get_context_length())
-            except Exception:
-                _ctx_len = 200  # V5 default
-            # Never burn off more than half the trajectory (safe for tests).
-            burnin = min(max(_ctx_len, _T // 10), _T // 2) if _T > 0 else 0
+            burnin = _pca_burnin(_T)
             pca = run_pca_attractor(
                 trajectories=trajs,
                 burnin=burnin,
@@ -1418,6 +1412,20 @@ def run_pipeline(cfg: dict) -> Dict[str, Any]:
     return all_results
 
 
+def _pca_burnin(n_steps: int) -> int:
+    """Canonical PCA burn-in formula shared by ``run_phase3_dynamics`` and
+    ``_save_summary_plots``.
+
+    With context-end-aligned initial states (``from_data=True``, ``step_idx``
+    set to the natural continuation of each context window), there is no large
+    correction transient.  A small burn-in of ``T // 10`` is sufficient to
+    discard the micro-perturbation noise and the first prediction chunk.
+    The cap at ``T // 2`` ensures that at least half the trajectory is always
+    available for analysis even for very short test trajectories.
+    """
+    return min(max(10, n_steps // 10), n_steps // 2) if n_steps > 0 else 0
+
+
 def _save_summary_plots(results: Dict[str, Any], output_dir: Path,
                         simulator) -> None:
     """Save summary visualisations."""
@@ -1445,16 +1453,11 @@ def _save_summary_plots(results: Dict[str, Any], output_dir: Path,
         except Exception:
             pass
         try:
-            # Compute burnin covering context-washout period, capped at T//3.
-            try:
-                _ctx = int(getattr(simulator, "_get_context_length", lambda: 200)())
-            except Exception:
-                _ctx = 200
-            _T = trajs.shape[1]
-            _burnin = min(max(_ctx, _T // 10), _T // 3)
+            # Small burnin via _pca_burnin(): context-end-aligned x0 has no large
+            # correction transient.  Capped at T//2 for test safety.
             plot_pca_trajectories(
                 trajs, save_path=plots_dir / "pca_trajectories.png",
-                burnin=_burnin,
+                burnin=_pca_burnin(trajs.shape[1]),
             )
         except Exception:
             pass

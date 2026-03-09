@@ -61,6 +61,12 @@ _ZSCORE_DETECTION_THRESHOLD: float = -0.1
 # would require many warm-up steps to recover from).
 _INITIAL_STATE_NOISE_SCALE: float = 0.3
 
+# Noise scale used in data-sample mode (from_data=True).  Intentionally small:
+# diversity across trajectories comes primarily from different step_idx values
+# (context-window alignment), not from noise amplitude.  0.05σ is just enough
+# to make each trajectory unique even when the same step is sampled twice.
+_DATA_SAMPLE_NOISE_SCALE: float = 0.05
+
 
 def _resolve_device(device: str) -> str:
     """Resolve ``"auto"`` to the actual device string (``"cuda"`` or ``"cpu"``)."""
@@ -695,6 +701,16 @@ class BrainDynamicsSimulator:
         _predictor = getattr(getattr(self.model, "model", None), "predictor", None)
         return int(getattr(_predictor, "context_length", 200))
 
+    def _get_stride(self) -> int:
+        """Return the sliding-window stride (``context_length // 4``, min 1).
+
+        This is the single canonical definition of the 75% overlap stride used by
+        both ``n_temporal_windows`` and ``_get_context_for_window``.  Callers
+        (e.g. ``run_free_dynamics``) should use this method rather than
+        duplicating the formula.
+        """
+        return max(1, self._get_context_length() // 4)
+
     @property
     def n_temporal_windows(self) -> int:
         """
@@ -1261,6 +1277,7 @@ class BrainDynamicsSimulator:
         self, rng: Optional[np.random.Generator] = None,
         noise_scale: float = _INITIAL_STATE_NOISE_SCALE,
         from_data: bool = False,
+        step_idx: Optional[int] = None,
     ) -> np.ndarray:
         """
         采样随机初始脑状态。
@@ -1271,19 +1288,30 @@ class BrainDynamicsSimulator:
         （``mean + N(0, noise_scale) × std``）。适合刺激分析（小扰动、少瞬态）。
 
         *数据采样模式* ``from_data=True``（自由动力学推荐）:  从 ``base_graph``
-        时序中随机抽取一个时间步 t，返回 ``data[:, t]`` 加上微量扰动。
+        时序中抽取指定（``step_idx``）或随机时间步，返回该步的值加上微量扰动。
 
-        科学依据：用于自由动力学分析时，初始状态的**空间相关结构**至关重要。
-        采用 ``mean + 各向同性噪声`` 会生成无空间相关的 x0（BOLD 激活在各脑区
-        独立采样），而真实脑状态具有强空间相关性（功能连接）。模型编码器需要
-        数百步才能将非相关初始状态"修正"为具有正确空间结构的状态，这一修正
-        过程成为 PCA 的主成分（PC1 可高达 86% 方差），遮盖真实脑动力学。
-        ``from_data=True`` 直接采样真实 BOLD 时间步，空间相关性与上下文历史
-        一致，消除修正瞬态，使 PCA 反映真实动力学模态。
+        **科学依据与最佳实践（自由动力学分析）**:
 
-        **joint 模式**：分别为 fMRI 和 EEG 部分各自采样，再拼接成联合状态
-        向量 ``[z_fmri | z_eeg]``，形状 ``(n_fmri_regions + n_eeg_regions,)``。
-        joint 模式暂不支持 ``from_data=True``（两种模态时间轴可能不对齐）。
+        当 ``step_idx`` 指向对应时序窗口的"紧随步"时（参见 ``run_free_dynamics``
+        计算逻辑），上下文窗口与 x0 构成一段 **连续的 BOLD 片段**：
+
+        ::
+
+            context_window_k = data[:, T - ctx - k*s : T - k*s]
+            x0               = data[:, T - k*s]          (窗口紧随步)
+
+        这意味着：
+
+        1. **零时间错位**：上下文末步 + x0 = 连续的 BOLD 信号，无人为拼接。
+        2. **零空间结构修正**：x0 已包含真实的脑连接空间相关性，模型无需"修正"
+           各向同性初始状态，消除了通常主导 PC1（86%+ 方差）的长瞬态漂移。
+        3. **轨迹立即进入自然动力学**：早期步（上下文仍有真实数据）即可展示
+           振荡/混沌绕转运动，而非向吸引子漂移的直线。
+
+        使用随机 step_idx (step_idx=None, from_data=True)：保留空间相关性但
+        引入时间错位，效果优于均值+噪声，但不如上下文对齐。
+
+        **joint 模式**：fMRI/EEG 时间轴可能不对齐，暂退化为噪声采样。
 
         检测方式：``base_graph[modality].x.min() < -0.1`` → z-scored；不裁剪。
 
@@ -1291,10 +1319,11 @@ class BrainDynamicsSimulator:
             rng:         随机数生成器；None → 使用 self.seed 重新创建。
             noise_scale: 噪声幅度（单位：数据标准差 σ）。
                          ``from_data=False`` 时：默认 0.3σ（小扰动）。
-                         ``from_data=True`` 时：默认 0.1σ（仅用于避免轨迹重复）。
-            from_data:   True → 从 base_graph 时序随机抽取时间步作为初始状态
-                         （推荐用于自由动力学分析，可消除空间相关修正瞬态）。
+                         ``from_data=True`` 时：默认 0.05σ（维持多样性的微扰）。
+            from_data:   True → 从 base_graph 时序采样（推荐用于自由动力学分析）。
                          False → 均值 + 各向同性噪声（旧行为，用于刺激分析）。
+            step_idx:    仅在 ``from_data=True`` 时有效。指定时序中的采样步索引
+                         （用于上下文对齐，见上文科学依据）；None → 随机采样。
         """
         if rng is None:
             rng = np.random.default_rng(self.seed)
@@ -1302,7 +1331,7 @@ class BrainDynamicsSimulator:
         if self.modality == "joint":
             # Joint mode: use noise-based sampling (fMRI/EEG time axes may differ).
             # When from_data is requested, fall back gracefully.
-            _ns = noise_scale if not from_data else 0.1
+            _ns = noise_scale if not from_data else _DATA_SAMPLE_NOISE_SCALE
             fmri_noise = rng.normal(0.0, _ns, self.n_fmri_regions).astype(np.float32)
             fmri_x0_z = fmri_noise  # z-score ≈ mean_z + noise (mean_z ≈ 0)
 
@@ -1316,22 +1345,26 @@ class BrainDynamicsSimulator:
         std_state  = np.maximum(data_np.std(axis=1), _STD_GUARD)  # [N]
 
         if from_data:
-            # ── Data-sample mode: pick a random time step from actual BOLD/EEG ──
-            # The selected column data[:, t] is a real brain state with full
-            # spatial correlation structure, so the model encoder sees a context
-            # that matches the injected x0 in distribution.  This eliminates the
-            # long "spatial-structure correction" transient that dominates PC1
-            # when using mean + isotropic-noise initial states.
+            # ── Data-sample mode ─────────────────────────────────────────────────
+            # Pick a specific or random time step from the BOLD/EEG recording.
+            # The selected column data[:, t] is a real brain state with the full
+            # spatial correlation structure learned during training.
             T_data = data_np.shape[1]
-            t = int(rng.integers(0, T_data))
+            if step_idx is not None:
+                # Use the caller-specified step, wrapping if out of range.
+                t = int(step_idx) % T_data
+            else:
+                t = int(rng.integers(0, T_data))
             x0 = data_np[:, t].copy().astype(np.float32)
-            # Tiny perturbation (default 0.1σ) ensures each trajectory starts from
-            # a slightly different state even when the same time step is sampled.
-            _ns = noise_scale if noise_scale != _INITIAL_STATE_NOISE_SCALE else 0.1
+            # Micro-perturbation: makes each trajectory unique while preserving the
+            # spatial structure.  Default _DATA_SAMPLE_NOISE_SCALE (0.05σ) is
+            # intentionally small — diversity across trajectories is primarily
+            # achieved via different step_idx values (context-window alignment).
+            _ns = noise_scale if noise_scale != _INITIAL_STATE_NOISE_SCALE else _DATA_SAMPLE_NOISE_SCALE
             noise = rng.normal(0.0, _ns, self.n_regions).astype(np.float32)
             x0 = x0 + noise * std_state
         else:
-            # ── Noise-perturb mode (original behaviour): mean + N(0, noise_scale×std) ─
+            # ── Noise-perturb mode (original behaviour) ──────────────────────────
             mean_state = data_np.mean(axis=1)            # [N]
             noise = rng.normal(0.0, noise_scale, self.n_regions).astype(np.float32)
             x0 = (mean_state + noise * std_state).astype(np.float32)

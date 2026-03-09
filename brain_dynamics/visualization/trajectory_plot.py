@@ -202,11 +202,12 @@ def plot_pca_trajectories(
     ax_2d.grid(True, alpha=0.25)
 
     # ── Panel 2: Density heatmap of all visited states ────────────────────────
-    # Use only the LATE portion of each trajectory (second half after burnin) for
-    # the density map.  Early post-burnin steps may still be dominated by the
-    # context-washout transient; the late portion better represents the attractor.
-    late_start = T // 2  # skip first half of post-burnin trajectory
-    all_2d = np.vstack([traj_2d[late_start:] for traj_2d in proj2d])  # late states only
+    # Use ALL post-burnin steps: this captures BOTH the early context-guided
+    # oscillatory phase (where trajectories orbit the attractor) and the later
+    # free-run phase.  The combination produces the expected ring-like density
+    # (orbit path) converging toward a bright spot (free-run attractor), which
+    # correctly reflects near-critical bounded-chaos dynamics.
+    all_2d = np.vstack(proj2d)               # (show_n*T, 2)
     # 2D histogram as density proxy
     x_range = (all_2d[:, 0].min(), all_2d[:, 0].max())
     y_range = (all_2d[:, 1].min(), all_2d[:, 1].max())
@@ -237,7 +238,7 @@ def plot_pca_trajectories(
                    marker="*", label="Final states")
     ax_den.set_xlabel(pc1_lbl, fontsize=9)
     ax_den.set_ylabel(pc2_lbl, fontsize=9)
-    ax_den.set_title("State Density Heatmap\n(late-stage: bright = attractor)", fontsize=10)
+    ax_den.set_title("State Density Heatmap\n(bright = attractor)", fontsize=10)
     ax_den.legend(fontsize=7, loc="upper left")
 
     # ── Panel 3: 3D PCA ───────────────────────────────────────────────────────

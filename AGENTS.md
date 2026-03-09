@@ -786,3 +786,51 @@ r ≈ 0 的两个神经生物学合理原因：
 - **P2-1**: pipeline_report.json 新增 run_timestamp、metadata (seed/n_init/steps/modality/cfg_hash)、dmd_interpretation_note。
 
 *Last updated: 2026-03-09*
+
+### [2026-03-09] 自由动力学 PCA 直线漂移 Bug — 上下文末端对齐初始状态修复
+
+#### 现象
+PCA 轨迹图显示所有轨迹沿 PC1（占 86%+ 方差）作单向漂移（右→左直线），而非预期的绕吸引子有界混沌轨道（"绕圈"）。近临界脑系统的 PCA 应呈现无规则但有界的轨道状态密度图。
+
+#### 根因链（三级叠加）
+
+**Bug 1（主因）: x0 与上下文窗口时间不对齐**
+- 旧版 `run_free_dynamics` 从数据随机抽取时间步 t（或用均值+噪声），注入到上下文窗口 k 的最后一步。
+- 上下文窗口 k 覆盖 `data[:, T-ctx-k*s : T-k*s]`，平均末步为 `T - k*s - 1`。
+- 随机时间步 t 与上下文末步的平均时间差 ≈ **120 TR（240 秒）**，跨越约 12 个 BOLD 振荡周期。
+- 模型编码器需将"错误时相"的脑状态修正到正确时相，修正路径主导了 PC1。
+
+**Bug 2: 模型 MSE 训练在自由运行模式下回归均值**
+- `TwinBrainDigitalTwin` 以 50 步分块预测，MSE 训练的最优多步预测器在 Lyapunov 时间尺度之后趋向条件均值（无条件均值 = 训练数据均值 ≈ 0）。
+- 上下文被真实 BOLD 冲刷后（200 步），模型进入"自由运行"，预测值向 0 漂移——单向直线。
+
+**Bug 3: 过大的 burnin 丢弃自然动力学阶段**
+- 旧版 burnin = max(context_length=200, T//10=50) = 200，恰好丢弃了上下文仍有真实 BOLD 数据的阶段。
+- 真实 BOLD 引导阶段（步骤 0–200）才包含振荡/圆周运动；burnin=200 后只剩自由运行漂移。
+
+#### 修复
+
+**`BrainDynamicsSimulator`**:
+1. 新增常量 `_DATA_SAMPLE_NOISE_SCALE = 0.05`（模块级，消除魔数）。
+2. 新增方法 `_get_stride()`：`max(1, _get_context_length() // 4)`，唯一规范定义，供所有调用方使用。
+3. `sample_random_state()` 新增 `step_idx: Optional[int]` 参数：`from_data=True` + `step_idx` 指定时，采样该精确步而非随机步。
+
+**`run_free_dynamics`**:
+- 对每个时序窗口 k，计算上下文对齐步：`step = min(T - k*stride, T-1)`
+  - window 0: `step = T-1`（上下文末步，等效 x0=None，立即进入自然延续）
+  - window k≥1: `step = T - k*stride`（上下文结束后的紧随步）
+- 使用 `simulator._get_stride()`（不重复公式）
+- **结果**: context + x0 = 连续 BOLD 片段，时间对齐误差 **0–1 TR**（旧版 120 TR）
+
+**`dynamics_pipeline/pipeline.py`**:
+- 新增 `_pca_burnin(n_steps)` 辅助函数，统一 `run_phase3_dynamics` 和 `_save_summary_plots` 两处 burnin 计算，消除重复。
+- burnin 公式：`min(max(10, T//10), T//2)`（小 burnin，消除微扰噪声即可）
+
+**`trajectory_plot.py`**:
+- 密度热图回归使用全部后-burnin 步（而非上次改动的"后半段"）：早期振荡阶段（上下文引导）+ 晚期自由运行阶段均包含，形成"轨道收敛到吸引点"的正确近临界密度形态。
+
+#### 规则（新增）
+- `run_free_dynamics` 的初始状态采样**必须**使用 `simulator.sample_random_state(rng, from_data=True, step_idx=_x0_step_for_window(k))`。随机步（无 step_idx）或均值+噪声均会引入时间错位，破坏 PCA 可视化。
+- 滑窗步长计算**只能**通过 `simulator._get_stride()` 获取，不在外部重复 `max(1, ctx//4)`。
+- `_DATA_SAMPLE_NOISE_SCALE = 0.05`：数据采样模式的扰动幅度。多样性主要来自不同 step_idx，不来自噪声幅度；0.05σ 仅保证同 step_idx 的两条轨迹不完全重叠。
+- PCA burnin = `_pca_burnin(T)` = `min(max(10, T//10), T//2)`。不应使用 context_length 作为 burnin 下界（会丢弃珍贵的上下文引导振荡阶段）。
