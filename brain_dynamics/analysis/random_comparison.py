@@ -515,7 +515,106 @@ def run_random_model_comparison(
 # TASK 1: Graph-structure comparison (no surrogate dynamics)
 # ---------------------------------------------------------------------------
 
-def _degree_preserving_rewire(W: np.ndarray, n_swaps: int, seed: int) -> np.ndarray:
+def _run_tanh_trajectories(
+    W: np.ndarray,
+    n_init: int = 10,
+    steps: int = 200,
+    seed: int = 0,
+) -> np.ndarray:
+    """Simulate ``x(t+1) = clip(tanh(W @ x), 0, 1)`` from random initial states.
+
+    This is the same nonlinear dynamics rule used internally by
+    ``_wolf_lle_random`` and ``run_random_trajectories``.  It is used here
+    to generate trajectory-based metrics (LLE, PCA dim, D2) for any arbitrary
+    connectivity matrix ``W`` — brain, degree-preserving, or fully-random —
+    so that all three network types are compared under **the same dynamics
+    rule**, making the comparison scientifically valid.
+
+    Parameters
+    ----------
+    W:
+        Square connectivity matrix ``(N, N)``.
+    n_init:
+        Number of independent trajectories from uniform random initial states.
+    steps:
+        Prediction steps per trajectory.
+    seed:
+        Base random seed.
+
+    Returns
+    -------
+    trajectories: shape ``(n_init, steps, N)``, dtype float32.
+    """
+    rng = np.random.default_rng(seed)
+    N = W.shape[0]
+    trajs = np.zeros((n_init, steps, N), dtype=np.float32)
+    for i in range(n_init):
+        x = rng.random(N)
+        for t in range(steps):
+            x = np.clip(np.tanh(W @ x), 0.0, 1.0)
+            trajs[i, t] = x.astype(np.float32)
+    return trajs
+
+
+def _tanh_dynamics_metrics(
+    W: np.ndarray,
+    n_init: int,
+    steps: int,
+    lle_steps: int,
+    seed: int,
+    rng: np.random.Generator,
+) -> Dict:
+    """Compute LLE, PCA dim-90%, and D2 for ``tanh(W @ x)`` dynamics.
+
+    Parameters
+    ----------
+    W:
+        Connectivity matrix ``(N, N)``.
+    n_init:
+        Trajectories for PCA/D2 computation.
+    steps:
+        Steps per trajectory for PCA/D2.
+    lle_steps:
+        Total Wolf-Benettin steps for LLE estimation.
+    seed:
+        Random seed for trajectories.
+    rng:
+        Shared RNG used for the Wolf-Benettin perturbation direction.
+
+    Returns
+    -------
+    dict with keys ``lle``, ``pca_dim_90pct``, ``d2``.
+    """
+    N = W.shape[0]
+
+    # LLE via Wolf-Benettin (same method as _wolf_lle_random)
+    x0 = rng.random(N)
+    lle = _wolf_lle_random(W, x0=x0, steps=lle_steps, rng=rng)
+
+    # Trajectories for PCA and D2
+    trajs = _run_tanh_trajectories(W, n_init=n_init, steps=steps, seed=seed)
+
+    # PCA intrinsic dimension (90 % variance threshold)
+    X = trajs.reshape(-1, N).astype(np.float64)
+    X -= X.mean(axis=0)
+    try:
+        _, s, _ = np.linalg.svd(X, full_matrices=False)
+        v = s ** 2
+        cumvar = np.cumsum(v) / (v.sum() + 1e-30)
+        pca_dim = int(np.searchsorted(cumvar, 0.90) + 1)
+    except Exception:
+        pca_dim = -1
+
+    # Correlation dimension D2 (use first-region time series for speed)
+    try:
+        from analysis.embedding_dimension import correlation_dimension
+        ts = trajs[:, :, 0].reshape(-1).astype(np.float64)
+        d2 = float(correlation_dimension(ts, max_dim=20, n_points=min(2000, len(ts))))
+    except Exception:
+        d2 = float("nan")
+
+    return {"lle": float(lle), "pca_dim_90pct": pca_dim, "d2": d2}
+
     """Maslov-Sneppen degree-preserving edge rewiring for a weighted matrix.
 
     Rewires ``n_swaps`` valid edge-pairs while preserving the row/column
@@ -572,23 +671,35 @@ def run_graph_structure_comparison(
     lyapunov_results: Optional[Dict] = None,
     attractor_results: Optional[Dict] = None,
     n_random: int = 5,
+    n_tanh_init: int = 10,
+    tanh_steps: int = 200,
+    lle_steps: int = 400,
     seed: int = 42,
     output_dir: Optional[Path] = None,
 ) -> Dict:
     """TASK 1: Compare brain graph against random-graph baselines.
 
-    Compares three network types using a combination of
-    (a) GNN-derived dynamics metrics (LLE, D2, PCA dim) from the
-    pre-generated Phase 1 trajectories and
-    (b) analytical spectral metrics (participation ratio, spectral
-    radius, spectral gap ratio) computed directly from the connectivity
-    matrices — **no surrogate dynamics model is used**.
+    Compares three network types:
 
-    Network types
-    -------------
-    1. Original brain graph  (W unchanged)
-    2. Degree-preserving rewire  (Maslov-Sneppen, same weight distribution)
-    3. Fully random Gaussian  (same spectral radius, same weight variance)
+    1. **Original brain graph** (W unchanged) — GNN dynamics metrics from
+       Phase 1 trajectories + tanh(W @ x) dynamics for fair cross-network
+       comparison.
+    2. **Degree-preserving rewire** (Maslov-Sneppen) — same degree/weight
+       distribution, edges shuffled.  Tests whether the *specific* hub-to-hub
+       wiring pattern (beyond degree sequence) matters for dynamics.
+    3. **Fully random Gaussian** (same spectral radius) — tests whether
+       the brain graph's dynamics are explained by scale alone.
+
+    **Dynamics rule** for baselines 2 and 3: ``x(t+1) = clip(tanh(W @ x), 0, 1)``
+    (same rule used in ``_wolf_lle_random`` and ``run_random_trajectories``).
+    This allows direct comparison of LLE, PCA dim, and D2 across all three
+    network types using an identical dynamics model — making the scientific
+    conclusion about graph structure's role unambiguous.
+
+    For the brain graph, both the GNN-derived metrics (from Phase 1 trajectories)
+    **and** the tanh(W_brain @ x) metrics are reported; ``lle_gnn``, ``d2_gnn``,
+    and ``pca_dim_gnn`` come from the GNN; ``lle``, ``d2``, and ``pca_dim_90pct``
+    come from the tanh rule and are directly comparable to the baselines.
 
     Parameters
     ----------
@@ -597,14 +708,21 @@ def run_graph_structure_comparison(
     trajectories:
         GNN-generated trajectories ``(n_traj, T, N)`` from Phase 1.
     lyapunov_results:
-        Phase 3 Lyapunov results dict (provides real model LLE).
+        Phase 3 Lyapunov results dict (provides GNN model LLE).
     attractor_results:
         Phase 3 attractor analysis dict (provides n_attractors).
     n_random:
-        Number of independent random realisations to average spectral
-        metrics over (for the two random baselines).
+        Number of independent random realisations to average over for the
+        two random baselines (LLE averaged over n_random matrices; PCA/D2
+        computed on first realisation for speed).
+    n_tanh_init:
+        Trajectories per matrix for PCA/D2 computation (tanh dynamics).
+    tanh_steps:
+        Steps per trajectory (tanh dynamics).
+    lle_steps:
+        Wolf-Benettin steps for LLE estimation.
     seed:
-        Random seed.
+        Base random seed.
     output_dir:
         Directory to save ``random_graph_comparison.csv`` and
         ``random_graph_dynamics.png``.
@@ -612,17 +730,21 @@ def run_graph_structure_comparison(
     Returns
     -------
     dict with keys ``'brain_graph'``, ``'degree_preserving'``,
-    ``'fully_random'``.
+    ``'fully_random'``, and ``'note'``.
     """
     W = np.asarray(W, dtype=np.float64)
     N = W.shape[0]
     trajs = np.asarray(trajectories, dtype=np.float64)
     rng = np.random.default_rng(seed)
 
-    logger.info("Graph structure comparison: N=%d, n_random=%d", N, n_random)
+    logger.info(
+        "Graph structure comparison: N=%d, n_random=%d, n_tanh_init=%d, "
+        "tanh_steps=%d, lle_steps=%d",
+        N, n_random, n_tanh_init, tanh_steps, lle_steps,
+    )
 
-    # --- GNN dynamics metrics for real brain graph ---
-    real_lle = (lyapunov_results or {}).get("primary_mean", float("nan"))
+    # ── 1. GNN dynamics metrics for real brain graph ──────────────────────────
+    real_lle_gnn = (lyapunov_results or {}).get("primary_mean", float("nan"))
     real_n_attractors = (attractor_results or {}).get("n_attractors", float("nan"))
 
     X = trajs.reshape(-1, N)
@@ -631,29 +753,41 @@ def run_graph_structure_comparison(
         _, s_pca, _ = np.linalg.svd(X, full_matrices=False)
         v = s_pca ** 2
         cumvar = np.cumsum(v) / (v.sum() + 1e-30)
-        real_pca_dim = int(np.searchsorted(cumvar, 0.90) + 1)
+        real_pca_dim_gnn = int(np.searchsorted(cumvar, 0.90) + 1)
     except Exception:
-        real_pca_dim = -1
+        real_pca_dim_gnn = -1
 
     try:
         from analysis.embedding_dimension import correlation_dimension
         flat = trajs[:, :, 0].reshape(-1)
-        real_d2 = float(correlation_dimension(flat, max_dim=20, n_points=2000))
+        real_d2_gnn = float(correlation_dimension(flat, max_dim=20, n_points=2000))
     except Exception:
-        real_d2 = float("nan")
+        real_d2_gnn = float("nan")
 
-    brain_spectral = _spectral_metrics_rc(W)
-    brain_entry = {
-        "network": "Brain (GNN)",
-        "lle": float(real_lle),
-        "d2": float(real_d2),
-        "pca_dim_90pct": int(real_pca_dim),
-        "n_attractors": float(real_n_attractors),
-        **brain_spectral,
-    }
+    # ── 2. tanh(W @ x) dynamics for fair three-way comparison ────────────────
+    # Helper to average metrics over n_random matrix realisations.
+    def _avg_tanh_metrics(matrices: List[np.ndarray]) -> Dict:
+        """Average LLE over all matrices; PCA/D2 from first matrix only."""
+        lles = []
+        for W_i in matrices:
+            x0_i = rng.random(N)
+            lles.append(_wolf_lle_random(W_i, x0=x0_i, steps=lle_steps, rng=rng))
+        pca_d2 = _tanh_dynamics_metrics(
+            matrices[0],
+            n_init=n_tanh_init,
+            steps=tanh_steps,
+            lle_steps=lle_steps,
+            seed=seed,
+            rng=rng,
+        )
+        return {
+            "lle": float(np.mean(lles)),
+            "lle_std": float(np.std(lles)),
+            "pca_dim_90pct": pca_d2["pca_dim_90pct"],
+            "d2": pca_d2["d2"],
+        }
 
-    # --- Spectral metrics for random baselines ---
-    def _avg_spectral(matrices):
+    def _avg_spectral(matrices: List[np.ndarray]) -> Dict:
         metrics_list = [_spectral_metrics_rc(m) for m in matrices]
         keys = ["spectral_radius", "participation_ratio", "spectral_gap_ratio"]
         return {
@@ -661,27 +795,50 @@ def run_graph_structure_comparison(
             for k in keys
         }
 
-    # Degree-preserving rewire
-    # n_swaps = 10% of N² = empirically sufficient to decorrelate edge positions
-    # while the max_attempts guard in _degree_preserving_rewire prevents infinite loops.
+    # Brain graph — tanh dynamics (comparable to baselines)
+    brain_tanh = _tanh_dynamics_metrics(
+        W,
+        n_init=n_tanh_init,
+        steps=tanh_steps,
+        lle_steps=lle_steps,
+        seed=seed,
+        rng=rng,
+    )
+    brain_spectral = _spectral_metrics_rc(W)
+    brain_entry = {
+        "network": "Brain (GNN)",
+        # GNN metrics — gold standard for the trained model
+        "lle_gnn": float(real_lle_gnn),
+        "d2_gnn": float(real_d2_gnn),
+        "pca_dim_gnn": int(real_pca_dim_gnn),
+        "n_attractors": float(real_n_attractors),
+        # tanh(W @ x) metrics — directly comparable to baselines
+        "lle": brain_tanh["lle"],
+        "d2": brain_tanh["d2"],
+        "pca_dim_90pct": brain_tanh["pca_dim_90pct"],
+        **brain_spectral,
+    }
+
+    # ── 3. Degree-preserving rewire (Maslov-Sneppen) ──────────────────────────
+    # n_swaps = 10% of N² — empirically sufficient to decorrelate edge positions
+    # while the max_attempts guard prevents infinite loops on dense graphs.
     n_swaps = max(N * N // 10, 100)
     dp_matrices = [
         _degree_preserving_rewire(W, n_swaps=n_swaps, seed=seed + i)
         for i in range(n_random)
     ]
+    dp_tanh = _avg_tanh_metrics(dp_matrices)
     dp_spectral = _avg_spectral(dp_matrices)
     dp_entry = {
         "network": "Degree-preserving random",
-        "lle": float("nan"),   # No GNN trajectory available
-        "d2": float("nan"),
-        "pca_dim_90pct": -1,
-        "n_attractors": float("nan"),
+        "n_attractors": float("nan"),   # no GNN trajectory available
+        **dp_tanh,
         **dp_spectral,
     }
 
-    # Fully random Gaussian (same spectral radius as brain)
+    # ── 4. Fully random Gaussian (same spectral radius as brain) ─────────────
     target_sr = brain_spectral["spectral_radius"]
-    fr_matrices = []
+    fr_matrices: List[np.ndarray] = []
     for i in range(n_random):
         W_fr = rng.standard_normal((N, N))
         W_fr /= np.sqrt(N)
@@ -690,25 +847,34 @@ def run_graph_structure_comparison(
         if sr_fr > 1e-8:
             W_fr *= target_sr / sr_fr
         fr_matrices.append(W_fr)
+    fr_tanh = _avg_tanh_metrics(fr_matrices)
     fr_spectral = _avg_spectral(fr_matrices)
     fr_entry = {
         "network": "Fully random Gaussian",
-        "lle": float("nan"),
-        "d2": float("nan"),
-        "pca_dim_90pct": -1,
         "n_attractors": float("nan"),
+        **fr_tanh,
         **fr_spectral,
     }
+
+    logger.info(
+        "  Brain tanh LLE=%.4f | Degree-preserving LLE=%.4f±%.4f | "
+        "Fully-random LLE=%.4f±%.4f",
+        brain_tanh["lle"],
+        dp_tanh["lle"], dp_tanh["lle_std"],
+        fr_tanh["lle"], fr_tanh["lle_std"],
+    )
 
     results = {
         "brain_graph": brain_entry,
         "degree_preserving": dp_entry,
         "fully_random": fr_entry,
         "note": (
-            "GNN dynamics metrics (LLE, D2, PCA dim) are only available for "
-            "the real brain graph (from Phase 1 trajectories). Random baselines "
-            "are characterised by analytical spectral metrics (participation ratio, "
-            "spectral radius, spectral gap) which correlate with dynamical dimensionality."
+            "All three network types are compared under the SAME dynamics rule "
+            "tanh(W @ x): (1) original brain graph W, (2) Maslov-Sneppen "
+            "degree-preserving rewire of W (same degree & weight distribution, "
+            "shuffled edge topology), (3) fully random Gaussian W (same spectral "
+            "radius). GNN dynamics metrics (lle_gnn, d2_gnn, pca_dim_gnn) are "
+            "additionally reported for the brain graph from Phase 1 trajectories."
         ),
     }
 
@@ -724,8 +890,13 @@ def run_graph_structure_comparison(
 
 
 def _save_rg_csv(rows: List[Dict], path: Path) -> None:
-    fieldnames = ["network", "lle", "d2", "pca_dim_90pct",
-                  "spectral_radius", "participation_ratio", "spectral_gap_ratio"]
+    fieldnames = [
+        "network",
+        "lle", "lle_std", "lle_gnn",
+        "d2", "d2_gnn",
+        "pca_dim_90pct", "pca_dim_gnn",
+        "spectral_radius", "participation_ratio", "spectral_gap_ratio",
+    ]
     try:
         with open(path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -756,13 +927,19 @@ def _save_rg_plot(rows: List[Dict], path: Path) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle("Graph Structure Comparison (brain vs random baselines)", fontsize=11)
 
-    # Panel 1: Spectral radius
-    sr_vals = [r["spectral_radius"] for r in rows]
-    axes[0].bar(x, sr_vals, color=colors, width=0.5)
+    # Panel 1: LLE comparison (all three under same tanh dynamics)
+    lle_vals = [r.get("lle", float("nan")) for r in rows]
+    lle_stds = [r.get("lle_std", 0.0) for r in rows]
+    valid = [not np.isnan(v) for v in lle_vals]
+    bar_vals = [v if not np.isnan(v) else 0.0 for v in lle_vals]
+    bars = axes[0].bar(x, bar_vals, color=colors, width=0.5,
+                       yerr=[s if v else 0.0 for s, v in zip(lle_stds, valid)],
+                       capsize=4)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
-    axes[0].set_ylabel("Spectral radius")
-    axes[0].set_title("Spectral radius")
+    axes[0].set_ylabel("LLE (tanh dynamics)")
+    axes[0].set_title("LLE: brain vs degree-preserving vs random")
+    axes[0].axhline(0, color="k", linestyle="--", alpha=0.5)
     axes[0].grid(True, axis="y", alpha=0.3)
 
     # Panel 2: Participation ratio (spectral dimensionality proxy)
@@ -774,21 +951,14 @@ def _save_rg_plot(rows: List[Dict], path: Path) -> None:
     axes[1].set_title("Participation ratio")
     axes[1].grid(True, axis="y", alpha=0.3)
 
-    # Panel 3: Brain GNN LLE / D2 vs "N/A" for random (as text note)
-    lle_vals = [r["lle"] if not np.isnan(r.get("lle", float("nan"))) else 0.0
-                for r in rows]
-    bars = axes[2].bar(x, lle_vals, color=colors, width=0.5)
+    # Panel 3: PCA dim (tanh dynamics)
+    pca_vals = [max(r.get("pca_dim_90pct", -1), 0) for r in rows]
+    axes[2].bar(x, pca_vals, color=colors, width=0.5)
     axes[2].set_xticks(x)
     axes[2].set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
-    axes[2].set_ylabel("LLE (GNN, brain only)")
-    axes[2].set_title("LLE (brain GNN vs random N/A)")
-    axes[2].axhline(0, color="k", linestyle="--", alpha=0.5)
+    axes[2].set_ylabel("PCA intrinsic dim (90% variance)")
+    axes[2].set_title("Intrinsic dimensionality")
     axes[2].grid(True, axis="y", alpha=0.3)
-    for bar, row in zip(bars, rows):
-        if np.isnan(row.get("lle", float("nan"))):
-            axes[2].text(bar.get_x() + bar.get_width() / 2, 0.002,
-                         "N/A\n(spectral\nonly)", ha="center", va="bottom",
-                         fontsize=7, color="gray")
 
     plt.tight_layout()
     plt.savefig(str(path), dpi=150, bbox_inches="tight")

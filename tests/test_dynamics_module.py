@@ -2917,5 +2917,137 @@ class TestQ4DeltaRhoSignConvention(unittest.TestCase):
                              "Large |delta_rho| must not produce 'similar' judgment")
 
 
+class TestGraphStructureComparison(unittest.TestCase):
+    """
+    Tests for run_graph_structure_comparison — TASK 1.
+
+    Verifies that the degree-preserving baseline now reports actual trajectory-
+    based dynamics metrics (LLE, PCA dim, D2) via tanh(W @ x) dynamics, not NaN.
+    This is the implementation of the third control condition: hub/degree matters.
+    """
+
+    def _import(self):
+        import sys
+        _bd = Path(__file__).parent.parent / "brain_dynamics"
+        if str(_bd) not in sys.path:
+            sys.path.insert(0, str(_bd))
+        from analysis.random_comparison import (
+            run_graph_structure_comparison,
+            _run_tanh_trajectories,
+            _tanh_dynamics_metrics,
+        )
+        return run_graph_structure_comparison, _run_tanh_trajectories, _tanh_dynamics_metrics
+
+    def test_run_tanh_trajectories_shape(self):
+        """_run_tanh_trajectories should return (n_init, steps, N) float32 array."""
+        _, _run_tanh_trajectories, _ = self._import()
+        import numpy as np
+        N = 8
+        W = np.random.randn(N, N) * 0.3
+        trajs = _run_tanh_trajectories(W, n_init=4, steps=10, seed=0)
+        self.assertEqual(trajs.shape, (4, 10, N))
+        self.assertTrue(np.all(trajs >= 0.0), "tanh clip should keep values >= 0")
+        self.assertTrue(np.all(trajs <= 1.0), "tanh clip should keep values <= 1")
+
+    def test_degree_preserving_has_dynamics_metrics(self):
+        """degree_preserving entry must have finite lle, pca_dim_90pct after the fix."""
+        run_graph_structure_comparison, _, _ = self._import()
+        import numpy as np
+        N = 8
+        rng = np.random.default_rng(0)
+        W = rng.standard_normal((N, N)) * 0.5
+        trajs = rng.random((3, 20, N)).astype(np.float32)
+        result = run_graph_structure_comparison(
+            W=W,
+            trajectories=trajs,
+            n_random=2,
+            n_tanh_init=3,
+            tanh_steps=30,
+            lle_steps=50,
+            seed=0,
+        )
+        self.assertIn("degree_preserving", result)
+        dp = result["degree_preserving"]
+        # Before fix: lle was always NaN; after fix it must be a finite float
+        self.assertIn("lle", dp)
+        self.assertTrue(np.isfinite(dp["lle"]),
+                        f"degree_preserving lle should be finite, got {dp['lle']}")
+        self.assertGreater(dp["pca_dim_90pct"], 0,
+                           "degree_preserving pca_dim_90pct should be > 0")
+        # lle_std must be present (from averaging over n_random matrices)
+        self.assertIn("lle_std", dp)
+
+    def test_fully_random_has_dynamics_metrics(self):
+        """fully_random entry must have finite lle after the fix."""
+        run_graph_structure_comparison, _, _ = self._import()
+        import numpy as np
+        N = 8
+        rng = np.random.default_rng(1)
+        W = rng.standard_normal((N, N)) * 0.5
+        trajs = rng.random((3, 20, N)).astype(np.float32)
+        result = run_graph_structure_comparison(
+            W=W,
+            trajectories=trajs,
+            n_random=2,
+            n_tanh_init=3,
+            tanh_steps=30,
+            lle_steps=50,
+            seed=1,
+        )
+        fr = result["fully_random"]
+        self.assertTrue(np.isfinite(fr["lle"]),
+                        f"fully_random lle should be finite, got {fr['lle']}")
+
+    def test_brain_entry_has_gnn_and_tanh_metrics(self):
+        """brain_graph entry must have both lle_gnn (GNN) and lle (tanh)."""
+        run_graph_structure_comparison, _, _ = self._import()
+        import numpy as np
+        N = 8
+        rng = np.random.default_rng(2)
+        W = rng.standard_normal((N, N)) * 0.5
+        trajs = rng.random((3, 20, N)).astype(np.float32)
+        result = run_graph_structure_comparison(
+            W=W,
+            trajectories=trajs,
+            n_random=2,
+            n_tanh_init=3,
+            tanh_steps=30,
+            lle_steps=50,
+            seed=2,
+        )
+        bg = result["brain_graph"]
+        # GNN metrics from Phase 1 trajectories
+        self.assertIn("lle_gnn", bg)
+        self.assertIn("d2_gnn", bg)
+        self.assertIn("pca_dim_gnn", bg)
+        # tanh dynamics metrics for fair comparison
+        self.assertIn("lle", bg)
+        self.assertIn("pca_dim_90pct", bg)
+
+    def test_three_way_comparison_produces_valid_structure(self):
+        """All three entries must be present and have required keys."""
+        run_graph_structure_comparison, _, _ = self._import()
+        import numpy as np
+        N = 8
+        rng = np.random.default_rng(3)
+        W = rng.standard_normal((N, N)) * 0.5
+        trajs = rng.random((3, 20, N)).astype(np.float32)
+        result = run_graph_structure_comparison(
+            W=W,
+            trajectories=trajs,
+            n_random=2,
+            n_tanh_init=3,
+            tanh_steps=30,
+            lle_steps=50,
+            seed=3,
+        )
+        for key in ("brain_graph", "degree_preserving", "fully_random"):
+            self.assertIn(key, result)
+            entry = result[key]
+            for metric in ("lle", "pca_dim_90pct", "spectral_radius"):
+                self.assertIn(metric, entry,
+                              f"{key} must have '{metric}' key")
+
+
 if __name__ == "__main__":
     unittest.main()
