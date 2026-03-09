@@ -868,18 +868,57 @@ class BrainDynamicsSimulator:
             end = T - window_idx * stride
             start = end - ctx_len
             if start < 0 or end <= 0:
-                # Requested window extends before the start of the recording;
-                # fall back to the oldest full-length window available.
-                start = 0
-                end = min(ctx_len, T)
-                if window_idx > 0:
-                    logger.debug(
-                        "_get_context_for_window: '%s' T=%d, window_idx=%d is "
-                        "out of range (ctx_len=%d, stride=%d, need T≥%d); "
-                        "using earliest window [0:%d].",
-                        nt, T, window_idx, ctx_len, stride,
-                        ctx_len + window_idx * stride, end,
-                    )
+                if end <= 0:
+                    # Window index is so large that the window end falls before
+                    # the start of the recording.  Use the earliest data slice.
+                    start = 0
+                    end = min(ctx_len, T)
+                    if window_idx > 0:
+                        logger.debug(
+                            "_get_context_for_window: '%s' T=%d, window_idx=%d "
+                            "gives end≤0 (stride=%d); using earliest window [0:%d].",
+                            nt, T, window_idx, stride, end,
+                        )
+                elif T <= ctx_len:
+                    # ── Fallback mode (T ≤ context_length) ────────────────────
+                    # n_temporal_windows used prediction_steps as the stride to
+                    # generate multiple diverse starting contexts from a short
+                    # recording.  Each window k should see a DIFFERENT prefix of
+                    # the recording:
+                    #
+                    #   window 0  →  x[:, 0 : T, :]           (T steps)
+                    #   window 1  →  x[:, 0 : T−s, :]         (T−s steps)
+                    #   window k  →  x[:, 0 : T−k·s, :]       (T−k·s steps)
+                    #
+                    # Using the full [0:T] for every window (old behaviour)
+                    # gave all fallback windows identical contexts, completely
+                    # defeating the purpose of multi-window diversity.
+                    start = 0
+                    # end = T - window_idx * stride (computed above).
+                    # Strictly positive: the end <= 0 branch was not taken,
+                    # so end ≥ 1.
+                    if window_idx > 0:
+                        logger.debug(
+                            "_get_context_for_window: '%s' T=%d ≤ ctx_len=%d, "
+                            "window_idx=%d → variable-length prefix [0:%d] "
+                            "(fallback mode).",
+                            nt, T, ctx_len, window_idx, end,
+                        )
+                else:
+                    # ── Primary mode, window too old ──────────────────────────
+                    # T > context_length but this window would start before the
+                    # beginning of the recording.  Clamp to the earliest
+                    # full-length ctx_len slice.
+                    start = 0
+                    end = min(ctx_len, T)
+                    if window_idx > 0:
+                        logger.debug(
+                            "_get_context_for_window: '%s' T=%d, window_idx=%d is "
+                            "out of range (ctx_len=%d, stride=%d, need T≥%d); "
+                            "using earliest window [0:%d].",
+                            nt, T, window_idx, ctx_len, stride,
+                            ctx_len + window_idx * stride, end,
+                        )
             context[nt].x = nt_x[:, start:end, :]
 
         return context

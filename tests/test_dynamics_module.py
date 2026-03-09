@@ -2510,6 +2510,45 @@ class TestNTemporalWindowsFallback(unittest.TestCase):
                 traj, _ = sim.rollout(steps=3, context_window_idx=idx)
                 self.assertEqual(traj.shape, (3, N))
 
+    def test_fallback_windows_have_different_context_lengths(self):
+        """
+        Regression test for _get_context_for_window fallback mode.
+
+        When T == context_length, the fallback path produces windows with
+        decreasing context lengths: T, T-stride, T-2*stride, …  Previously
+        all fallback windows returned the same [0:T] context, giving zero
+        diversity and defeating the multi-window purpose.
+        """
+        ctx_len = 20
+        pred_steps = 5
+        # stride = ctx_len // 4 = 5
+        sim = self._make_sim(T_base=ctx_len, context_length=ctx_len,
+                             pred_steps=pred_steps)
+        n = sim.n_temporal_windows
+        self.assertGreater(n, 1, "Expected >1 fallback windows")
+
+        stride = sim._get_stride()
+        T = ctx_len  # T == context_length, so we're in fallback mode
+
+        seen_lengths = set()
+        for w in range(n):
+            ctx = sim._get_context_for_window(w)
+            t_ctx = ctx["fmri"].x.shape[1]
+            expected = T - w * stride
+            self.assertEqual(
+                t_ctx, expected,
+                f"Window {w}: expected context length {expected}, got {t_ctx}. "
+                "All fallback windows should have distinct prefix lengths.",
+            )
+            seen_lengths.add(t_ctx)
+
+        # All windows must have genuinely different context lengths
+        self.assertEqual(
+            len(seen_lengths), n,
+            "All fallback windows should have distinct context lengths, "
+            f"but got {len(seen_lengths)} unique lengths for {n} windows.",
+        )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Config reading fix: predictor_config from v5_optimization.advanced_prediction
@@ -2640,6 +2679,87 @@ class TestPredictorConfigFromV5Optimization(unittest.TestCase):
             "v5_optimization.context_length=999 must be ignored when "
             "model.predictor_config is present",
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Basin test: _run_trajectories device kwarg / tuple return bug
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRunTrajectories(unittest.TestCase):
+    """
+    Tests for basin_test._run_trajectories.
+
+    Regression tests for two bugs that caused all basin test trajectories to
+    fail silently:
+
+    1. ``_run_trajectories`` passed ``device=device`` to
+       ``BrainDynamicsSimulator.rollout()``, which does not accept this
+       keyword argument.  The device is fixed at simulator construction time.
+
+    2. ``rollout()`` returns a ``(trajectory, times)`` tuple, but the old code
+       assigned the tuple directly to the ``trajs[i]`` numpy row, which would
+       raise a shape mismatch after fix 1.
+    """
+
+    def setUp(self):
+        _models_dir = Path(__file__).parent.parent / "models"
+        if str(_models_dir.parent) not in sys.path:
+            sys.path.insert(0, str(_models_dir.parent))
+
+    def _make_sim(self) -> "BrainDynamicsSimulator":
+        from models.graph_native_system import GraphNativeBrainModel
+        from models.digital_twin_inference import TwinBrainDigitalTwin
+        from torch_geometric.data import HeteroData as HD
+        H = 16
+        model = GraphNativeBrainModel(
+            node_types=["fmri"],
+            edge_types=[("fmri", "connects", "fmri")],
+            in_channels_dict={"fmri": 1},
+            hidden_channels=H,
+            prediction_steps=5,
+            predictor_config={"context_length": 20},
+        )
+        model.eval()
+        twin = TwinBrainDigitalTwin(model=model, device="cpu")
+        g = HD()
+        g["fmri"].x = torch.randn(N, 20, 1)
+        g["fmri", "connects", "fmri"].edge_index = torch.zeros(2, 0, dtype=torch.long)
+        return BrainDynamicsSimulator(model=twin, base_graph=g, modality="fmri",
+                                      device="cpu")
+
+    def test_run_trajectories_does_not_crash(self):
+        """_run_trajectories should not raise TypeError for 'device' kwarg."""
+        import sys
+        _bd = Path(__file__).parent.parent / "brain_dynamics"
+        if str(_bd) not in sys.path:
+            sys.path.insert(0, str(_bd))
+        from experiments.basin_test import _run_trajectories
+
+        sim = self._make_sim()
+        rng = np.random.default_rng(0)
+        init_states = rng.random((3, N)).astype(np.float32)
+        # Should not raise TypeError: unexpected keyword argument 'device'
+        trajs = _run_trajectories(sim, init_states, T=4, device="cpu")
+        self.assertEqual(trajs.shape, (3, 4, N))
+
+    def test_run_trajectories_output_shape(self):
+        """_run_trajectories should return (n_traj, T, N) numpy array."""
+        import sys
+        _bd = Path(__file__).parent.parent / "brain_dynamics"
+        if str(_bd) not in sys.path:
+            sys.path.insert(0, str(_bd))
+        from experiments.basin_test import _run_trajectories
+
+        sim = self._make_sim()
+        rng = np.random.default_rng(1)
+        n_traj = 4
+        T_steps = 6
+        init_states = rng.random((n_traj, N)).astype(np.float32)
+        trajs = _run_trajectories(sim, init_states, T=T_steps)
+        self.assertEqual(trajs.shape, (n_traj, T_steps, N),
+                         "Expected shape (n_traj, T, N)")
+        self.assertTrue(np.isfinite(trajs).all(),
+                        "Trajectories should contain only finite values")
 
 
 if __name__ == "__main__":
