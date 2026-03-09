@@ -740,7 +740,9 @@ class BrainVisualizationServer:
         # meaningful EC inference.  This matches standard EEG/fMRI preprocessing
         # practice (per-channel z-score prior to Granger/DCM analysis).
         if not raw_path and self._loaded_time_series is not None:
-            ts_src = self._loaded_raw_time_series or self._loaded_time_series
+            ts_src = (self._loaded_raw_time_series
+                      if self._loaded_raw_time_series is not None
+                      else self._loaded_time_series)
             if len(ts_src) >= n_lags + 10:
                 time_series = ts_src
                 self.logger.info(
@@ -1550,10 +1552,13 @@ class BrainVisualizationServer:
             ]
 
         def _frames_from_eeg(x_seq) -> list:
-            """Per-frame min-max normalisation for EEG.
+            """Per-CHANNEL min-max normalisation for EEG.
 
             Each frame: ``{"activity": [n_regions floats], "raw": [n_regions floats]}``
-            Fully vectorised when N_eeg == n_regions; interpolation otherwise.
+            Uses per-channel (axis=1) min-max so consecutive frames share the same
+            normalisation scale and EEG activity does not flicker due to global
+            mean shifts between frames.  Fully vectorised when N_eeg == n_regions;
+            linear interpolation to 200 slots otherwise.
             Frames are sub-sampled to ``_MAX_FRAMES_PER_MODALITY`` when T is large.
             NaN / Inf values are replaced with 0.0 before JSON serialisation.
             """
@@ -1575,30 +1580,32 @@ class BrainVisualizationServer:
                 x_np = x_np.copy()
                 x_np[bad] = 0.0
 
+            def _per_channel_norm(arr):
+                """Normalise (N, T) array per channel (axis=1) → (N, T) in [0, 1]."""
+                c_min = arr.min(axis=1, keepdims=True)   # (N, 1)
+                c_max = arr.max(axis=1, keepdims=True)   # (N, 1)
+                return np.clip((arr - c_min) / np.maximum(c_max - c_min, 1e-6),
+                               0.0, 1.0).astype(np.float32)
+
+            norms = _per_channel_norm(x_np)   # (N, T) in [0, 1]
+
             if N == n_regions:
-                sig_min = x_np.min(axis=0, keepdims=True)
-                sig_max = x_np.max(axis=0, keepdims=True)
-                scale = np.maximum(sig_max - sig_min, 1e-6)
-                norms = np.clip((x_np - sig_min) / scale, 0.0, 1.0).astype(np.float32)
                 return [
                     {"activity": norms[:, t].tolist(),
                      "raw":      x_np[:, t].astype(np.float32).tolist()}
                     for t in range(T)
                 ]
-            # Interpolation path (N_eeg → n_regions)
+            # Interpolation path (N_eeg → n_regions):
+            # linear interpolation maps N original channels to n_regions slots.
             src = np.linspace(0.0, 1.0, N)
             dst = np.linspace(0.0, 1.0, n_regions)
-            result = []
-            for t in range(T):
-                sig = x_np[:, t]
-                smin, smax = float(sig.min()), float(sig.max())
-                sc = max(smax - smin, 1e-6)
-                norm = np.clip((sig - smin) / sc, 0.0, 1.0)
-                result.append({
-                    "activity": np.interp(dst, src, norm).astype(np.float32).tolist(),
-                    "raw":      np.interp(dst, src, sig).astype(np.float32).tolist(),
-                })
-            return result
+            return [
+                {
+                    "activity": np.interp(dst, src, norms[:, t]).astype(np.float32).tolist(),
+                    "raw":      np.interp(dst, src, x_np[:, t]).astype(np.float32).tolist(),
+                }
+                for t in range(T)
+            ]
 
         frames_fmri: list = []
         frames_eeg:  list = []
