@@ -154,7 +154,7 @@ advanced:
     n_nodes: 10                 # Source nodes to stimulate (full N is slow)
     stim_amplitude: 0.5
   energy_constraint:
-    enabled: false              # Energy budget analysis from trajectories
+    enabled: true               # Energy budget analysis from trajectories
   phase_diagram:
     enabled: false              # g-sweep phase diagram
   controllability:

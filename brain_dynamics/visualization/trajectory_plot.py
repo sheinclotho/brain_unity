@@ -202,6 +202,11 @@ def plot_pca_trajectories(
     ax_2d.grid(True, alpha=0.25)
 
     # ── Panel 2: Density heatmap of all visited states ────────────────────────
+    # Use ALL post-burnin steps: this captures BOTH the early context-guided
+    # oscillatory phase (where trajectories orbit the attractor) and the later
+    # free-run phase.  The combination produces the expected ring-like density
+    # (orbit path) converging toward a bright spot (free-run attractor), which
+    # correctly reflects near-critical bounded-chaos dynamics.
     all_2d = np.vstack(proj2d)               # (show_n*T, 2)
     # 2D histogram as density proxy
     x_range = (all_2d[:, 0].min(), all_2d[:, 0].max())

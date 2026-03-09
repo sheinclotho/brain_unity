@@ -192,14 +192,17 @@ def spectral_community_detection(
 
 def _try_louvain(W: np.ndarray, seed: int = 42) -> Optional[Tuple[np.ndarray, float]]:
     """
-    尝试使用 networkx + community（Louvain）进行社区检测。
+    尝试使用 Louvain 算法进行社区检测。
+
+    优先级：
+    1. python-louvain (``community`` 包，pip install python-louvain)
+    2. networkx >= 2.7 内置 Louvain (``networkx.algorithms.community.louvain_communities``)
 
     Returns:
-        (labels, Q) 若成功；None 若包不可用。
+        (labels, Q) 若成功；None 若两者均不可用。
     """
     try:
         import networkx as nx
-        import community as community_louvain
     except ImportError:
         return None
 
@@ -208,10 +211,31 @@ def _try_louvain(W: np.ndarray, seed: int = 42) -> Optional[Tuple[np.ndarray, fl
     W_sym = (W_abs + W_abs.T) / 2.0
 
     G = nx.from_numpy_array(W_sym)
-    partition = community_louvain.best_partition(G, random_state=seed)
-    labels = np.array([partition[i] for i in range(N)], dtype=np.int32)
-    Q = community_louvain.modularity(partition, G)
-    return labels, float(Q)
+
+    # ── 尝试 python-louvain (pip install python-louvain) ─────────────────────
+    try:
+        import community as community_louvain
+        partition = community_louvain.best_partition(G, random_state=seed)
+        labels = np.array([partition[i] for i in range(N)], dtype=np.int32)
+        Q = community_louvain.modularity(partition, G)
+        return labels, float(Q)
+    except ImportError:
+        pass
+
+    # ── 尝试 networkx >= 2.7 内置 Louvain ────────────────────────────────────
+    try:
+        from networkx.algorithms.community import louvain_communities, modularity
+        communities = louvain_communities(G, seed=seed)
+        labels = np.zeros(N, dtype=np.int32)
+        for k, comm in enumerate(communities):
+            for node in comm:
+                labels[node] = k
+        Q = modularity(G, communities)
+        return labels, float(Q)
+    except (AttributeError, ImportError):
+        pass
+
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -394,7 +418,7 @@ def run_community_structure(
         logger.info("Louvain: k=%d, Q=%.4f", best_k, Q)
         k_q_pairs = [(best_k, Q)]
     else:
-        logger.info("Louvain 不可用，使用谱聚类。")
+        logger.info("Louvain 不可用（需要 python-louvain 或 networkx>=2.7），使用谱聚类。")
         method = "spectral_clustering"
         if k_range is None:
             k_range = _DEFAULT_K_RANGE

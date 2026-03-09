@@ -443,7 +443,11 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
     if dyn_cfg.get("pca", {}).get("enabled", True):
         try:
             from spectral_dynamics.f_pca_attractor import run_pca_attractor
-            burnin = max(0, trajs.shape[1] // 10) if trajs.ndim >= 2 else 0
+            # With context-end-aligned x0 (from_data=True, step_idx=context_end),
+            # the initial state IS the natural BOLD continuation of the context.
+            # No large correction transient → small burnin (T//10) is sufficient.
+            _T = trajs.shape[1] if trajs.ndim >= 2 else 0
+            burnin = _pca_burnin(_T)
             pca = run_pca_attractor(
                 trajectories=trajs,
                 burnin=burnin,
@@ -452,8 +456,8 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
             results["pca"] = pca
             logger.info(
                 "  PCA: var_top5=%.1f%%, n@90%%=%d",
-                pca.get("variance_top5", 0) * 100,
-                pca.get("n_components_90", 0),
+                pca.get("variance_top5_pct", 0),
+                pca.get("n_components_90pct", 0),
             )
         except Exception as e:
             logger.warning("  PCA analysis failed: %s", e)
@@ -1408,6 +1412,20 @@ def run_pipeline(cfg: dict) -> Dict[str, Any]:
     return all_results
 
 
+def _pca_burnin(n_steps: int) -> int:
+    """Canonical PCA burn-in formula shared by ``run_phase3_dynamics`` and
+    ``_save_summary_plots``.
+
+    With context-end-aligned initial states (``from_data=True``, ``step_idx``
+    set to the natural continuation of each context window), there is no large
+    correction transient.  A small burn-in of ``T // 10`` is sufficient to
+    discard the micro-perturbation noise and the first prediction chunk.
+    The cap at ``T // 2`` ensures that at least half the trajectory is always
+    available for analysis even for very short test trajectories.
+    """
+    return min(max(10, n_steps // 10), n_steps // 2) if n_steps > 0 else 0
+
+
 def _save_summary_plots(results: Dict[str, Any], output_dir: Path,
                         simulator) -> None:
     """Save summary visualisations."""
@@ -1435,9 +1453,11 @@ def _save_summary_plots(results: Dict[str, Any], output_dir: Path,
         except Exception:
             pass
         try:
+            # Small burnin via _pca_burnin(): context-end-aligned x0 has no large
+            # correction transient.  Capped at T//2 for test safety.
             plot_pca_trajectories(
                 trajs, save_path=plots_dir / "pca_trajectories.png",
-                burnin=max(0, trajs.shape[1] // 10),
+                burnin=_pca_burnin(trajs.shape[1]),
             )
         except Exception:
             pass
