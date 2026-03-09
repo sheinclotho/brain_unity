@@ -286,7 +286,7 @@ class BrainVisualizationServer:
                     # the connection to appear stalled.
                     payload = await loop.run_in_executor(
                         _JSON_EXECUTOR,
-                        lambda r=response: json.dumps(r, allow_nan=False),
+                        lambda: json.dumps(response, allow_nan=False),
                     )
                     await websocket.send(payload)
                 except json.JSONDecodeError:
@@ -1518,7 +1518,7 @@ class BrainVisualizationServer:
 
             # --- Sub-sample large time series before any further processing ---
             if T > _max_frames:
-                idx = np.round(np.linspace(0, T - 1, _max_frames)).astype(int)
+                idx = np.linspace(0, T - 1, _max_frames, dtype=int)
                 x_np = x_np[:, idx]
                 T = _max_frames
 
@@ -1565,7 +1565,7 @@ class BrainVisualizationServer:
 
             # --- Sub-sample large time series BEFORE the per-frame loop ---
             if T > _max_frames:
-                idx = np.round(np.linspace(0, T - 1, _max_frames)).astype(int)
+                idx = np.linspace(0, T - 1, _max_frames, dtype=int)
                 x_np = x_np[:, idx]
                 T = _max_frames
 

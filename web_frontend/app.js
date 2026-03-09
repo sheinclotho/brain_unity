@@ -523,7 +523,7 @@ function handleMsg(msg) {
     }
     // If a cache load was pending, surface the error prominently
     const fi = document.getElementById('frame-info');
-    if (fi && fi.textContent === '加载中…') {
+    if (_loadPending && fi) {
       fi.textContent = `⚠ 加载失败: ${msg.message || '未知错误'}`;
     }
     // If a simulation was pending, also show the error in the stim info bar
