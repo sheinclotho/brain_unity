@@ -1260,65 +1260,84 @@ class BrainDynamicsSimulator:
     def sample_random_state(
         self, rng: Optional[np.random.Generator] = None,
         noise_scale: float = _INITIAL_STATE_NOISE_SCALE,
+        from_data: bool = False,
     ) -> np.ndarray:
         """
         采样随机初始脑状态。
 
-        **单模态模式 (fMRI / EEG)**：从 ``base_graph`` 数据的均值附近添加随机
-        噪声，噪声幅度按各通道的标准差缩放（默认 0.3σ），确保初始状态位于数据的
-        自然分布范围内。对 z-score 归一化数据（值域约 ±3σ），**不裁剪**到
-        [0, 1]；对 [0, 1]-归一化数据，仍执行裁剪以保留物理合理性。
+        **单模态模式 (fMRI / EEG)**:
 
-        检测方式：``base_graph[modality].x.min() < -0.1`` → z-scored。
+        *默认模式* ``from_data=False``:  从数据均值附近添加随机噪声
+        （``mean + N(0, noise_scale) × std``）。适合刺激分析（小扰动、少瞬态）。
 
-        **背景**：V5 格式的 fMRI BOLD 和 EEG 数据均为 z-score 归一化（均值≈0，
-        标准差≈1）。若将初始状态裁剪到 [0, 1]，则写入上下文末步的值（≈ 0–0.05）
-        与上下文历史中的真实值（≈ ±3σ）产生巨大跳跃，模型在预刺激阶段需要大量
-        时间步恢复，表现为刺激前的大幅振荡（Image 4 中可见的现象）。
+        *数据采样模式* ``from_data=True``（自由动力学推荐）:  从 ``base_graph``
+        时序中随机抽取一个时间步 t，返回 ``data[:, t]`` 加上微量扰动。
 
-        **joint 模式**：分别为 fMRI 和 EEG 部分各自采样，使用
-        ``_fmri_mean/std`` 和 ``_eeg_mean/std`` 对噪声缩放，再拼接成
-        z-score 归一化的联合状态向量 ``[z_fmri | z_eeg]``，形状
-        ``(n_fmri_regions + n_eeg_regions,)``。值域无 [0,1] 限制。
+        科学依据：用于自由动力学分析时，初始状态的**空间相关结构**至关重要。
+        采用 ``mean + 各向同性噪声`` 会生成无空间相关的 x0（BOLD 激活在各脑区
+        独立采样），而真实脑状态具有强空间相关性（功能连接）。模型编码器需要
+        数百步才能将非相关初始状态"修正"为具有正确空间结构的状态，这一修正
+        过程成为 PCA 的主成分（PC1 可高达 86% 方差），遮盖真实脑动力学。
+        ``from_data=True`` 直接采样真实 BOLD 时间步，空间相关性与上下文历史
+        一致，消除修正瞬态，使 PCA 反映真实动力学模态。
+
+        **joint 模式**：分别为 fMRI 和 EEG 部分各自采样，再拼接成联合状态
+        向量 ``[z_fmri | z_eeg]``，形状 ``(n_fmri_regions + n_eeg_regions,)``。
+        joint 模式暂不支持 ``from_data=True``（两种模态时间轴可能不对齐）。
+
+        检测方式：``base_graph[modality].x.min() < -0.1`` → z-scored；不裁剪。
 
         Args:
             rng:         随机数生成器；None → 使用 self.seed 重新创建。
-            noise_scale: 噪声幅度（单位：数据标准差 σ）。默认 0.3σ 适合刺激
-                         分析（小扰动、无瞬态）。自由动力学实验可传入更大值
-                         （如 1.0σ）以增加初始状态多样性。
+            noise_scale: 噪声幅度（单位：数据标准差 σ）。
+                         ``from_data=False`` 时：默认 0.3σ（小扰动）。
+                         ``from_data=True`` 时：默认 0.1σ（仅用于避免轨迹重复）。
+            from_data:   True → 从 base_graph 时序随机抽取时间步作为初始状态
+                         （推荐用于自由动力学分析，可消除空间相关修正瞬态）。
+                         False → 均值 + 各向同性噪声（旧行为，用于刺激分析）。
         """
         if rng is None:
             rng = np.random.default_rng(self.seed)
 
         if self.modality == "joint":
-            # Sample z-scored state for fMRI part
-            fmri_noise = rng.normal(0.0, noise_scale, self.n_fmri_regions).astype(np.float32)
-            fmri_x0_z = fmri_noise  # z-score ≈ mean_z + noise (mean_z ≈ 0 by definition)
+            # Joint mode: use noise-based sampling (fMRI/EEG time axes may differ).
+            # When from_data is requested, fall back gracefully.
+            _ns = noise_scale if not from_data else 0.1
+            fmri_noise = rng.normal(0.0, _ns, self.n_fmri_regions).astype(np.float32)
+            fmri_x0_z = fmri_noise  # z-score ≈ mean_z + noise (mean_z ≈ 0)
 
-            # Sample z-scored state for EEG part
-            eeg_noise = rng.normal(0.0, noise_scale, self.n_eeg_regions).astype(np.float32)
+            eeg_noise = rng.normal(0.0, _ns, self.n_eeg_regions).astype(np.float32)
             eeg_x0_z = eeg_noise
 
             return np.concatenate([fmri_x0_z, eeg_x0_z])
 
         x_data = self.base_graph[self.modality].x  # [N, T, 1]
         data_np = x_data.squeeze(-1).cpu().numpy()   # [N, T]
-        mean_state = data_np.mean(axis=1)            # [N]
         std_state  = np.maximum(data_np.std(axis=1), _STD_GUARD)  # [N]
 
-        # Scale noise by the data's per-channel standard deviation so that
-        # the injected initial state lies within the model's normal operating
-        # range.  For z-scored data (std ≈ 1) this gives ≈ ±0.3σ perturbations;
-        # for [0,1]-normalised data (std ≈ 0.15–0.25) it gives proportionally
-        # smaller perturbations — both within the natural data distribution.
-        noise = rng.normal(0.0, noise_scale, self.n_regions).astype(np.float32)
-        x0 = (mean_state + noise * std_state).astype(np.float32)
+        if from_data:
+            # ── Data-sample mode: pick a random time step from actual BOLD/EEG ──
+            # The selected column data[:, t] is a real brain state with full
+            # spatial correlation structure, so the model encoder sees a context
+            # that matches the injected x0 in distribution.  This eliminates the
+            # long "spatial-structure correction" transient that dominates PC1
+            # when using mean + isotropic-noise initial states.
+            T_data = data_np.shape[1]
+            t = int(rng.integers(0, T_data))
+            x0 = data_np[:, t].copy().astype(np.float32)
+            # Tiny perturbation (default 0.1σ) ensures each trajectory starts from
+            # a slightly different state even when the same time step is sampled.
+            _ns = noise_scale if noise_scale != _INITIAL_STATE_NOISE_SCALE else 0.1
+            noise = rng.normal(0.0, _ns, self.n_regions).astype(np.float32)
+            x0 = x0 + noise * std_state
+        else:
+            # ── Noise-perturb mode (original behaviour): mean + N(0, noise_scale×std) ─
+            mean_state = data_np.mean(axis=1)            # [N]
+            noise = rng.normal(0.0, noise_scale, self.n_regions).astype(np.float32)
+            x0 = (mean_state + noise * std_state).astype(np.float32)
 
         # Only clip to [0, 1] for strictly non-negative (legacy-normalised) data.
-        # Z-scored data (min < -0.1) must NOT be clipped: doing so would force
-        # all negative channel values to 0, creating an anomalous initial state
-        # that causes large transient oscillations during the pre-stimulation
-        # period (up to ±0.7 AU visible in EEG stim-response plots).
+        # Z-scored data (min < -0.1) must NOT be clipped.
         if self._state_bounds is not None:
             x0 = np.clip(x0, self._state_bounds[0], self._state_bounds[1])
 

@@ -443,7 +443,17 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
     if dyn_cfg.get("pca", {}).get("enabled", True):
         try:
             from spectral_dynamics.f_pca_attractor import run_pca_attractor
-            burnin = max(0, trajs.shape[1] // 10) if trajs.ndim >= 2 else 0
+            # Burnin must cover at least the context-washout period
+            # (context_length steps until model is in pure free-run mode).
+            # T // 10 alone (50 for T=500) is insufficient; use the larger value.
+            # Cap to T // 3 so short test trajectories still work.
+            _T = trajs.shape[1] if trajs.ndim >= 2 else 0
+            try:
+                _ctx_len = int(simulator._get_context_length())
+            except Exception:
+                _ctx_len = 200  # V5 default
+            # Never burn off more than half the trajectory (safe for tests).
+            burnin = min(max(_ctx_len, _T // 10), _T // 2) if _T > 0 else 0
             pca = run_pca_attractor(
                 trajectories=trajs,
                 burnin=burnin,
@@ -1435,9 +1445,16 @@ def _save_summary_plots(results: Dict[str, Any], output_dir: Path,
         except Exception:
             pass
         try:
+            # Compute burnin covering context-washout period, capped at T//3.
+            try:
+                _ctx = int(getattr(simulator, "_get_context_length", lambda: 200)())
+            except Exception:
+                _ctx = 200
+            _T = trajs.shape[1]
+            _burnin = min(max(_ctx, _T // 10), _T // 3)
             plot_pca_trajectories(
                 trajs, save_path=plots_dir / "pca_trajectories.png",
-                burnin=max(0, trajs.shape[1] // 10),
+                burnin=_burnin,
             )
         except Exception:
             pass

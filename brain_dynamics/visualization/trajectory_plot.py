@@ -202,7 +202,11 @@ def plot_pca_trajectories(
     ax_2d.grid(True, alpha=0.25)
 
     # ── Panel 2: Density heatmap of all visited states ────────────────────────
-    all_2d = np.vstack(proj2d)               # (show_n*T, 2)
+    # Use only the LATE portion of each trajectory (second half after burnin) for
+    # the density map.  Early post-burnin steps may still be dominated by the
+    # context-washout transient; the late portion better represents the attractor.
+    late_start = T // 2  # skip first half of post-burnin trajectory
+    all_2d = np.vstack([traj_2d[late_start:] for traj_2d in proj2d])  # late states only
     # 2D histogram as density proxy
     x_range = (all_2d[:, 0].min(), all_2d[:, 0].max())
     y_range = (all_2d[:, 1].min(), all_2d[:, 1].max())
@@ -233,7 +237,7 @@ def plot_pca_trajectories(
                    marker="*", label="Final states")
     ax_den.set_xlabel(pc1_lbl, fontsize=9)
     ax_den.set_ylabel(pc2_lbl, fontsize=9)
-    ax_den.set_title("State Density Heatmap\n(bright = attractor)", fontsize=10)
+    ax_den.set_title("State Density Heatmap\n(late-stage: bright = attractor)", fontsize=10)
     ax_den.legend(fontsize=7, loc="upper left")
 
     # ── Panel 3: 3D PCA ───────────────────────────────────────────────────────
