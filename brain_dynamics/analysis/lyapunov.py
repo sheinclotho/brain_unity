@@ -153,6 +153,15 @@ _WOLF_BIAS_STD_THRESHOLD: float = 1e-3
 # A value < 0.02 means trajectories differ by < 7% of a random baseline → context-dominated.
 _TRAJECTORY_DIVERSITY_LOW_THRESHOLD: float = 0.02
 
+# Supplement 1: number of representative trajectories from which the mean
+# Rosenstein log-divergence curve is computed.  5 is enough to average out
+# per-trajectory noise while keeping the post-processing step fast (pure NumPy).
+_MAX_DIVERGENCE_CURVE_SAMPLES: int = 5
+
+# Supplement 1: regression fraction used in _try_plot_divergence_curve must
+# match rosenstein_lyapunov's default regression_fraction (0.6).
+_ROSENSTEIN_FIT_FRACTION: float = 0.6
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Delay-embedding helper for Rosenstein (Takens reconstruction)
@@ -1551,6 +1560,41 @@ def run_lyapunov_analysis(
             np.save(output_dir / "rosenstein_values.npy", rosenstein_values)
             logger.info("  → 已保存: %s/rosenstein_values.npy", output_dir)
 
+            # ── Supplement 1: Rosenstein divergence curve ─────────────────────
+            # Compute mean log-divergence S(j) averaged over representative
+            # trajectories.  This is a pure trajectory computation (no model
+            # calls) and provides the linear-region evidence for the LLE fit.
+            div_curves: List[np.ndarray] = []
+            finite_mask_r = np.isfinite(rosenstein_values)
+            finite_idx_r = np.where(finite_mask_r)[0]
+            sample_idx = finite_idx_r[:min(_MAX_DIVERGENCE_CURVE_SAMPLES, len(finite_idx_r))]
+            for si in sample_idx:
+                _, div_curve_i = rosenstein_lyapunov(
+                    trajectory=trajectories[si],
+                    max_lag=_r_max_lag,
+                    min_temporal_sep=_r_min_sep,
+                    delay_embed_dim=rosenstein_delay_embed_dim,
+                    delay_embed_tau=rosenstein_delay_embed_tau,
+                )
+                if div_curve_i is not None and len(div_curve_i) > 1:
+                    div_curves.append(div_curve_i)
+            if div_curves:
+                min_len = min(len(c) for c in div_curves)
+                div_arr = np.stack([c[:min_len] for c in div_curves])
+                import warnings as _warnings
+                with _warnings.catch_warnings():
+                    _warnings.simplefilter("ignore", RuntimeWarning)
+                    mean_div_curve = np.nanmean(div_arr, axis=0)
+                np.save(output_dir / "lyapunov_divergence_curve.npy",
+                        mean_div_curve)
+                logger.info(
+                    "  → 已保存: %s/lyapunov_divergence_curve.npy", output_dir
+                )
+                _try_plot_divergence_curve(
+                    mean_div_curve, mean_lam,
+                    output_dir / "lyapunov_divergence_curve.png",
+                )
+
         # Save human-readable JSON report
         report = {
             "mean_lyapunov": mean_lam,
@@ -1968,3 +2012,75 @@ def _try_plot_spectrum(
     fig.savefig(output_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     logger.info("  → 保存谱图: %s", output_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Supplement 1: Rosenstein Divergence Curve Visualisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _try_plot_divergence_curve(
+    mean_log_div: np.ndarray,
+    lle: float,
+    output_path: "Path",
+) -> None:
+    """
+    Supplement 1 plot: mean log divergence S(j) vs lag j (Rosenstein method).
+
+    The linear-growth region of S(j) gives the LLE estimate.  Plotting this
+    curve allows visual verification that the linear regression was performed
+    on a genuine exponential-divergence region rather than noise.
+
+    Args:
+        mean_log_div:  shape (max_lag,), mean log-separation at each lag.
+        lle:           LLE estimate (slope of the linear region, nats/step).
+        output_path:   where to save the PNG.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    from pathlib import Path as _Path
+
+    lags = np.arange(len(mean_log_div))
+    finite = np.isfinite(mean_log_div)
+
+    # Estimate regression region, matching rosenstein_lyapunov's default fraction
+    fit_end = max(2, int(len(lags) * _ROSENSTEIN_FIT_FRACTION))
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    # Full divergence curve
+    ax.plot(lags[finite], mean_log_div[finite], "k-o", ms=4, lw=1.5,
+            label="Mean log divergence S(j)")
+
+    # Highlight regression region
+    reg_lags = lags[1:fit_end]
+    reg_vals = mean_log_div[1:fit_end]
+    reg_finite = np.isfinite(reg_vals)
+    if reg_finite.sum() >= 2:
+        ax.plot(reg_lags[reg_finite], reg_vals[reg_finite], "r-",
+                lw=2.5, alpha=0.7, label="Regression region (LLE fit)")
+        # Draw regression line
+        coeffs = np.polyfit(reg_lags[reg_finite].astype(float),
+                            reg_vals[reg_finite], deg=1)
+        fit_line = np.polyval(coeffs, reg_lags)
+        ax.plot(reg_lags, fit_line, "r--", lw=1.2, alpha=0.5,
+                label=f"Linear fit  (λ₁={lle:.5f} nats/step)")
+
+    ax.axhline(0, color="gray", lw=0.6, ls=":")
+    ax.set_xlabel("Lag  j  (steps)")
+    ax.set_ylabel("S(j) = ⟨log ||δx(j)||⟩")
+    ax.set_title(
+        f"Rosenstein Lyapunov Divergence Curve\n"
+        f"LLE = {lle:.5f} nats/step  "
+        f"({'expanding' if lle > 0 else 'contracting'})"
+    )
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(_Path(output_path), dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("  → 保存 Lyapunov 散度曲线: %s", output_path)

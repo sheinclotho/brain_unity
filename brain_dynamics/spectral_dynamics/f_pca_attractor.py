@@ -63,6 +63,12 @@ from sklearn.decomposition import PCA
 
 logger = logging.getLogger(__name__)
 
+# Poincaré section constants
+_POINCARE_CROSSING_EPS: float = 1e-12   # threshold for near-zero slope in crossing interpolation
+_POINCARE_PERIODIC_THRESH: float = 1e-6  # range < this → trivially periodic (fixed point)
+_POINCARE_TIGHT_RATIO: float = 0.15      # std/range < this → clustered (periodic)
+_POINCARE_QUASI_RATIO: float = 0.50      # std/range < this → smooth manifold (quasi-periodic)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # F1: PCA explained variance
@@ -405,4 +411,263 @@ def run_pca_attractor(
             label=label,
         )
 
+        # ── New Test 2: Phase Portrait (pair-wise PC projections) ─────────────
+        X_pca = pca_result["X_pca"]
+        evr = pca_result["explained_variance_ratio"]
+        if X_pca.shape[1] >= 2:
+            _try_plot_phase_portrait_pair(
+                X_pca, n_traj, T_eff, evr,
+                pc_a=0, pc_b=1,
+                output_path=out / "phase_portrait_pc1_pc2.png",
+            )
+        if X_pca.shape[1] >= 3:
+            _try_plot_phase_portrait_pair(
+                X_pca, n_traj, T_eff, evr,
+                pc_a=0, pc_b=2,
+                output_path=out / "phase_portrait_pc1_pc3.png",
+            )
+            _try_plot_phase_portrait_pair(
+                X_pca, n_traj, T_eff, evr,
+                pc_a=1, pc_b=2,
+                output_path=out / "phase_portrait_pc2_pc3.png",
+            )
+
+        # ── New Test 3: Poincaré Section ──────────────────────────────────────
+        poincare = compute_poincare_section(X_pca, n_traj, T_eff)
+        result["poincare_n_crossings"] = poincare["n_crossings"]
+        result["poincare_interpretation"] = poincare["interpretation"]
+        np.save(out / "poincare_points.npy", poincare["points"])
+        _try_plot_poincare_section(
+            poincare,
+            output_path=out / "poincare_section.png",
+        )
+
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# New Test 2: Phase Portrait (pair-wise PC projections)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _try_plot_phase_portrait_pair(
+    X_pca: np.ndarray,
+    n_traj: int,
+    steps_per_traj: int,
+    evr: List[float],
+    pc_a: int,
+    pc_b: int,
+    output_path: Path,
+    n_traj_show: int = 5,
+) -> None:
+    """
+    New Test 2: Phase portrait for any pair of PCs.
+
+    Overlays up to `n_traj_show` trajectories in (PC_{pc_a+1}, PC_{pc_b+1})
+    space, coloured by time.  Useful for direct attractor geometry inspection.
+
+    Args:
+        X_pca:          shape (n_traj * T_eff, n_pcs) — all trajectories stacked.
+        n_traj:         number of trajectories.
+        steps_per_traj: T_eff = T - burnin.
+        evr:            explained variance ratios list.
+        pc_a, pc_b:     0-indexed PC pair to plot.
+        output_path:    where to save the PNG.
+        n_traj_show:    max trajectories to overlay.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
+    except ImportError:
+        return
+
+    if X_pca.shape[1] <= max(pc_a, pc_b):
+        return
+
+    n_show = min(n_traj_show, n_traj)
+    T = steps_per_traj
+    cmap = plt.cm.viridis
+    colors_t = cmap(np.linspace(0.05, 0.95, T))
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for i in range(n_show):
+        start = i * T
+        end = start + T
+        if end > X_pca.shape[0]:
+            break
+        pc_x = X_pca[start:end, pc_a]
+        pc_y = X_pca[start:end, pc_b]
+        for t in range(T - 1):
+            ax.plot(pc_x[t:t+2], pc_y[t:t+2], color=colors_t[t], lw=0.8, alpha=0.7)
+        ax.scatter(pc_x[0], pc_y[0], color="blue", s=25, zorder=5, marker="o")
+        ax.scatter(pc_x[-1], pc_y[-1], color="red", s=25, zorder=5, marker="x")
+
+    # Colorbar for time
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, T))
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label="Time Step")
+
+    var_a = float(evr[pc_a]) * 100 if pc_a < len(evr) else 0
+    var_b = float(evr[pc_b]) * 100 if pc_b < len(evr) else 0
+    ax.set_xlabel(f"PC{pc_a+1}  ({var_a:.1f}% var)")
+    ax.set_ylabel(f"PC{pc_b+1}  ({var_b:.1f}% var)")
+    ax.set_title(
+        f"Phase Portrait: PC{pc_a+1} vs PC{pc_b+1}\n"
+        f"({n_show} trajectories, blue=start, red×=end, colour=time)"
+    )
+    ax.grid(True, alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("保存 phase portrait: %s", output_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# New Test 3: Poincaré Section
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_poincare_section(
+    X_pca: np.ndarray,
+    n_traj: int,
+    steps_per_traj: int,
+) -> Dict:
+    """
+    New Test 3: Compute a Poincaré section through the plane PC1 = 0, PC2 > 0.
+
+    For each trajectory, detects upward-crossing zero-crossings of PC1
+    (PC1(t) < 0 and PC1(t+1) >= 0) where PC2 > 0 at the crossing point.
+    Records (PC2_cross, PC3_cross) at each crossing via linear interpolation.
+
+    Interpretation:
+      - Single cluster → periodic orbit
+      - Smooth curve   → quasi-periodic (torus)
+      - Scattered / fractal → chaotic
+
+    Args:
+        X_pca:          shape (n_traj * T_eff, n_pcs).
+        n_traj:         number of trajectories.
+        steps_per_traj: T_eff.
+
+    Returns:
+        dict with keys:
+          points:          np.ndarray (n_crossings, 2) — (PC2_cross, PC3_cross)
+          n_crossings:     int
+          interpretation:  str — "periodic" | "quasi-periodic" | "chaotic"
+          has_pc3:         bool
+    """
+    has_pc3 = X_pca.shape[1] >= 3
+    T = steps_per_traj
+    crossings_pc2: List[float] = []
+    crossings_pc3: List[float] = []
+
+    for i in range(n_traj):
+        start = i * T
+        end = min(start + T, X_pca.shape[0])
+        if end - start < 4:
+            continue
+        pc1 = X_pca[start:end, 0]
+        pc2 = X_pca[start:end, 1] if X_pca.shape[1] >= 2 else np.zeros(end - start)
+        pc3 = X_pca[start:end, 2] if has_pc3 else np.zeros(end - start)
+
+        # Detect upward zero-crossings: PC1(t) < 0 → PC1(t+1) >= 0
+        t_arr = np.arange(len(pc1) - 1)
+        cross_mask = (pc1[t_arr] < 0) & (pc1[t_arr + 1] >= 0)
+        cross_times = t_arr[cross_mask]
+
+        for t in cross_times:
+            # Linear interpolation to find exact crossing fraction
+            dpc1 = pc1[t + 1] - pc1[t]
+            if abs(dpc1) < _POINCARE_CROSSING_EPS:
+                alpha = 0.0
+            else:
+                alpha = -pc1[t] / dpc1   # in [0, 1]
+            pc2_c = float(pc2[t] + alpha * (pc2[t + 1] - pc2[t]))
+            pc3_c = float(pc3[t] + alpha * (pc3[t + 1] - pc3[t]))
+            # Only keep crossings with PC2 > 0 (half-plane condition)
+            if pc2_c > 0:
+                crossings_pc2.append(pc2_c)
+                crossings_pc3.append(pc3_c)
+
+    n_cross = len(crossings_pc2)
+    if n_cross == 0:
+        points = np.empty((0, 2), dtype=np.float32)
+        interp = "no_crossings"
+    else:
+        points = np.column_stack([crossings_pc2, crossings_pc3]).astype(np.float32)
+        # Classify based on spread of crossing points.
+        # Thresholds (relative to range):
+        #   _POINCARE_TIGHT_RATIO  → clustered   → periodic
+        #   _POINCARE_QUASI_RATIO  → smooth curve → quasi-periodic
+        #   otherwise              → scattered    → chaotic
+        if n_cross < 5:
+            interp = "insufficient_crossings"
+        else:
+            pc2_arr = np.array(crossings_pc2)
+            pc3_arr = np.array(crossings_pc3)
+            spread_pc2 = float(np.std(pc2_arr))
+            spread_pc3 = float(np.std(pc3_arr) if has_pc3 else 0.0)
+            spread = max(spread_pc2, spread_pc3)
+            range_pc2 = float(np.ptp(pc2_arr)) if len(pc2_arr) > 1 else 0.0
+            if range_pc2 < _POINCARE_PERIODIC_THRESH:
+                interp = "periodic"
+            elif spread / (range_pc2 + 1e-9) < _POINCARE_TIGHT_RATIO:
+                interp = "periodic"
+            elif spread / (range_pc2 + 1e-9) < _POINCARE_QUASI_RATIO:
+                interp = "quasi-periodic"
+            else:
+                interp = "chaotic"
+
+    return {
+        "points": points,
+        "n_crossings": n_cross,
+        "interpretation": interp,
+        "has_pc3": has_pc3,
+    }
+
+
+def _try_plot_poincare_section(poincare: Dict, output_path: Path) -> None:
+    """
+    New Test 3 plot: PC2_cross vs PC3_cross at Poincaré section crossings.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
+    except ImportError:
+        return
+
+    points = poincare["points"]
+    n_cross = poincare["n_crossings"]
+    interp = poincare["interpretation"]
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    if n_cross == 0:
+        ax.text(0.5, 0.5, "No crossings detected\n(section PC1=0, PC2>0)",
+                ha="center", va="center", transform=ax.transAxes, fontsize=12)
+    else:
+        pc2_c = points[:, 0]
+        pc3_c = points[:, 1]
+        # Colour by crossing order (trajectory time)
+        cmap = plt.cm.plasma
+        sc = ax.scatter(pc2_c, pc3_c,
+                        c=np.arange(n_cross), cmap=cmap,
+                        s=20, alpha=0.8, edgecolors="k", lw=0.3, zorder=3)
+        plt.colorbar(sc, ax=ax, label="Crossing index (time order)")
+
+    ax.set_xlabel("PC2 at crossing")
+    ax.set_ylabel("PC3 at crossing")
+    ax.set_title(
+        f"Poincaré Section  (PC1=0, PC2>0)\n"
+        f"n_crossings={n_cross},  interpretation: {interp}\n"
+        "cluster→periodic | curve→quasi-periodic | scatter→chaotic"
+    )
+    ax.grid(True, alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("保存 Poincare section: %s", output_path)
