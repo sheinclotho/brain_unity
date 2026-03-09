@@ -10,6 +10,8 @@ const N_REGIONS    = 200;
 const RECONNECT_MS     = 3000;
 const MAX_RECONNECT_MS = 30000;  // exponential backoff ceiling
 const SPHERE_R     = 4.0;   // base sphere radius (Three.js units ≈ mm)
+const LERP_ALPHA       = 0.15;  // activity lerp speed per render frame (~60 fps)
+const PLAY_INTERVAL_MS = 200;   // auto-play frame interval in ms (5 fps)
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const canvas      = document.getElementById('brain-canvas');
@@ -167,7 +169,7 @@ for (let i = 0; i < N_REGIONS; i++) {
   });
   const mesh = new THREE.Mesh(regionGeo, mat);
   mesh.position.copy(BRAIN_POS[i]);
-  mesh.userData = { regionId: i, activity: 0.2, selected: false };
+  mesh.userData = { regionId: i, activity: 0.2, _displayedActivity: 0.2, selected: false };
   scene.add(mesh);
   regionMeshes.push(mesh);
 }
@@ -196,12 +198,8 @@ function updateActivity(arr, rawArr) {
   for (let i = 0; i < regionMeshes.length; i++) {
     const m  = regionMeshes[i];
     const v  = Math.max(0, Math.min(1, arr[i] ?? 0.2));
-    m.userData.activity = v;
+    m.userData.activity = v;       // target; render loop lerps _displayedActivity toward this
     m.userData.rawActivity = rawArr ? rawArr[i] : undefined;
-    const c  = activityColor(v);
-    m.material.color.copy(c);
-    m.material.emissive.setRGB(c.r * 0.22, c.g * 0.22, c.b * 0.22);
-    m.scale.setScalar(m.userData.selected ? 1.6 : 0.65 + v * 0.60);
     sum  += v;
     sum2 += v * v;
   }
@@ -341,6 +339,23 @@ function demoUpdate() {
 (function animate() {
   requestAnimationFrame(animate);
   if (!connected && frameSeq.length === 0) demoUpdate();
+  // Smoothly interpolate each sphere's displayed activity toward its target.
+  // This eliminates the hard color-jump that causes visible flickering when
+  // stepping through frames at playback speed.
+  for (let i = 0; i < regionMeshes.length; i++) {
+    const m      = regionMeshes[i];
+    const target = m.userData.activity;
+    const cur    = m.userData._displayedActivity;
+    const next   = cur + (target - cur) * LERP_ALPHA;
+    m.userData._displayedActivity = next;
+    if (Math.abs(next - cur) > 1e-5) {
+      const c = activityColor(next);
+      m.material.color.copy(c);
+      m.material.emissive.setRGB(c.r * 0.22, c.g * 0.22, c.b * 0.22);
+    }
+    // Always update scale so selection state changes apply on the very next frame
+    m.scale.setScalar(m.userData.selected ? 1.6 : 0.65 + next * 0.60);
+  }
   applyOrbit();
   renderer.render(scene, camera);
 })();
@@ -754,7 +769,7 @@ function playSeq() {
     } else {
       _prevAct = act;
     }
-  }, 100);   // 10 fps
+  }, PLAY_INTERVAL_MS);   // 5 fps
 }
 
 function pauseSeq() {
