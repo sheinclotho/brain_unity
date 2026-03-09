@@ -151,7 +151,10 @@ advanced:
     patterns: ["sine"]
   response_matrix:
     enabled: true               # Full N×N stimulation response matrix
-    n_nodes: 10                 # Source nodes to stimulate (full N is slow)
+    n_nodes: 10                 # Source nodes to stimulate.
+                                # Set to null (or omit) for all N nodes — recommended for
+                                # full Phase-2 spectral/community analysis (requires N×N matrix)
+                                # but significantly slower (O(N) model calls vs O(n_nodes)).
     stim_amplitude: 0.5
   energy_constraint:
     enabled: true               # Energy budget analysis from trajectories

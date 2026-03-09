@@ -167,7 +167,7 @@ def _try_plot_rank(mags: np.ndarray, output_path: Path, label: str) -> None:
     # Linear scale
     axes[0].plot(ranks, mags, "o-", ms=3, lw=1.5)
     axes[0].axhline(mags[0] * _DOMINANT_THRESHOLD, ls="--", color="red",
-                    label=f"threshold {_DOMINANT_THRESHOLD:.0%}x|λ₁|")
+                    label=f"threshold {_DOMINANT_THRESHOLD:.0%}x|lambda_1|")
     axes[0].set_xlabel("Rank (|λ| descending)")
     axes[0].set_ylabel("|λ|")
     axes[0].set_title(f"Eigenvalue Magnitude Rank (linear)  [{label}]")

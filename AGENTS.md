@@ -834,3 +834,26 @@ PCA 轨迹图显示所有轨迹沿 PC1（占 86%+ 方差）作单向漂移（右
 - 滑窗步长计算**只能**通过 `simulator._get_stride()` 获取，不在外部重复 `max(1, ctx//4)`。
 - `_DATA_SAMPLE_NOISE_SCALE = 0.05`：数据采样模式的扰动幅度。多样性主要来自不同 step_idx，不来自噪声幅度；0.05σ 仅保证同 step_idx 的两条轨迹不完全重叠。
 - PCA burnin = `_pca_burnin(T)` = `min(max(10, T//10), T//2)`。不应使用 context_length 作为 burnin 下界（会丢弃珍贵的上下文引导振荡阶段）。
+
+### [2026-03-09] 三项 Dynamics 模块维护修复
+
+#### Fix 1: Glyph 8321 (SUBSCRIPT ONE) 警告
+- **问题**: `e1_spectral_analysis.py` 的图例标签使用 `|λ₁|`（包含 Unicode U+2081 上标数字1），即使通过 `configure_matplotlib()` 配置了 Microsoft YaHei 字体，该字体仍不含此字形，产生 `UserWarning: Glyph 8321 (\N{SUBSCRIPT ONE}) missing from font(s) Microsoft YaHei`。
+- **修复**: 将 `|λ₁|` 替换为 ASCII 文本 `|lambda_1|`。
+- **规则**: matplotlib 标签禁止使用 Unicode 专用字符（下标、上标、特殊符号）；所有标签必须为纯 ASCII 或 LaTeX 数学模式（`$...$`）。
+
+#### Fix 2: 响应矩阵 `n_nodes: null` 配置支持
+- **问题**: `pipeline.py` 中 `min(rm_cfg.get("n_nodes", simulator.n_regions), simulator.n_regions)` 当 YAML 配置为 `n_nodes: null` 时（Python `None`），`min(None, int)` 抛出 `TypeError`。用户无法通过配置文件设置全节点刺激。
+- **修复**: 显式 `None` 检查：`n_nodes = simulator.n_regions if n_nodes_cfg is None else min(int(n_nodes_cfg), simulator.n_regions)`，并加入 `try/except` 处理非整数值（给出有用的警告信息）。
+- **配置更新**: `config.yaml` 中 `n_nodes` 添加注释说明 `null`（或省略）表示全节点刺激（推荐用于 Phase-2 全谱分析，但比较慢）。
+
+#### Fix 3: 信息流 TE 统计稀释 Bug 与离散化范围错误
+- **Bug A（离散化范围）**: `_discretize` 使用固定 `[0, 1]` 分箱。对 z-score 轨迹（值域 ≈ ±3σ）：
+  - 负值 → 索引 -1 → numpy 负索引回绕到最后一个 bin（第 15 号），使 ~50% 的样本被错误地归入最后一个 bin
+  - 值 > 1.0 → 索引 16 → `np.add.at` 越界 IndexError
+- **修复 A**: 改为**等频率（百分位）分箱**：`bins = np.percentile(x, linspace(0,100,n_bins+1))`。等频率分箱适用任意实值范围，每个 bin 含 ≈T/n_bins 个样本，与 KSG/直方图 TE 文献的"equiquantile"离散化标准一致（Faes et al. 2017 Phys Rev X）。新增退化信号（全等值）的特殊处理，以及 `np.clip` 安全兜底。
+- **Bug B（统计稀释）**: `compute_information_flow_centrality` 中 `mean_te = te_off.mean()` 和 `te_asymmetry = |te_off - te_off.T|.mean()` 在全 N×N 矩阵上计算，而未计算的格子全为零。`n_src=n_tgt=20, N=190` 时，统计值被稀释 ~(190/20)²≈90×（日志中表现为"平均 TE=0.0001"但"最大 TE=0.1479"）。
+- **修复 B**: `compute_information_flow_centrality` 新增 `n_src`/`n_tgt` 参数，将 `mean_te` 和 `max_te` 限定在已计算子矩阵 `[:n_src, :n_tgt]` 上；将 `te_asymmetry` 限定在两方向均已计算的方块子矩阵 `[:n_both, :n_both]` 上（其中 `n_both = min(n_src, n_tgt)`）。日志新增 `n_src×n_tgt / N_total` 上下文信息，report 新增 `n_total_regions` 字段。
+- **规则**: `compute_information_flow_centrality` 调用时**必须**传入 `n_src` 和 `n_tgt`，否则统计无意义（在部分矩阵上报告全矩阵均值是错误的）。TE 离散化**必须**使用等频率分箱，不允许使用固定范围分箱。
+
+*Last updated: 2026-03-09*
