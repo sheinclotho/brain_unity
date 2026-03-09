@@ -253,6 +253,10 @@ def main() -> None:
         cfg["output"]["save_plots"] = False
     if args.energy_budget is not None:
         cfg["advanced"]["energy_constraint"]["E_budget"] = args.energy_budget
+        # Passing --energy-budget implies the user wants the budget analysis to
+        # run (Phase 5b: run_energy_budget_analysis from existing trajectories).
+        # Without setting enabled=True the Phase 5 check would silently skip it.
+        cfg["advanced"]["energy_constraint"]["enabled"] = True
     if args.n_workers is not None:
         cfg["dynamics"]["lyapunov"]["n_workers"] = args.n_workers
 

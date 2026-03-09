@@ -1111,10 +1111,40 @@ def run_lyapunov_analysis(
     run_rosenstein = effective_method in ("rosenstein", "both")
 
     # Determine segment start indices for multi-segment sampling.
-    if n_segments <= 1:
+    #
+    # For Rosenstein, n_segments > 1 samples the trajectory at different
+    # starting fractions (0, 1/k, 2/k, ...).  This improves LLE estimates for
+    # genuinely diverse trajectories by covering early/mid/late attractor
+    # behaviour.
+    #
+    # BIAS WARNING — context-dominated trajectories:
+    # When all n_traj trajectories share the same base_graph history (only the
+    # last context step differs), they are statistically near-identical
+    # (context_dominated=True).  In this regime:
+    #   • Segment 0 (full trajectory): spans transient → attractor.  The
+    #     nearest-neighbour divergence slope is dominated by the transient phase,
+    #     giving the correct (often negative) LLE.
+    #   • Segments 1, 2, … (late portions): start near the attractor where all
+    #     phase-space points are clustered.  The divergence curve is noise-
+    #     dominated, producing a near-zero or slightly positive slope that
+    #     inflates the average.  Empirical example: segment 0 → -0.028, average
+    #     across 3 segments → +0.029 (upward bias of ≈0.06).
+    #
+    # Fix: when context_dominated is True, collapse to a single segment (the
+    # full trajectory) regardless of the n_segments setting.
+    if context_dominated and n_segments > 1:
+        logger.info(
+            "  ⚠  context_dominated=True：自动降为 n_segments=1"
+            "（多段采样对上下文主导轨迹引入正向偏差，仅使用完整轨迹）。"
+        )
+        effective_n_segments = 1
+    else:
+        effective_n_segments = n_segments
+
+    if effective_n_segments <= 1:
         segment_fracs = [0.0]
     else:
-        segment_fracs = [k / n_segments for k in range(n_segments)]
+        segment_fracs = [k / effective_n_segments for k in range(effective_n_segments)]
 
     # ── Adaptive Rosenstein parameters ────────────────────────────────────────
     # Automatically reduce max_lag and min_sep when trajectories are short so
