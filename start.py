@@ -37,20 +37,32 @@ WS_HOST  = "127.0.0.1"  # 只监听本地，安全默认值
 
 
 def find_model() -> Optional[Path]:
-    """在项目目录内自动搜索训练好的模型文件。"""
+    """在项目目录内自动搜索训练好的模型文件（仅限训练检查点，排除图缓存）。"""
     candidates = list(project_root.glob("**/hetero_gnn_trained.pt"))
     candidates += list(project_root.glob("**/best_model.pt"))
-    candidates += list(project_root.glob("**/*.pt"))
-    # 排除临时/测试目录
-    candidates = [p for p in candidates if "__pycache__" not in str(p)]
+    candidates += list(project_root.glob("**/swa_model.pt"))
+    candidates += list(project_root.glob("**/checkpoint_epoch_*.pt"))
+    # 排除临时/测试目录和 graph_cache（图缓存是 HeteroData，不是模型检查点）
+    candidates = [
+        p for p in candidates
+        if "__pycache__" not in str(p) and "graph_cache" not in str(p)
+    ]
     return candidates[0] if candidates else None
 
 
 def start_web_server(web_dir: Path, port: int) -> None:
-    """在单独线程中启动静态文件服务器。"""
-    os.chdir(web_dir)
+    """在单独线程中启动静态文件服务器。
+
+    注意：不使用 os.chdir()，因为那会改变整个进程的工作目录，
+    导致 WebSocket 服务器的相对路径解析出现竞态条件。
+    改用 directory= 参数让 HTTP handler 直接服务指定目录。
+    """
+    web_dir_str = str(web_dir)
 
     class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=web_dir_str, **kwargs)
+
         def log_message(self, *args):
             pass  # 静默日志
 

@@ -367,14 +367,16 @@ function connect() {
   };
 
   ws.onerror = () => {
-    // Unlock stim button if a request was in-flight when the connection dropped.
+    // Unlock buttons if a request was in-flight when the connection dropped.
     _unlockStimBtn();
+    _unlockLoadBtn();
   };
   ws.onclose = () => {
     connected = false;
     setStatus(false);
-    // Unlock stim button so the UI doesn't stay permanently disabled.
+    // Unlock buttons so the UI doesn't stay permanently disabled.
     _unlockStimBtn();
+    _unlockLoadBtn();
     // Exponential backoff: double the delay each failure, cap at 30 s.
     const delay = _reconnectDelay;
     _reconnectDelay = Math.min(MAX_RECONNECT_MS, _reconnectDelay * 2);
@@ -395,9 +397,18 @@ function handleMsg(msg) {
   // Multi-frame sequence (stimulation result or cache data)
   if ((msg.type === 'simulation_result' || msg.type === 'cache_loaded')
       && Array.isArray(msg.frames) && msg.frames.length > 0) {
-    // Store per-modality frames when the server provides them
+    // Re-enable the load button if it was disabled during the request
+    if (msg.type === 'cache_loaded') _unlockLoadBtn();
+    // Store per-modality frames when the server provides them.
+    // When the server sends fMRI as the primary ``frames`` and omits
+    // ``frames_fmri`` to avoid duplicating the payload, reconstruct it here.
     if (Array.isArray(msg.frames_fmri) && msg.frames_fmri.length > 0) {
       framesFmri = msg.frames_fmri;
+    } else if (msg.type === 'cache_loaded'
+               && Array.isArray(msg.modalities)
+               && msg.modalities.includes('fmri')) {
+      // frames_fmri was omitted to save bandwidth; frames IS the fMRI data.
+      framesFmri = msg.frames;
     } else {
       framesFmri = [];
     }
@@ -499,6 +510,8 @@ function handleMsg(msg) {
   }
   if (msg.type === 'error') {
     console.warn('Server error:', msg.message);
+    // Always unlock the load button on any error (a load may have been pending)
+    _unlockLoadBtn();
     // Show error in whichever status element is currently awaiting a response.
     const ecStatus = document.getElementById('ec-status');
     if (ecStatus && ecStatus.textContent === '推断中…') {
@@ -508,9 +521,13 @@ function handleMsg(msg) {
     if (aStatus && aStatus.textContent.endsWith('…')) {
       aStatus.textContent = `⚠ ${msg.message}`;
     }
+    // If a cache load was pending, surface the error prominently
+    const fi = document.getElementById('frame-info');
+    if (fi && fi.textContent === '加载中…') {
+      fi.textContent = `⚠ 加载失败: ${msg.message || '未知错误'}`;
+    }
     // If a simulation was pending, also show the error in the stim info bar
     if (stimPending) {
-      const fi = document.getElementById('frame-info');
       if (fi) fi.textContent = `⚠ 仿真失败: ${msg.message || '未知错误'}`;
     }
   }
@@ -624,6 +641,21 @@ function _unlockStimBtn() {
   if (stimBtn._stimTimeout) { clearTimeout(stimBtn._stimTimeout); stimBtn._stimTimeout = null; }
   stimBtn.disabled = false;
   if (stimBtn._origText) { stimBtn.textContent = stimBtn._origText; stimBtn._origText = null; }
+}
+
+let _loadPending = false;
+function _lockLoadBtn() {
+  _loadPending = true;
+  const btn = document.getElementById('btn-load');
+  const fi  = document.getElementById('frame-info');
+  if (btn) { btn._origText = btn.textContent; btn.disabled = true; btn.textContent = '加载中…'; }
+  if (fi)  { fi.textContent = '加载中…'; }
+}
+function _unlockLoadBtn() {
+  if (!_loadPending) return;
+  _loadPending = false;
+  const btn = document.getElementById('btn-load');
+  if (btn) { btn.disabled = false; if (btn._origText) { btn.textContent = btn._origText; btn._origText = null; } }
 }
 
 function setStatus(ok) {
@@ -983,6 +1015,7 @@ document.getElementById('btn-mod-eeg').addEventListener('click', () => {
 document.getElementById('btn-load').addEventListener('click', () => {
   const path = (document.getElementById('cache-select').value.trim()) || null;
   if (connected && ws && ws.readyState === WebSocket.OPEN) {
+    _lockLoadBtn();
     ws.send(JSON.stringify({ type: "load_cache", path }));
   } else {
     alert('请先连接后端服务器（运行 python start.py）');
