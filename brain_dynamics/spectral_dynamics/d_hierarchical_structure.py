@@ -198,12 +198,14 @@ def _try_plot_dendrogram(
     label: str,
     method: str,
 ) -> None:
-    """绘制完整树形图 + 截断版（D1）。"""
+    """Plot full dendrogram + truncated version (D1)."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from scipy.cluster import hierarchy as sch
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -215,9 +217,9 @@ def _try_plot_dendrogram(
     sch.dendrogram(Z, ax=ax, truncate_mode="lastp", p=p_val,
                    leaf_rotation=90, leaf_font_size=7,
                    color_threshold=None)
-    ax.set_title(f"层级聚类树形图（显示最后 {p_val} 次合并）\n方法={method}  [{label}]")
-    ax.set_xlabel("节点/簇")
-    ax.set_ylabel("距离（1 - 归一化|W|）")
+    ax.set_title(f"Hierarchical Clustering Dendrogram (last {p_val} merges)\nmethod={method}  [{label}]")
+    ax.set_xlabel("Node/Cluster")
+    ax.set_ylabel("Distance (1 - norm|W|)")
 
     # Show cluster counts at several heights
     max_h = float(Z[:, 2].max())
@@ -225,7 +227,7 @@ def _try_plot_dendrogram(
         h = frac * max_h
         n_c = len(np.unique(hierarchy.fcluster(Z, t=h, criterion="distance")))
         ax.axhline(h, ls="--", color=color, lw=0.8, alpha=0.7,
-                   label=f"h={h:.2f} → {n_c} 簇")
+                   label=f"h={h:.2f} -> {n_c} clusters")
     ax.legend(fontsize=7)
 
     # n_clusters vs height curve
@@ -236,9 +238,9 @@ def _try_plot_dendrogram(
     ]
     ax2 = axes[1]
     ax2.plot(h_values / max_h, n_clusters_curve, "o-", ms=3, lw=1.5)
-    ax2.set_xlabel("截断高度（归一化）")
-    ax2.set_ylabel("簇数量")
-    ax2.set_title(f"簇数量 vs 截断高度  [{label}]")
+    ax2.set_xlabel("Cut height (normalised)")
+    ax2.set_ylabel("Number of clusters")
+    ax2.set_title(f"Cluster count vs cut height  [{label}]")
     ax2.set_yscale("log")
     # Mark "elbow" regions
     for frac, color in zip([0.2, 0.4, 0.6, 0.8], ["blue", "green", "orange", "red"]):

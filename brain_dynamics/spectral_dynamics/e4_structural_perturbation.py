@@ -243,11 +243,13 @@ def run_structural_perturbation(
 
 
 def _try_plot_perturbation(results: Dict, output_path: Path, label: str) -> None:
-    """扰动实验对比柱状图：PR / n_dominant / spectral_radius。"""
+    """Bar chart comparing perturbation conditions: PR / n_dominant / spectral_radius."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -255,7 +257,7 @@ def _try_plot_perturbation(results: Dict, output_path: Path, label: str) -> None
     existing = [c for c in conditions if c in results]
 
     metrics_to_plot = ["participation_ratio", "n_dominant", "spectral_radius"]
-    metric_labels = ["谱有效维度 PR", "主导特征值数 n_dom", "谱半径 ρ(W)"]
+    metric_labels = ["Effective dim. PR", "Dominant eigenvalues n_dom", "Spectral radius ρ(W)"]
 
     fig, axes = plt.subplots(1, len(metrics_to_plot), figsize=(13, 4))
     x = np.arange(len(existing))
@@ -274,7 +276,7 @@ def _try_plot_perturbation(results: Dict, output_path: Path, label: str) -> None
                 ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.02,
                         f"{v:.2f}", ha="center", va="bottom", fontsize=7)
 
-    fig.suptitle(f"结构扰动实验  [{label}]", fontsize=11)
+    fig.suptitle(f"Structural Perturbation Experiments  [{label}]", fontsize=11)
     fig.tight_layout()
     fig.savefig(output_path, dpi=120, bbox_inches="tight")
     plt.close(fig)

@@ -186,6 +186,8 @@ def _try_plot_energy_bar(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -195,19 +197,19 @@ def _try_plot_energy_bar(
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
 
     ax1.bar(ranks, energies[:N] * 100, color="steelblue", alpha=0.8)
-    ax1.set_xlabel("模态秩")
-    ax1.set_ylabel("模态能量 (%)")
-    ax1.set_title(f"模态能量分布（前 {N} 个）  [{label}]")
-    ax1.axhline(5.0, ls="--", color="red", lw=0.8, label="5% 线")
+    ax1.set_xlabel("Mode Rank")
+    ax1.set_ylabel("Mode Energy (%)")
+    ax1.set_title(f"Mode Energy Distribution (top {N})  [{label}]")
+    ax1.axhline(5.0, ls="--", color="red", lw=0.8, label="5% line")
     ax1.legend()
 
     ax2.plot(np.arange(1, len(cumul) + 1), cumul * 100, "o-", ms=3, lw=1.5)
     ax2.axhline(80, ls="--", color="orange", lw=1, label="80%")
     ax2.axhline(90, ls="--", color="red", lw=1, label="90%")
     ax2.axhline(95, ls="--", color="darkred", lw=1, label="95%")
-    ax2.set_xlabel("模态数量")
-    ax2.set_ylabel("累积能量 (%)")
-    ax2.set_title(f"累积模态能量  [{label}]")
+    ax2.set_xlabel("Number of Modes")
+    ax2.set_ylabel("Cumulative Energy (%)")
+    ax2.set_title(f"Cumulative Mode Energy  [{label}]")
     ax2.legend(fontsize=8)
 
     fig.tight_layout()
@@ -223,11 +225,13 @@ def _try_plot_modal_timeseries(
     traj_idx: int = 0,
     n_modes: int = 5,
 ) -> None:
-    """绘制单条轨迹的前 n_modes 个模态时序。"""
+    """Plot first n_modes modal time series for a single trajectory."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -246,8 +250,8 @@ def _try_plot_modal_timeseries(
         ax.set_ylabel(f"z_{k+1}")
         ax.axhline(0, ls="--", color="gray", lw=0.5)
 
-    axes[-1].set_xlabel("时间步")
-    axes[0].set_title(f"前 {n_modes} 模态时序（轨迹 {traj_idx}）  [{label}]")
+    axes[-1].set_xlabel("Time step")
+    axes[0].set_title(f"Top {n_modes} modal time series (traj {traj_idx})  [{label}]")
     fig.tight_layout()
     fig.savefig(output_path, dpi=120, bbox_inches="tight")
     plt.close(fig)

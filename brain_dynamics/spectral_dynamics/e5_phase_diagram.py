@@ -164,11 +164,13 @@ def run_phase_diagram(
 
 
 def _try_plot_phase_diagram(result: Dict, output_path: Path, label: str) -> None:
-    """绘制谱半径 vs g 相图。"""
+    """Plot spectral radius vs coupling strength g phase diagram."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -177,7 +179,7 @@ def _try_plot_phase_diagram(result: Dict, output_path: Path, label: str) -> None
 
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.plot(g, rhos, "k-o", ms=3, lw=1.5, label="ρ(g·W)")
-    ax.axhline(1.0, ls="--", color="red", lw=1, label="ρ=1 (线性临界)")
+    ax.axhline(1.0, ls="--", color="red", lw=1, label="rho=1 (linear critical)")
     ax.axvline(result["g_linear_critical"], ls=":", color="gray", lw=1,
                label=f"g_critical={result['g_linear_critical']:.2f}")
 
@@ -193,9 +195,9 @@ def _try_plot_phase_diagram(result: Dict, output_path: Path, label: str) -> None
             arrowprops=dict(arrowstyle="->", color="blue", lw=0.8),
         )
 
-    ax.set_xlabel("耦合强度 g")
-    ax.set_ylabel("谱半径 ρ(g·W)")
-    ax.set_title(f"耦合强度相图（谱半径解析扫描）  [{label}]")
+    ax.set_xlabel("Coupling strength g")
+    ax.set_ylabel("Spectral radius rho(g·W)")
+    ax.set_title(f"Coupling Strength Phase Diagram (spectral radius scan)  [{label}]")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 

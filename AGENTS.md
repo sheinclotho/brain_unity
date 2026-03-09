@@ -769,3 +769,20 @@ r ≈ 0 的两个神经生物学合理原因：
 
 - **规则**: `spectral_dynamics` 中不得再出现 WC step / Rosenstein LLE / L1 投影的本地实现；
   所有此类功能必须通过 `from analysis.wc_dynamics import ...` 调用。
+
+### [2026-03-09] CJK 字体警告修复 & 计划书实现
+
+#### CJK Glyph 警告根因与修复
+- **根因**: DejaVu Sans 不含 CJK 字形，所有 spectral_dynamics 可视化文件的 `set_xlabel/set_title` 等中文字符串触发 `UserWarning: Glyph NNN missing from font(s) DejaVu Sans`。
+- **修复方案 A**: 新增 `spectral_dynamics/plot_utils.py` 的 `configure_matplotlib()` 函数，自动检测系统 CJK 字体并配置 `rcParams['font.sans-serif']`。
+- **修复方案 B**: 将 10 个文件中所有 matplotlib 轴标签/标题改为英文（最可移植方案），中文保留在 docstring/注释中。
+- **规则**: spectral_dynamics 中所有新增 matplotlib 绘图函数：(1) 必须先调用 `from spectral_dynamics.plot_utils import configure_matplotlib; configure_matplotlib()`；(2) 所有 xlabel/ylabel/title/colorbar label 必须使用英文字符串。
+
+#### 管线改进
+- **P0-1**: Phase 3h D₂ 现为多轨迹/多窗口分布估计，输出 D2_mean/std/fail_rate/D2_h2_reliable。
+- **P0-3**: CSD 默认启用（`advanced.critical_slowing_down.enabled: true`），H3 评估包含 CSD Kendall-τ 证据。
+- **P0-4**: Phase 2 计算 connectivity_source/evidence_grade (A/C)；Phase 6 输出 confidence_flags 并对 FC-only (C级) 分析自动降低 H1 置信度。
+- **P1-1**: 新增 `brain_dynamics/analysis/intrinsic_dimension.py`（TwoNN 估计器），Phase 4 步骤 4e 集成。
+- **P2-1**: pipeline_report.json 新增 run_timestamp、metadata (seed/n_init/steps/modality/cfg_hash)、dmd_interpretation_note。
+
+*Last updated: 2026-03-09*

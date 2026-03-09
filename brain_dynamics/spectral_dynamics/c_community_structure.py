@@ -272,11 +272,13 @@ def _try_plot_community_histogram(
     output_path: Path,
     label: str,
 ) -> None:
-    """社区规模直方图（C3）。"""
+    """Community size histogram (C3)."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -287,20 +289,21 @@ def _try_plot_community_histogram(
 
     # Histogram of community sizes
     ax1.bar(range(n_communities), counts, color="steelblue", alpha=0.8, edgecolor="k", lw=0.5)
-    ax1.set_xlabel("社区编号")
-    ax1.set_ylabel("节点数")
-    ax1.set_title(f"社区规模分布（k={n_communities}, Q={Q:.3f}）  [{label}]")
-    ax1.axhline(counts.mean(), ls="--", color="red", lw=1, label=f"均值={counts.mean():.1f}")
+    ax1.set_xlabel("Community ID")
+    ax1.set_ylabel("Node Count")
+    ax1.set_title(f"Community Size Distribution (k={n_communities}, Q={Q:.3f})  [{label}]")
+    ax1.axhline(counts.mean(), ls="--", color="red", lw=1, label=f"mean={counts.mean():.1f}")
     ax1.legend()
 
     # Pie chart
     ax2.pie(counts, labels=[f"C{i+1}" for i in range(n_communities)],
             autopct="%1.0f%%", startangle=90,
             colors=plt.cm.tab10(np.linspace(0, 0.9, n_communities)))
-    ax2.set_title("社区规模比例")
+    ax2.set_title("Community Size Proportion")
 
-    fig.suptitle(f"社区结构（k={n_communities}, Q={Q:.3f}, "
-                 f"{'强' if Q > 0.4 else '中' if Q > 0.2 else '弱'}模块化）  [{label}]",
+    _mod_str = "strong" if Q > 0.4 else ("med" if Q > 0.2 else "weak")
+    fig.suptitle(f"Community Structure (k={n_communities}, Q={Q:.3f}, "
+                 f"{_mod_str} modularity)  [{label}]",
                  fontsize=11)
     fig.tight_layout()
     fig.savefig(output_path, dpi=120, bbox_inches="tight")
@@ -313,11 +316,13 @@ def _try_plot_q_vs_k(
     output_path: Path,
     label: str,
 ) -> None:
-    """绘制 Q vs k 曲线，帮助选择最优社区数。"""
+    """Plot Q vs k curve to aid optimal community count selection."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -327,12 +332,12 @@ def _try_plot_q_vs_k(
 
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(ks, qs, "o-", ms=6, lw=1.8, color="steelblue")
-    ax.axvline(best_k, ls="--", color="red", lw=1, label=f"最优 k={best_k}")
-    ax.axhline(0.4, ls=":", color="orange", lw=1, label="Q=0.4（强模块化阈值）")
+    ax.axvline(best_k, ls="--", color="red", lw=1, label=f"best k={best_k}")
+    ax.axhline(0.4, ls=":", color="orange", lw=1, label="Q=0.4 (strong mod.)")
     ax.axhline(0.2, ls=":", color="gray", lw=0.8, label="Q=0.2")
-    ax.set_xlabel("社区数量 k")
-    ax.set_ylabel("模块度 Q")
-    ax.set_title(f"模块度 vs 社区数量  [{label}]")
+    ax.set_xlabel("Number of communities k")
+    ax.set_ylabel("Modularity Q")
+    ax.set_title(f"Modularity vs Number of Communities  [{label}]")
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(output_path, dpi=120, bbox_inches="tight")

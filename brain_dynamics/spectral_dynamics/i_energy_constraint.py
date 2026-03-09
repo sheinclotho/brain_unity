@@ -159,11 +159,13 @@ def _energy_budget_builtin(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _try_plot(result: Dict, output_path: Path, label: str) -> None:
-    """能量分布直方图 + 推荐预算标注。"""
+    """Energy distribution histogram + recommended budget annotations."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
@@ -182,9 +184,9 @@ def _try_plot(result: Dict, output_path: Path, label: str) -> None:
     ax = axes[0]
     ax.hist(E_per_region, bins=30, color="steelblue", alpha=0.75, edgecolor="k", lw=0.4)
     ax.axvline(E_mean, ls="--", color="red", lw=1.5, label=f"E*={E_mean:.4f}")
-    ax.set_xlabel("脑区平均能量 E")
-    ax.set_ylabel("脑区数")
-    ax.set_title("脑区能量分布")
+    ax.set_xlabel("Region Mean Energy E")
+    ax.set_ylabel("Region Count")
+    ax.set_title("Region Energy Distribution")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
@@ -196,15 +198,15 @@ def _try_plot(result: Dict, output_path: Path, label: str) -> None:
         colors = ["#d62728", "#ff7f0e", "#2ca02c", "#1f77b4"]
         ax2.bar(keys, vals, color=colors[:len(keys)], alpha=0.8, edgecolor="k", lw=0.5)
         ax2.axhline(E_mean, ls="--", color="gray", lw=1, label=f"E*={E_mean:.4f}")
-        ax2.set_ylabel("E_budget 推荐值")
-        ax2.set_title("推荐能量预算")
+        ax2.set_ylabel("Recommended E_budget")
+        ax2.set_title("Recommended Energy Budgets")
         ax2.legend(fontsize=8)
         ax2.set_xticklabels(keys, rotation=20, ha="right", fontsize=8)
         for i, v in enumerate(vals):
             ax2.text(i, v + 0.002, f"{v:.4f}", ha="center", va="bottom", fontsize=7)
         ax2.grid(True, alpha=0.3, axis="y")
 
-    fig.suptitle(f"能量约束预算分析  [{label}]", fontsize=11)
+    fig.suptitle(f"Energy Constraint Budget Analysis  [{label}]", fontsize=11)
     fig.tight_layout()
     fig.savefig(output_path, dpi=120, bbox_inches="tight")
     plt.close(fig)

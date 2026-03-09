@@ -218,16 +218,18 @@ def _try_plot_spectral_comparison(
     output_path: Path,
     label: str,
 ) -> None:
-    """小提琴/箱线图对比：PR、n_dominant、gap_ratio、spectral_radius。"""
+    """Violin/box plot comparison: PR, n_dominant, gap_ratio, spectral_radius."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
     except ImportError:
         return
 
     metrics_keys  = ["participation_ratio", "n_dominant", "spectral_gap_ratio", "spectral_radius"]
-    metric_labels = ["谱有效维度 PR", "主导特征值数", "谱间隙比", "谱半径 ρ"]
+    metric_labels = ["Effective dim. PR", "Dominant eigenvalues", "Spectral gap ratio", "Spectral radius rho"]
 
     fig, axes = plt.subplots(1, len(metrics_keys), figsize=(14, 5))
     group_names  = ["Real", "ER", "DPR", "WS"]
@@ -265,7 +267,7 @@ def _try_plot_spectral_comparison(
         ax.set_ylabel(ml)
         ax.set_title(ml)
 
-    fig.suptitle(f"随机网络谱结构对比  [{label}]", fontsize=11)
+    fig.suptitle(f"Random Network Spectral Structure Comparison  [{label}]", fontsize=11)
     fig.tight_layout()
     fig.savefig(output_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
