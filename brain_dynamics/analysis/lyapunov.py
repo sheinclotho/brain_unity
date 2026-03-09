@@ -1983,16 +1983,16 @@ def _try_plot_spectrum(
            label="λ ≤ 0 (contracting)")
     ax.axhline(0, color="black", lw=0.8, ls="--")
     ax.set_xlabel("Rank  i")
-    ax.set_ylabel("λᵢ  (nats / step)")
+    ax.set_ylabel("lambda_i  (nats / step)")
     ax.set_title(f"Lyapunov Spectrum  [k={k}]\n"
-                 f"λ₁={float(mean_spec[0]):.4f}  D_KY={dky:.2f}")
+                 f"LLE={float(mean_spec[0]):.4f}  D_KY={dky:.2f}")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.25)
 
     # Right: cumulative sum with D_KY annotation
     ax2 = axes[1]
     ax2.plot(ranks, cumsum, "k-o", ms=3, lw=1.5)
-    ax2.axhline(0, color="red", lw=0.8, ls="--", label="Σλ = 0")
+    ax2.axhline(0, color="red", lw=0.8, ls="--", label="sum(lambda) = 0")
     ax2.fill_between(ranks, cumsum, 0, where=(cumsum >= 0),
                      alpha=0.15, color="tomato")
     ax2.fill_between(ranks, cumsum, 0, where=(cumsum < 0),
@@ -2002,7 +2002,7 @@ def _try_plot_spectrum(
         ax2.axvline(dky, color="purple", lw=1.2, ls=":",
                     label=f"D_KY = {dky:.2f}")
     ax2.set_xlabel("Rank  i")
-    ax2.set_ylabel("Σᵢ₌₁ⁱ λ")
+    ax2.set_ylabel("cumulative lambda")
     ax2.set_title("Cumulative Lyapunov Sum\n"
                   "D_KY = where cumsum crosses zero")
     ax2.legend(fontsize=8)
@@ -2068,11 +2068,11 @@ def _try_plot_divergence_curve(
                             reg_vals[reg_finite], deg=1)
         fit_line = np.polyval(coeffs, reg_lags)
         ax.plot(reg_lags, fit_line, "r--", lw=1.2, alpha=0.5,
-                label=f"Linear fit  (λ₁={lle:.5f} nats/step)")
+                label=f"Linear fit  (LLE={lle:.5f} nats/step)")
 
     ax.axhline(0, color="gray", lw=0.6, ls=":")
     ax.set_xlabel("Lag  j  (steps)")
-    ax.set_ylabel("S(j) = ⟨log ||δx(j)||⟩")
+    ax.set_ylabel("S(j) = mean log ||dx(j)||")
     ax.set_title(
         f"Rosenstein Lyapunov Divergence Curve\n"
         f"LLE = {lle:.5f} nats/step  "
