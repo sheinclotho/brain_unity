@@ -277,8 +277,8 @@ class ModelServer:
         results = []
         current_state = initial_state.clone()
 
-        # Deviation-based leaky integrator (same model as _demo_simulate in
-        # realtime_server.py).  The initial state is the stable resting equilibrium:
+        # Deviation-based leaky integrator (point-stimulation, no assumed connectivity).
+        # The initial state is the stable resting equilibrium:
         #   deviation  = state − init                  (0 at rest)
         #   net_dev    = W @ deviation                 (propagate deviations, not absolutes)
         #   delta      = tanh(stim*2.0 + net_dev*0.35) * 0.04
@@ -289,6 +289,11 @@ class ModelServer:
         # NOTE: initial_state may come from the frontend in [0,1] display space;
         # the deviation-based formula keeps state in [0,1] so _state_to_json must
         # NOT apply its usual tanh renormalisation (already_normalized=True).
+        #
+        # NOTE: this path is only reached when BrainVisualizationServer has no
+        # TwinBrainDigitalTwin loaded (i.e. model_path was not provided or the
+        # import failed).  The primary simulation path in realtime_server.py uses
+        # TwinBrainDigitalTwin.simulate_intervention for scientifically valid results.
         init_state_1d = current_state.squeeze(-1).clone()   # (n_regions,) — equilibrium
         connectivity  = self._get_connectivity_matrix()
         rng = torch.Generator()
@@ -306,7 +311,7 @@ class ModelServer:
             deviation = state_1d - init_state_1d
             net_dev   = connectivity @ deviation
 
-            # Deviation-based WC: fixed point at init_state_1d (not at 0 or ~0.8)
+            # Deviation-based leaky integrator: fixed point at init_state_1d
             delta      = torch.tanh(stim * 2.0 + net_dev * 0.35) * 0.04
             leak       = deviation * 0.10
             noise      = torch.randn(n_regions, generator=rng) * 0.008
@@ -367,21 +372,16 @@ class ModelServer:
                                   + 0.20 * np.sin(2 * np.pi * slow_cycles * progress))
         
         elif pattern == "pulse":
-            # Exponential-decay neural-response envelope — same as _demo_simulate and
-            # predict_trajectory.  The old square-wave (signal[::interval] = amplitude)
-            # degenerated to constant amplitude for frequency ≥ 2 Hz because the
-            # interval formula rounded to 0 → max(1,0) = 1 → every frame was "on".
+            # Exponential-decay neural-response envelope.
             signal = amplitude * np.exp(-np.arange(n_steps, dtype=np.float32) * 0.12)
         
         elif pattern == "ramp":
-            # Use (k+0.5)/n_steps so the first frame is non-zero, matching the
-            # _demo_simulate and predict_trajectory convention (avoids exact 0 at k=0).
+            # Use (k+0.5)/n_steps so the first frame is non-zero.
             progress = (np.arange(n_steps, dtype=np.float32) + 0.5) / max(n_steps, 1)
             signal = amplitude * progress
         
         elif pattern == "constant":
-            # 15%-duration ramp-up, then sustained — matches _demo_simulate and offline JS
-            # (avoids sudden color jump while keeping full amplitude for most of DUR).
+            # 15%-duration ramp-up, then sustained (avoids sudden color jump).
             progress = np.arange(n_steps, dtype=np.float32)
             signal = amplitude * np.minimum(1.0, progress / max(n_steps * 0.15, 1.0))
         

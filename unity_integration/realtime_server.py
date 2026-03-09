@@ -6,7 +6,7 @@ WebSocket server for real-time communication with the web frontend.
 
 Supported request types (``type`` field):
   get_state        – Return current demo brain activity (200-region float array)
-  simulate         – Virtual stimulation simulation (WC / surrogate MLP / GNN)
+  simulate         – Virtual stimulation (TwinBrainDigitalTwin GNN / surrogate MLP after infer_ec)
   load_cache       – Load a .pt cache file and stream its full time series
   list_cache_files – List all discoverable .pt cache files on the server
   infer_ec         – Infer effective connectivity (Jacobian or perturbation method)
@@ -20,6 +20,7 @@ Start the server::
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 from typing import Dict, Any, Set, Optional
@@ -42,6 +43,10 @@ except ImportError:
     MODEL_SERVER_AVAILABLE = False
     logging.warning("ModelServer not available")
 
+# Thread-pool executor used to run json.dumps off the asyncio event loop so
+# that large (multi-MB) responses do not block the WebSocket handler coroutine.
+_JSON_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                       thread_name_prefix="json_ser")
 
 def _import_brain_state_analyzer():
     """Robustly import BrainStateAnalyzer regardless of the import context."""
@@ -141,25 +146,34 @@ class BrainVisualizationServer:
                infer_ec, validate_ec, analyze_brain.
     """
 
+    # Project root — two levels up from this file (unity_integration/ → repo root).
+    # Used to build absolute search paths so they remain stable even when the
+    # process CWD is changed by other threads (e.g. the HTTP static-file server).
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
     # Directories searched for .pt cache files (in priority order).
+    # All paths are absolute so they are unaffected by os.chdir() calls.
     # V5 training pipeline writes per-subject graph caches to
     # ``outputs/graph_cache/`` (configurable via data.cache.dir).
-    _CACHE_SEARCH_DIRS = [
-        Path("outputs/graph_cache"),   # V5 default (API §2, data.cache.dir)
-        Path("outputs"),               # V5 training output root — also holds checkpoints
-                                       # that are excluded via _is_checkpoint_file()
-        Path("."),                     # current working directory
-        Path(".."),                    # parent directory (fallback)
-    ]
-    # Filename stems of training checkpoint files that should never be
-    # returned as graph-cache candidates (they have a completely different
-    # internal format and would cause confusing errors).
+    @classmethod
+    def _build_cache_search_dirs(cls) -> list:
+        root = cls._PROJECT_ROOT
+        return [
+            root / "outputs" / "graph_cache",  # V5 default (API §2, data.cache.dir)
+            root / "outputs",                  # V5 training output root
+            root,                              # project root (flat layout)
+        ]
+
     _CHECKPOINT_STEMS = {"best_model", "swa_model"}
-    # Filename prefix of periodic checkpoint files (e.g. checkpoint_epoch_10.pt)
     _CHECKPOINT_PREFIX = "checkpoint_epoch"
-    # Minimum file size (bytes) to be considered a valid cache (filters out
-    # empty placeholder files and zero-byte torch.save() artefacts).
     _MIN_CACHE_SIZE = 1024
+
+    # Maximum number of frames sent per modality in a cache_loaded response.
+    # Frames are uniformly sub-sampled to this limit so the JSON payload stays
+    # well below 5 MB regardless of recording duration or EEG sampling rate.
+    # 500 frames gives smooth scrubbing for a typical fMRI session (TR=2 s →
+    # 1000 s of data); for high-frequency EEG every k-th frame is kept.
+    _MAX_FRAMES_PER_MODALITY: int = 500
 
 
     def __init__(
@@ -185,13 +199,37 @@ class BrainVisualizationServer:
                 "Use 'model_path' to load a trained model."
             )
 
-        self.model_server = None
-        if MODEL_SERVER_AVAILABLE and model_path:
-            self.model_server = ModelServer(
-                model_path=model_path,
-                output_dir=output_dir or "unity_project/brain_data/model_output"
-            )
-            self.logger.info("✓ ModelServer initialized")
+        # Primary inference engine: TwinBrainDigitalTwin loaded from a checkpoint.
+        # When a model_path is provided, try to initialise the GNN-based twin.
+        # If loading fails (e.g. incomplete dependencies), self._twin stays None
+        # and the server falls back to the surrogate-MLP path after infer_ec.
+        self._twin = None
+        self.model_server = None  # kept for legacy output-dir management only
+        if model_path:
+            _repo_root = self._PROJECT_ROOT
+            import sys as _sys
+            if str(_repo_root) not in _sys.path:
+                _sys.path.insert(0, str(_repo_root))
+            try:
+                from brain_dynamics.loader.load_model import load_trained_model
+                self._twin = load_trained_model(
+                    model_path=str(model_path), device="cpu"
+                )
+                self.logger.info("✓ TwinBrainDigitalTwin 推理引擎初始化完成")
+            except Exception as _exc:
+                self.logger.warning(
+                    f"TwinBrainDigitalTwin 加载失败 ({_exc})；"
+                    "仿真功能将依赖 EC 代理模型（需先运行 infer_ec）"
+                )
+            # Keep ModelServer for output-dir creation and parameter logging.
+            if MODEL_SERVER_AVAILABLE:
+                try:
+                    self.model_server = ModelServer(
+                        model_path=str(model_path),
+                        output_dir=str(output_dir or "unity_project/brain_data/model_output"),
+                    )
+                except Exception:
+                    pass
 
         self.clients: Set = set()
 
@@ -199,6 +237,10 @@ class BrainVisualizationServer:
         # Key: (cache_file_path_str, n_lags) so the surrogate is only retrained
         # when the source data or lag window changes, not on every infer_ec call.
         self._ec_analyzer_cache: dict = {}
+
+        # Edge-reconstructed HeteroData graph, prepared when the user loads a
+        # cache file.  Required by TwinBrainDigitalTwin.simulate_intervention.
+        self._loaded_graph = None
 
         # Last loaded time series — stored so handle_validate_ec and
         # handle_analyze_brain can access it without re-loading the .pt file.
@@ -231,14 +273,30 @@ class BrainVisualizationServer:
         """Handle client connection and requests."""
         await self.register_client(websocket)
 
+        loop = asyncio.get_event_loop()
+
         try:
             async for message in websocket:
                 try:
                     request = json.loads(message)
                     response = await self.process_request(request)
-                    await websocket.send(json.dumps(response))
+                    # Serialise the response off the event loop so that large
+                    # payloads (e.g. multi-modality cache data with thousands of
+                    # EEG frames) do not block the asyncio event loop and cause
+                    # the connection to appear stalled.
+                    payload = await loop.run_in_executor(
+                        _JSON_EXECUTOR,
+                        lambda: json.dumps(response, allow_nan=False),
+                    )
+                    await websocket.send(payload)
                 except json.JSONDecodeError:
                     error = {"type": "error", "message": "Invalid JSON"}
+                    await websocket.send(json.dumps(error))
+                except (ValueError, OverflowError) as e:
+                    # json.dumps raises ValueError for NaN/Inf values that
+                    # slipped through sanitisation.
+                    self.logger.error(f"JSON serialisation error: {e}")
+                    error = {"type": "error", "message": f"序列化错误（含 NaN/Inf）: {e}"}
                     await websocket.send(json.dumps(error))
                 except Exception as e:
                     self.logger.error(f"Error processing request: {e}")
@@ -410,129 +468,107 @@ class BrainVisualizationServer:
             if len(valid_regions) < len(target_regions):
                 self.logger.warning(f"Filtered {len(target_regions) - len(valid_regions)} invalid region IDs")
                 target_regions = valid_regions
-            
-            # Use ModelServer if available
-            if self.model_server:
-                # Create timestamped output directory only when ModelServer will actually
-                # use it — avoids leaving empty dirs on every demo/surrogate simulation.
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_base = Path(self.model_server.output_dir)
-                stim_output_dir = output_base / "stimulation" / f"stim_{timestamp}"
-                stim_output_dir.mkdir(parents=True, exist_ok=True)
-                self.logger.info(f"Stimulation output directory: {stim_output_dir}")
-                self.logger.info(f"Using ModelServer for stimulation simulation")
-                # Convert the user's initial_state list to a tensor so ModelServer
-                # starts from the actual brain state rather than random noise.
-                init_tensor = None
-                if initial_state is not None:
-                    arr = np.array(initial_state[:n_regions], dtype=np.float32)
-                    init_tensor = torch.tensor(arr).unsqueeze(-1)  # (n_regions, 1)
-                responses = self.model_server.simulate_stimulation(
-                    target_regions=target_regions,
-                    amplitude=amplitude,
-                    pattern=pattern,
-                    frequency=frequency,
-                    duration=duration,
-                    initial_state=init_tensor,
-                    subject_id="stimulation"
-                )
-                
-                # Auto-save each frame as JSON for progressive playback support.
-                self.logger.info(f"Auto-saving {len(responses)} stimulation frames to {stim_output_dir}")
-                for idx, response in enumerate(responses):
-                    json_path = stim_output_dir / f"frame_{idx:04d}.json"
-                    with open(json_path, 'w', encoding='utf-8') as f:
-                        json.dump(response, f, indent=2)
 
-                # Create sequence index
-                index_data = {
-                    "type": "stimulation_sequence",
-                    "timestamp": timestamp,
-                    "stimulation_params": {
-                        "target_regions": target_regions,
-                        "amplitude": amplitude,
-                        "pattern": pattern,
-                        "frequency": frequency,
-                        "duration": duration
-                    },
-                    "n_frames": len(responses),
-                    "output_dir": str(stim_output_dir),
-                    "files": [f"frame_{i:04d}.json" for i in range(len(responses))]
-                }
-                index_path = stim_output_dir / "sequence_index.json"
-                with open(index_path, 'w', encoding='utf-8') as f:
-                    json.dump(index_data, f, indent=2)
-                
-                self.logger.info(f"✓ Stimulation results auto-saved to: {stim_output_dir}")
-                
-                frames = [{"activity": self._extract_activity_array(r)} for r in responses]
-                # Counterfactual: run ModelServer with amplitude=0 so frame count and
-                # dynamics exactly match the stimulated run (valid scientific comparison).
-                # Using _demo_simulate here gave a different frame count (PRE+DUR+POST vs
-                # DUR) and different dynamics, making the CF toggle misleading.
-                cf_responses = self.model_server.simulate_stimulation(
-                    target_regions=target_regions,
-                    amplitude=0.0,
-                    pattern=pattern,
-                    frequency=frequency,
-                    duration=duration,
-                    initial_state=init_tensor,
-                    subject_id="stimulation_cf",
-                )
-                cf_frames = [{"activity": self._extract_activity_array(r)} for r in cf_responses]
-                # Pattern-aware start_frame: point to the frame with maximum stim effect.
-                # ModelServer has no pre-stim frames (frame 0 = first stim step), so we
-                # index directly without adding a PRE offset.
-                _PULSE_PEAK_K = 9
-                _ms_dur = min(int(duration), 60)
-                if pattern == "pulse":
-                    _ms_peak_k = min(_PULSE_PEAK_K, _ms_dur - 1)
-                elif pattern == "ramp":
-                    _ms_peak_k = max(0, _ms_dur * 3 // 4)
-                else:  # sine, constant
-                    _ms_peak_k = _ms_dur // 2
-                ms_top_affected, ms_peak_delta = _compute_top_affected(
-                    frames, cf_frames, _ms_peak_k, valid_regions
-                )
-                return {
-                    "type": "simulation_result",
-                    "success": True,
-                    "n_frames": len(frames),
-                    "frames": frames,
-                    "counterfactual_frames": cf_frames,
-                    "modality": "simulation",
-                    "method": "model_server",
-                    "start_frame": _ms_peak_k,
-                    "top_affected": ms_top_affected,
-                    "peak_delta": ms_peak_delta,
-                    "saved_to": str(stim_output_dir),
-                    "index_file": str(index_path),
-                }
+            # ── Path 1: TwinBrainDigitalTwin GNN simulation ────────────────
+            # Requires: trained model (_twin) + edge-reconstructed graph
+            # (_loaded_graph, set when the user loads a cache file).
+            # Returns causal_effect (perturbed − baseline) tensors which are
+            # converted to per-frame activity arrays for the timeline.
+            if self._twin is not None and self._loaded_graph is not None:
+                try:
+                    self.logger.info("TwinBrainDigitalTwin 仿真中…")
+                    # Determine which modality to stimulate (prefer fMRI)
+                    _stim_modality = (
+                        "fmri" if "fmri" in self._loaded_graph.node_types else
+                        self._loaded_graph.node_types[0]
+                    )
+                    interventions = {
+                        _stim_modality: (list(target_regions), float(amplitude))
+                    }
+                    twin_result = self._twin.simulate_intervention(
+                        baseline_data=self._loaded_graph,
+                        interventions=interventions,
+                        num_prediction_steps=int(duration),
+                    )
+                    # ── Convert to visualisation frames ──────────────────
+                    _mod = _stim_modality
+                    perturbed_t = twin_result["perturbed"][_mod]    # [N, steps, C]
+                    baseline_t  = twin_result["baseline"][_mod]     # [N, steps, C]
+                    causal_t    = twin_result["causal_effect"][_mod] # [N, steps, C]
 
-            # ── Data-driven surrogate path (requires prior EC inference) ──────
+                    pert_np  = perturbed_t.detach().cpu().float().numpy()[:, :, 0]  # [N, steps]
+                    base_np  = baseline_t.detach().cpu().float().numpy()[:, :, 0]   # [N, steps]
+                    caus_np  = causal_t.detach().cpu().float().numpy()[:, :, 0]     # [N, steps]
+
+                    N_model, steps = pert_np.shape
+                    # Percentile-normalise perturbed and baseline to [0,1] using
+                    # the same scale so the two are directly comparable.
+                    flat = np.concatenate([pert_np.ravel(), base_np.ravel()])
+                    _p5, _p95 = np.percentile(flat, 5), np.percentile(flat, 95)
+                    _scale = max(float(_p95 - _p5), 1e-6)
+
+                    def _twin_to_frames(x_np):
+                        norms = np.clip((x_np - _p5) / _scale, 0.0, 1.0).astype(np.float32)
+                        if N_model == n_regions:
+                            return [{"activity": norms[:, t].tolist()} for t in range(steps)]
+                        src = np.linspace(0.0, 1.0, N_model)
+                        dst = np.linspace(0.0, 1.0, n_regions)
+                        return [
+                            {"activity": np.interp(dst, src, norms[:, t]).astype(np.float32).tolist()}
+                            for t in range(steps)
+                        ]
+
+                    frames    = _twin_to_frames(pert_np)
+                    cf_frames = _twin_to_frames(base_np)
+
+                    # Peak frame: step where mean absolute causal effect is largest
+                    peak_idx = int(np.argmax(np.abs(caus_np).mean(axis=0)))
+
+                    tw_top_affected, tw_peak_delta = _compute_top_affected(
+                        frames, cf_frames, peak_idx, valid_regions
+                    )
+                    self.logger.info(
+                        f"✓ TwinBrainDigitalTwin 仿真完成: {steps} 帧, "
+                        f"峰值帧={peak_idx}"
+                    )
+                    return {
+                        "type":                "simulation_result",
+                        "success":             True,
+                        "n_frames":            len(frames),
+                        "frames":              frames,
+                        "counterfactual_frames": cf_frames,
+                        "modality":            "simulation",
+                        "method":              "digital_twin",
+                        "start_frame":         peak_idx,
+                        "top_affected":        tw_top_affected,
+                        "peak_delta":          tw_peak_delta,
+                    }
+                except Exception as _exc:
+                    self.logger.warning(
+                        f"TwinBrainDigitalTwin 仿真失败 ({_exc})，"
+                        "尝试 EC 代理模型路径"
+                    )
+
+            # ── Path 2: Data-driven surrogate path (requires prior EC inference)
             # If the user has already run "推断有效连接", a trained MLP surrogate is
             # available in _ec_analyzer_cache.  Use predict_trajectory to produce a
-            # REAL data-driven forecast instead of generic Wilson-Cowan dynamics.
+            # data-driven forecast based on the loaded brain data.
             #
             # Stimulation mechanics (NPI principle):
             #   Only the exact target regions receive the external perturbation.
             #   stim_weights is a point / indicator function (1.0 at targets, 0
-            #   elsewhere), NOT a spatial Gaussian.  This ensures that every
+            #   elsewhere), NOT a spatial spread kernel.  This ensures that every
             #   change seen in OTHER regions comes exclusively from what the
             #   surrogate learned about functional connectivity — the model
-            #   handles all propagation.  Using a Gaussian spread here would
-            #   pre-distribute the stimulation to neighbours before the model
-            #   runs, mixing the physical-spread assumption with the learned
-            #   connectivity and making the two impossible to disentangle.
+            #   handles all propagation.
             surrogate_frames = None
+            surrogate_cf     = None
             if initial_state is not None and self._ec_analyzer_cache:
                 analyzer = list(self._ec_analyzer_cache.values())[-1]
                 if (analyzer._surrogate is not None
                         and analyzer._ts_mean is not None
                         and analyzer.n_regions == n_regions):
                     try:
-                        # Point stimulation: 1.0 at each selected target, 0 elsewhere.
-                        # The surrogate MLP propagates the effect to connected regions.
                         sw = np.zeros(n_regions, dtype=np.float32)
                         for tid in target_regions:
                             if 0 <= tid < n_regions:
@@ -543,9 +579,6 @@ class BrainVisualizationServer:
                         POST_s = 10
 
                         def _stim_amp_s(k: int) -> float:
-                            # (k+0.5)/DUR_s: centers each frame in its time slot so
-                            # the bell envelope is never evaluated at exactly 0 or 1,
-                            # ensuring non-zero amplitude even when DUR_s == 1 or 2.
                             progress = (k + 0.5) / max(DUR_s, 1)
                             if pattern == "sine":
                                 slow_c = min(frequency / 10.0, 3.0)
@@ -558,13 +591,6 @@ class BrainVisualizationServer:
                             else:
                                 return amplitude * min(1.0, k / max(DUR_s * 0.15, 1.0))
 
-                        # Unified stim_fn covers all three phases:
-                        #   k < PRE_s            → pre-stim (surrogate runs, no external input)
-                        #   PRE_s ≤ k < PRE_s+DUR_s → stimulation active
-                        #   k ≥ PRE_s+DUR_s      → post-stim recovery (no external input)
-                        # Using a single call with n_warmup=0 (lag window warms up during
-                        # the pre-stim region where stim_fn returns 0), so the pre-stim
-                        # frames show genuine baseline dynamics, not static copies.
                         def _stim_fn_full(k: int) -> float:
                             if k < PRE_s:
                                 return 0.0
@@ -574,18 +600,12 @@ class BrainVisualizationServer:
                             return 0.0
 
                         init_arr = np.array(initial_state[:n_regions], dtype=np.float32)
-
                         surrogate_frames = analyzer.predict_trajectory(
                             initial_state=init_arr,
                             stim_weights=sw,
                             stim_fn=_stim_fn_full,
                             n_steps=PRE_s + DUR_s + POST_s,
                         )
-
-                        # Counterfactual: same initial state, zero stimulation.
-                        # Because predict_trajectory is deterministic (no noise), the
-                        # pre-stim frames will be identical between stimulated and
-                        # counterfactual; they diverge from frame PRE_s onwards.
                         surrogate_cf = analyzer.predict_trajectory(
                             initial_state=init_arr,
                             stim_weights=sw,
@@ -596,17 +616,12 @@ class BrainVisualizationServer:
                             f"使用已训练代理模型预测刺激轨迹 ({len(surrogate_frames)} 帧)"
                         )
                     except Exception as _exc:
-                        self.logger.warning(
-                            f"代理预测失败，回退到 Wilson-Cowan: {_exc}"
-                        )
+                        self.logger.warning(f"代理预测失败: {_exc}")
                         surrogate_frames = None
                         surrogate_cf = None
 
             if surrogate_frames is not None:
-                # Same pattern-aware peak logic as the WC path: start at the frame
-                # where stimulation effect is most visible, not at stim onset (k=0).
-                # PRE_s and DUR_s are already set above (line ~586/587).
-                _PULSE_PEAK_K = 9  # empirical: pulse decay, effect peaks near k=9
+                _PULSE_PEAK_K = 9
                 if pattern == "pulse":
                     _s_peak_k = min(_PULSE_PEAK_K, DUR_s - 1)
                 elif pattern == "ramp":
@@ -618,88 +633,31 @@ class BrainVisualizationServer:
                     surrogate_frames, surrogate_cf, _s_peak_idx, valid_regions
                 )
                 return {
-                    "type": "simulation_result",
-                    "success": True,
-                    "n_frames": len(surrogate_frames),
-                    "frames": surrogate_frames,
+                    "type":                "simulation_result",
+                    "success":             True,
+                    "n_frames":            len(surrogate_frames),
+                    "frames":              surrogate_frames,
                     "counterfactual_frames": surrogate_cf,
-                    "modality": "simulation",
-                    "method": "surrogate_mlp",
-                    "start_frame": _s_peak_idx,
-                    "top_affected": s_top_affected,
-                    "peak_delta": s_peak_delta,
+                    "modality":            "simulation",
+                    "method":              "surrogate_mlp",
+                    "start_frame":         _s_peak_idx,
+                    "top_affected":        s_top_affected,
+                    "peak_delta":          s_peak_delta,
                 }
 
-            # Final fallback: Wilson-Cowan recurrent dynamics (no trained model needed).
-            # Generate stimulated trajectory, then null (amplitude=0) counterfactual.
-            # Both calls re-seed rng=np.random.default_rng(0) so noise is identical,
-            # making the comparison between stim and null scientifically clean.
-            #
-            # When the frontend provides no initial_state (no data loaded), each
-            # _demo_simulate call would independently call time.time(), giving slightly
-            # different t0 values and therefore slightly different baselines.  Pre-generate
-            # one deterministic baseline here so both runs start from the same state.
-            if initial_state is None:
-                _fallback = self._generate_demo_time_series(T=1)
-                initial_state = _fallback[0].tolist()
-            frames = self._demo_simulate(
-                target_regions=target_regions,
-                amplitude=amplitude,
-                pattern=pattern,
-                frequency=frequency,
-                duration=duration,
-                n_regions=n_regions,
-                initial_state=initial_state,
-            )
-            # Counterfactual: same dynamics but with amplitude=0
-            cf_frames = self._demo_simulate(
-                target_regions=target_regions,
-                amplitude=0.0,
-                pattern=pattern,
-                frequency=frequency,
-                duration=duration,
-                n_regions=n_regions,
-                initial_state=initial_state,
-            )
-            # Compute pattern-aware peak frame so the browser starts playback at
-            # the frame with the MOST VISIBLE stimulation effect, not at the boring
-            # first stim frame where the sine bell is barely non-zero.
-            # Numerical audit (see AGENTS.md) showed start_frame=10 (stim onset)
-            # yields only 0.001 visible change — 193× less than the peak frame.
-            # NOTE: _WC_PRE and _WC_MAX_DUR are kept separate from PRE_s/DUR_s
-            # because PRE_s/DUR_s are only defined when the surrogate path is
-            # entered (i.e., when _ec_analyzer_cache is non-empty).  The WC
-            # fallback can be reached without entering the surrogate path, so
-            # we define these independently using the same values as
-            # _demo_simulate's PRE=10 and _MAX_STIM_FRAMES=60.
-            _WC_PRE      = 10   # must match _demo_simulate's PRE
-            _WC_MAX_DUR  = 60   # must match _demo_simulate's _MAX_STIM_FRAMES
-            _PULSE_PEAK_K = 9   # empirical: pulse decay, accumulated effect peaks near k=9
-            _wc_dur = min(int(duration), _WC_MAX_DUR)
-            if pattern == "pulse":
-                # Pulse decays from k=0; accumulated deviation peaks at k ≈ 9
-                _peak_k = min(_PULSE_PEAK_K, _wc_dur - 1)
-            elif pattern == "ramp":
-                # Ramp grows continuously; deviation is maximum near the last stim frame
-                _peak_k = max(0, _wc_dur * 3 // 4)
-            else:
-                # sine and constant: bell/plateau centre gives maximum effect
-                _peak_k = _wc_dur // 2
-            _wc_peak_idx = _WC_PRE + _peak_k
-            top_affected, peak_delta = _compute_top_affected(
-                frames, cf_frames, _wc_peak_idx, valid_regions
-            )
+            # ── No simulation available ────────────────────────────────────
+            # All data-driven paths require either a trained model or a fitted
+            # EC surrogate.  Return a clear error so the user knows what to do.
             return {
-                "type": "simulation_result",
-                "success": True,
-                "n_frames": len(frames),
-                "frames": frames,
-                "counterfactual_frames": cf_frames,
-                "modality": "simulation",
-                "method": "wilson_cowan",
-                "start_frame": _wc_peak_idx,
-                "top_affected": top_affected,
-                "peak_delta": peak_delta,
+                "type":    "error",
+                "success": False,
+                "message": (
+                    "无法执行仿真：当前没有可用的模型或数据。\n"
+                    "请满足以下条件之一：\n"
+                    "1. 加载训练好的模型（--model path/best_model.pt）并加载图缓存文件；\n"
+                    "2. 加载图缓存文件后运行'推断有效连接'（EC 推断）以训练代理模型，"
+                    "再选择脑区进行仿真。"
+                ),
             }
                 
         except Exception as e:
@@ -1286,219 +1244,6 @@ class BrainVisualizationServer:
         return np.clip(v, 0.0, 1.0).astype(np.float32)
 
     # ------------------------------------------------------------------ #
-    #  Demo stimulation simulation (no trained model required)             #
-    # ------------------------------------------------------------------ #
-
-    def _demo_simulate(
-        self,
-        target_regions: list,
-        amplitude: float,
-        pattern: str,
-        frequency: float,
-        duration: int,
-        n_regions: int = 200,
-        initial_state: list = None,
-    ) -> list:
-        """Generate a realistic stimulation animation without a trained model.
-
-        Returns a list of {"activity": [200 floats]} frames showing:
-          1. Pre-stim baseline  (10 frames)
-          2. Stimulation active (``duration`` frames, capped at 60)
-          3. Post-stim recovery (10 frames)
-
-        When ``initial_state`` is provided (the user's selected time point
-        from loaded data), it is used as the starting brain state so the
-        stimulation is clearly anchored to the user's actual data rather than
-        a freshly generated synthetic baseline.  When omitted, the 7-network
-        sinusoidal model from ``handle_get_state`` is used as a fallback.
-
-        Spatial spread is approximated via a Gaussian kernel over the
-        Fibonacci-sphere positions baked into the visualisation (same formula
-        as ``makeBrainPositions`` in app.js).
-        """
-        import numpy as np
-        import time
-
-        # Gaussian spatial spread sigma (mm). ~30 mm ≈ typical tDCS/TMS spread
-        # radius observed in neuroimaging studies; keeps neighbouring regions
-        # within the same cortical network correlated.
-        _SPREAD_SIGMA_MM = 30.0
-        # Cap stimulation frames to keep the WebSocket payload manageable.
-        _MAX_STIM_FRAMES = 60
-
-        # Retrieve the module-level cached Fibonacci positions (computed once).
-        # This replaces the former per-call _brain_positions() nested function.
-        positions = _get_brain_positions(n_regions)  # (200, 3)
-
-        # ── Pre-compute Gaussian spatial-spread weights ────────────────────
-        spread_weights = np.zeros(n_regions, dtype=np.float32)
-        for tid in target_regions:
-            if 0 <= tid < n_regions:
-                d = np.linalg.norm(positions - positions[tid], axis=1)
-                spread_weights += np.exp(-(d ** 2) / (2 * _SPREAD_SIGMA_MM ** 2))
-        # Homotopic (callosal) activation: stimulating one hemisphere also weakly
-        # excites the contralateral homologous region via corpus callosum.
-        # Region 0-99 = left hemisphere; 100-199 = right hemisphere.
-        # This produces visible bilateral propagation in the demo without adding
-        # a full W matrix.  Strength 0.40 matches typical callosal coupling ratios.
-        _HOMO_STRENGTH = 0.40
-        for tid in target_regions:
-            if 0 <= tid < n_regions:
-                homo_id = tid + 100 if tid < 100 else tid - 100
-                if 0 <= homo_id < n_regions:
-                    d = np.linalg.norm(positions - positions[homo_id], axis=1)
-                    spread_weights += _HOMO_STRENGTH * np.exp(
-                        -(d ** 2) / (2 * _SPREAD_SIGMA_MM ** 2)
-                    )
-        # Normalise: peak = amplitude at target, falls off with distance
-        if spread_weights.max() > 0:
-            spread_weights /= spread_weights.max()
-
-        # ── 7-network baseline oscillation (matches app.js demoUpdate) ────
-        _net_freqs  = np.array([0.012, 0.020, 0.035, 0.028, 0.008, 0.025, 0.010])
-        _net_phases = np.array([0.0,   1.0,   2.1,   0.7,   3.2,   1.8,   0.4  ])
-        net_size   = n_regions // 7
-        t0         = time.time()
-
-        # Pre-compute per-region network assignment for vectorized _baseline calls.
-        _i_arr   = np.arange(n_regions, dtype=np.float32)
-        _k_arr   = np.minimum(np.arange(n_regions) // net_size, 6)  # (n,) int
-        _nfreqs  = _net_freqs[_k_arr]   # (n,) per-region oscillation frequency
-        _nphases = _net_phases[_k_arr]  # (n,) per-region oscillation phase
-
-        def _baseline(tick: float) -> np.ndarray:
-            """Vectorized 7-network sinusoidal baseline — no Python loop."""
-            v = (0.36
-                 + 0.22 * np.sin(_nfreqs * tick + _nphases + _i_arr * 0.08)
-                 + 0.04 * np.sin(0.003 * tick + _i_arr * 0.25))
-            return np.clip(v, 0.0, 1.0).astype(np.float32)
-
-        PRE  = 10
-        DUR  = min(int(duration), _MAX_STIM_FRAMES)
-
-        # ── Stimulation pattern function ───────────────────────────────────
-        # NOTE: We model the *neural response envelope*, not the raw electrical
-        # waveform.  At 10 fps the Nyquist limit is 5 Hz, so sampling a 10 Hz
-        # sine wave at integer frame indices yields sin(2πn)=0 for every frame
-        # (zero effect visible to the user).  Instead we show the slow-timescale
-        # change in cortical excitability that is the brain's actual response to
-        # sustained stimulation — which is the quantity of clinical interest.
-        def _stim_amp(relative_t: int) -> float:
-            # Center each step in its time slot so the bell envelope never evaluates
-            # at exactly 0 or 1 — this prevents zero-amplitude frames for small DUR.
-            # Formula: (k + 0.5) / DUR  ∈ (0, 1) exclusive, matching the NPI convention
-            # of a small perturbation applied mid-interval.
-            progress = (relative_t + 0.5) / max(DUR, 1)
-            if pattern == "sine":
-                slow_cycles = min(frequency / 10.0, 3.0)   # ≤ 3 visible cycles
-                osc = 0.20 * np.sin(2 * np.pi * slow_cycles * progress)
-                return amplitude * (np.sin(np.pi * progress) + osc)
-            elif pattern == "pulse":
-                return amplitude * np.exp(-relative_t * 0.12)
-            elif pattern == "ramp":
-                return amplitude * progress
-            else:  # constant / unknown — smooth ramp-up to avoid sudden color jump
-                return amplitude * min(1.0, relative_t / max(DUR * 0.15, 1.0))
-
-        # Fixed seed so the noise is reproducible (same run → same animation).
-        rng = np.random.default_rng(0)
-
-        # ── Determine baseline (init_arr) for both simulation paths ──────────
-        if initial_state is not None and len(initial_state) >= n_regions:
-            if len(initial_state) > n_regions:
-                self.logger.warning(
-                    f"initial_state has {len(initial_state)} elements but n_regions={n_regions}; "
-                    "truncating — check frontend/backend region count mismatch"
-                )
-            init_arr = np.array(initial_state[:n_regions], dtype=np.float32)
-        else:
-            # Fallback: use the sinusoidal 7-network baseline at PRE-1 as reference
-            init_arr = _baseline(t0 * 200 + (PRE - 1) * 4)
-
-        def _wc_step(state: np.ndarray, stim_in: np.ndarray) -> np.ndarray:
-            """Deviation-based leaky integrator — physical spread, no connectivity W.
-
-            This is the Wilson-Cowan fallback for when no trained model is
-            available.  It intentionally contains NO connectivity matrix W:
-
-            The NPI principle is to stimulate a region and *observe* which
-            other regions change — that observation is how you discover
-            connectivity.  If we pre-define W based on spatial proximity, we
-            are deciding connectivity ourselves (circular reasoning), which
-            defeats the entire purpose.
-
-            "stim_in" is pre-scaled by ``spread_weights`` (a Gaussian kernel
-            centred on the target, sigma ≈ 30 mm) before being passed here.
-            This Gaussian represents the *physical extent of the stimulation
-            tool* (e.g. TMS coil), NOT neural network connectivity.  Regions
-            that fall within the coil's footprint receive a direct biophysical
-            input; the question of which *connected* regions then respond is
-            exactly what EC inference is for.  There is no W term here because
-            that would be substituting an assumed spatial prior for the actual
-            learned connectivity.
-
-            Model:
-              - deviation = state − init_arr  (0 when at rest)
-              - delta     = tanh(stim_in * 2.0) * 0.04  (stim_in includes tool spread)
-              - leak      = deviation * 0.10  (returns to init_arr in ~10 steps)
-
-            Without stimulation: deviation stays at 0 → state stable at init_arr.
-            With stimulation:    regions within the tool's physical footprint
-                                 rise above init_arr; leak prevents saturation.
-            """
-            deviation = state - init_arr
-            delta     = np.tanh(stim_in * 2.0) * 0.04
-            leak      = deviation * 0.10
-            noise     = rng.standard_normal(n_regions).astype(np.float32) * 0.008
-            return np.clip(state + delta - leak + noise, 0.0, 1.0)
-
-        _NO_STIM = np.zeros(n_regions, dtype=np.float32)
-        POST  = 10
-        frames = []
-
-        if initial_state is not None and len(initial_state) >= n_regions:
-            # 1. Pre-stim: WC evolution from initial state with no stimulation.
-            # Using _wc_step (not static copies) so frames 0..PRE-1 evolve
-            # naturally — the same continuous-dynamics convention used by the
-            # surrogate-MLP path.  The fixed seed ensures the pre-stim noise is
-            # reproducible across the stimulated and counterfactual trajectories.
-            current = init_arr.copy()
-            for _ in range(PRE):
-                current = _wc_step(current, _NO_STIM)
-                frames.append({"activity": current.tolist()})
-
-            # 2. Stimulation active: deviation-based WC dynamics from end of
-            # pre-stim phase (continuous trajectory, not restarted from init_arr).
-            for k in range(DUR):
-                current = _wc_step(current, _stim_amp(k) * spread_weights)
-                frames.append({"activity": current.tolist()})
-
-            # 3. Post-stim: continued dynamics with no external input.
-            #    Leak pulls state back toward init_arr naturally.
-            for _ in range(POST):
-                current = _wc_step(current, _NO_STIM)
-                frames.append({"activity": current.tolist()})
-
-        else:
-            # Fallback: no data loaded — start from sinusoidal 7-network baseline.
-            # 1. Pre-stim baseline (sinusoidal)
-            for k in range(PRE):
-                frames.append({"activity": _baseline(t0 * 200 + k * 4).tolist()})
-
-            # 2. Stimulation active: deviation-based WC from last pre-stim frame.
-            current = np.array(frames[-1]["activity"], dtype=np.float32)
-            for k in range(DUR):
-                current = _wc_step(current, _stim_amp(k) * spread_weights)
-                frames.append({"activity": current.tolist()})
-
-            # 3. Post-stim: return to baseline
-            for _ in range(POST):
-                current = _wc_step(current, _NO_STIM)
-                frames.append({"activity": current.tolist()})
-
-        return frames
-
-    # ------------------------------------------------------------------ #
     #  List all discoverable .pt cache files                              #
     # ------------------------------------------------------------------ #
 
@@ -1520,7 +1265,7 @@ class BrainVisualizationServer:
         seen: set = set()
         files: list = []
 
-        for d in self._CACHE_SEARCH_DIRS:
+        for d in self._build_cache_search_dirs():
             if not d.exists():
                 continue
             for f in d.glob("**/*.pt"):
@@ -1537,12 +1282,10 @@ class BrainVisualizationServer:
                 if resolved in seen:
                     continue
                 seen.add(resolved)
-                # Return path relative to cwd when possible (shorter, portable)
-                try:
-                    display = str(f.resolve().relative_to(Path(".").resolve()))
-                except ValueError:
-                    display = str(f)
-                files.append(display)
+                # Always return the absolute path so the path is valid regardless
+                # of which directory the server process is in when the client
+                # later sends a load_cache request.
+                files.append(resolved)
 
         files.sort()   # sort only the final collected list (not the glob generator)
         self.logger.info(f"list_cache_files → {len(files)} file(s) found")
@@ -1609,7 +1352,8 @@ class BrainVisualizationServer:
             return {"type": "error", "message": "无法从文件中提取脑区时间序列"}
 
         self.logger.info(
-            f"✓ 缓存加载完成: {cache_path} → {len(primary)} 帧 "
+            f"✓ 缓存加载完成: {cache_path} → "
+            f"fMRI {len(frames_fmri)} 帧, EEG {len(frames_eeg)} 帧 "
             f"(模态: {modalities})"
         )
 
@@ -1632,12 +1376,40 @@ class BrainVisualizationServer:
         except Exception:
             self._loaded_raw_time_series = None
 
+        # Rebuild graph edges so TwinBrainDigitalTwin.simulate_intervention can
+        # use this cache for stimulation simulation.  Edge reconstruction runs in
+        # the background; a failure only degrades the simulation path — the
+        # visualisation frames are already built above.
+        self._loaded_graph = None
+        try:
+            import sys as _sys
+            _repo_root = self._PROJECT_ROOT
+            if str(_repo_root) not in _sys.path:
+                _sys.path.insert(0, str(_repo_root))
+            from brain_dynamics.loader.load_model import load_graph_for_inference
+            self._loaded_graph = load_graph_for_inference(cache_path, device="cpu")
+            self.logger.info("✓ 图缓存边重建完成，已准备好用于 TwinBrainDigitalTwin 仿真")
+        except Exception as _exc:
+            self.logger.warning(f"图缓存边重建失败（仿真功能降级到代理模型）: {_exc}")
+
+        # Build the response.  To avoid duplicating the primary modality's
+        # data in both ``frames`` and ``frames_fmri`` (which would double the
+        # JSON payload), ``frames`` is always the primary frames object and
+        # ``frames_fmri`` / ``frames_eeg`` are set only when the respective
+        # modality is present and *different* from primary.
+        # The frontend checks both ``msg.frames`` (for the gate condition) and
+        # ``msg.frames_fmri`` / ``msg.frames_eeg`` (for modality switching).
         return {
             "type":           "cache_loaded",
             "path":           str(cache_path),
             "n_frames":       len(primary),
+            # ``frames`` is the primary sequence used by the frontend timeline.
+            # It is the same object as frames_fmri when fMRI is available,
+            # so we do NOT also set frames_fmri to the same list to halve the
+            # JSON payload.  The frontend _getModalityFrames() already falls
+            # back to frames_fmri/frames_eeg from the per-modality fields.
             "frames":         primary,
-            "frames_fmri":    frames_fmri or None,
+            "frames_fmri":    frames_fmri if frames_fmri and frames_fmri is not primary else None,
             "frames_eeg":     frames_eeg  or None,
             "modalities":     modalities,
             # Actual node counts before interpolation to 200 visualisation slots.
@@ -1673,7 +1445,7 @@ class BrainVisualizationServer:
         Returns the first matching file; deterministic ordering within each
         directory is not required.
         """
-        for d in self._CACHE_SEARCH_DIRS:
+        for d in self._build_cache_search_dirs():
             if not d.exists():
                 continue
             for f in d.glob("**/*.pt"):
@@ -1728,18 +1500,34 @@ class BrainVisualizationServer:
             )
 
         n_regions = 200
+        _max_frames = self._MAX_FRAMES_PER_MODALITY
 
         def _frames_from_fmri(x_seq) -> list:
             """Global percentile normalisation for fMRI.
 
             Each frame: ``{"activity": [n_regions floats], "raw": [n_regions floats]}``
             Fully vectorised; interpolation only when N_fmri ≠ n_regions.
+            Frames are sub-sampled to ``_MAX_FRAMES_PER_MODALITY`` when T is large.
+            NaN / Inf values are replaced with 0.0 before JSON serialisation.
             """
             x = x_seq.cpu().float()
             if x.ndim == 2:
                 x = x.unsqueeze(-1)      # (N, T) → (N, T, 1)
             N, T, _ = x.shape
             x_np = x[:, :, 0].numpy()   # (N, T) float32
+
+            # --- Sub-sample large time series before any further processing ---
+            if T > _max_frames:
+                idx = np.linspace(0, T - 1, _max_frames, dtype=int)
+                x_np = x_np[:, idx]
+                T = _max_frames
+
+            # --- NaN / Inf sanitisation ---
+            bad = ~np.isfinite(x_np)
+            if bad.any():
+                x_np = x_np.copy()
+                x_np[bad] = 0.0
+
             flat = x_np.ravel()
             p5, p95 = np.percentile(flat, 5), np.percentile(flat, 95)
             scale = max(float(p95 - p5), 1e-6)
@@ -1766,12 +1554,26 @@ class BrainVisualizationServer:
 
             Each frame: ``{"activity": [n_regions floats], "raw": [n_regions floats]}``
             Fully vectorised when N_eeg == n_regions; interpolation otherwise.
+            Frames are sub-sampled to ``_MAX_FRAMES_PER_MODALITY`` when T is large.
+            NaN / Inf values are replaced with 0.0 before JSON serialisation.
             """
             x = x_seq.cpu().float()
             if x.ndim == 2:
                 x = x.unsqueeze(-1)
             N, T, _ = x.shape
             x_np = x[:, :, 0].numpy()   # (N, T)
+
+            # --- Sub-sample large time series BEFORE the per-frame loop ---
+            if T > _max_frames:
+                idx = np.linspace(0, T - 1, _max_frames, dtype=int)
+                x_np = x_np[:, idx]
+                T = _max_frames
+
+            # --- NaN / Inf sanitisation ---
+            bad = ~np.isfinite(x_np)
+            if bad.any():
+                x_np = x_np.copy()
+                x_np[bad] = 0.0
 
             if N == n_regions:
                 sig_min = x_np.min(axis=0, keepdims=True)
