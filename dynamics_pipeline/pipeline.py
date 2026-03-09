@@ -141,9 +141,14 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
     trajs = results.get("trajectories")
 
     # Determine connectivity matrix W
+    # Phase 2 analyses (spectral decomposition, community detection, modal
+    # projection) all require a SQUARE (N×N) matrix.  The response matrix R
+    # may have shape (n_stimulated_nodes, N) when n_nodes < N (e.g. n_nodes=10
+    # in the default config).  In that case we fall back to the functional
+    # connectivity matrix derived from the free-dynamics trajectories.
     W = None
     w_label = "response_matrix"
-    if R is not None:
+    if R is not None and R.ndim == 2 and R.shape[0] == R.shape[1]:
         W = R
     elif trajs is not None:
         # Compute functional connectivity from trajectories
@@ -151,7 +156,14 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
         W = np.corrcoef(stacked.T)
         W = np.nan_to_num(W, nan=0.0)
         w_label = "fc"
-        logger.info("  No response matrix; using FC from trajectories.")
+        if R is not None:
+            logger.info(
+                "  Response matrix is non-square (%s); using FC from "
+                "trajectories for Phase 2 structure analysis.",
+                "×".join(str(d) for d in R.shape),
+            )
+        else:
+            logger.info("  No response matrix; using FC from trajectories.")
 
     if W is None:
         logger.warning("  No connectivity matrix available, skipping Phase 2.")
@@ -169,7 +181,7 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
             logger.info(
                 "  Spectral: ρ=%.4f, PR=%.2f, n_dominant=%d, gap=%.4f",
                 spec["spectral_radius"], spec["participation_ratio"],
-                spec["n_dominant"], spec["gap_ratio"],
+                spec["n_dominant"], spec["spectral_gap_ratio"],
             )
         except Exception as e:
             logger.warning("  Spectral analysis failed: %s", e)
@@ -186,7 +198,7 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
             results["community"] = comm
             logger.info(
                 "  Community: Q=%.4f, k=%d, method=%s",
-                comm["modularity_Q"], comm["n_communities"],
+                comm["modularity_q"], comm["n_communities"],
                 comm.get("method", "unknown"),
             )
         except Exception as e:
@@ -207,12 +219,12 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
         try:
             from spectral_dynamics.e2_e3_modal_projection import run_modal_projection
             modal = run_modal_projection(
-                W, trajectories=trajs, label=w_label, output_dir=struct_dir,
+                trajs, W, label=w_label, output_dir=struct_dir,
             )
             results["modal_energy"] = modal
             logger.info(
                 "  Modal energy: top5=%.1f%%, n@90%%=%d",
-                modal.get("cumulative_energy_top5", 0) * 100,
+                modal.get("energy_top5_pct", 0),
                 modal.get("n_modes_90pct", 0),
             )
         except Exception as e:
