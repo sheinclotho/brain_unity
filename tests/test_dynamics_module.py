@@ -36,10 +36,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# Ensure the twinbrain-dynamics directory is on sys.path
-_TD_DIR = Path(__file__).parent.parent / "twinbrain-dynamics"
-if str(_TD_DIR) not in sys.path:
-    sys.path.insert(0, str(_TD_DIR))
+# Ensure the brain_dynamics directory is on sys.path
+_BD_DIR = Path(__file__).parent.parent / "brain_dynamics"
+if str(_BD_DIR) not in sys.path:
+    sys.path.insert(0, str(_BD_DIR))
 
 from simulator.brain_dynamics_simulator import (
     BrainDynamicsSimulator,
