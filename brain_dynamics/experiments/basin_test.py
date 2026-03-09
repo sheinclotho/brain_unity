@@ -65,19 +65,31 @@ def _run_trajectories(
     T:
         Number of prediction steps.
     device:
-        Compute device.
+        Unused and deprecated.  The compute device is fixed at simulator
+        construction time (``BrainDynamicsSimulator.device``).  The parameter
+        is kept for backward-compatible call sites only; passing it has no
+        effect and will raise a warning.
 
     Returns
     -------
     trajectories: shape (n_traj, T, N).
     """
+    import warnings
+    if device != "cpu":
+        warnings.warn(
+            "_run_trajectories: the `device` parameter is unused — "
+            "the compute device is fixed at BrainDynamicsSimulator construction "
+            "time.  Remove `device=` from your call site.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     from experiments.free_dynamics import run_free_dynamics
     n_traj, N = init_states.shape
     trajs = np.zeros((n_traj, T, N), dtype=np.float32)
     for i in range(n_traj):
         x0 = init_states[i]
-        # roll out with this specific initial state
-        traj = simulator.rollout(x0=x0, steps=T, device=device)
+        # rollout() returns (trajectory, times); device is set at simulator init.
+        traj, _ = simulator.rollout(x0=x0, steps=T)
         trajs[i] = traj
     return trajs
 
