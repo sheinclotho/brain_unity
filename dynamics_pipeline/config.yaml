@@ -207,6 +207,43 @@ validation:
     enabled: false
     n_random: 5                 # Number of random realisations
 
+  # ── TASK 1: Graph Structure Comparison (OPTIONAL) ─────────────────────────
+  # Compares brain graph vs degree-preserving-rewired and fully-random baselines
+  # using analytical spectral metrics + GNN-derived LLE/D2 (no extra model calls).
+  # Outputs: random_graph_comparison.csv, random_graph_dynamics.png
+  graph_structure_comparison:
+    enabled: false
+    n_random: 5                 # Realisations of each random baseline to average
+
+  # ── TASK 2: Input Dimension Control (OPTIONAL) ────────────────────────────
+  # Tests whether low-dimensional dynamics come from network structure vs input.
+  # Three conditions on GNN trajectories: no input / high-dim noise / 3-D drive.
+  # No extra model calls.
+  # Outputs: input_dimension_results.csv, input_dimension_plot.png
+  input_dimension_control:
+    enabled: false
+    noise_sigma: 0.5            # Noise amplitude for condition B
+    low_dim_k: 3                # Dimensionality of structured drive in condition C
+
+  # ── TASK 4: Node Ablation (OPTIONAL) ──────────────────────────────────────
+  # Ranks nodes by manifold-deformation impact (trajectory-space masking).
+  # No extra model calls.
+  # Outputs: node_importance.csv, node_importance_hist.png
+  node_ablation:
+    enabled: false
+    n_top_variance: 50          # High-variance nodes to always include
+    n_random_sample: 50         # Random control nodes
+
+  # ── TASK 7: Predictive Dimension (OPTIONAL) ───────────────────────────────
+  # VAR(1) predictor MSE/AIC/BIC across PCA dimensions m=1..max_dim.
+  # Optimal m should coincide with D2 if attractor dimension drives predictability.
+  # No extra model calls.
+  # Outputs: predictive_dimension.csv, aic_curve.png
+  predictive_dimension:
+    enabled: false
+    max_dim: 10                 # Maximum PCA dimension evaluated
+    train_fraction: 0.70        # Training fraction for each trajectory
+
 # ── Phase 5: Advanced (optional, expensive) ─────────────────────────────────
 advanced:
   stimulation:
@@ -235,6 +272,28 @@ advanced:
     n_target_regions: 20
   critical_slowing_down:
     enabled: true               # Early warning signals (H3 evidence, enabled by default)
+
+  # ── TASK 5: Lesion Dynamics (OPTIONAL) ────────────────────────────────────
+  # Temporal lesion: clamp top-ablation nodes at t=lesion_step in GNN trajectories.
+  # Requires node_ablation (4l) to be enabled first (uses its top_nodes ranking).
+  # No extra model calls.
+  # Outputs: lesion_effects.csv, lesion_examples.png
+  lesion_dynamics:
+    enabled: false
+    n_lesion_nodes: 10          # Top nodes from ablation to lesion
+    n_control: 10               # Random control nodes
+    lesion_step: 500            # Time step at which lesion is applied
+
+  # ── TASK 6: Granger Causality (OPTIONAL) ──────────────────────────────────
+  # Pairwise bivariate Granger causality on GNN trajectories.
+  # Complements Transfer Entropy (5e). Identifies sources, sinks, net-flow.
+  # Outputs: granger_flow.csv, causal_network.png, granger_report.json
+  granger_causality:
+    enabled: false
+    max_lag: 1                  # VAR lag order
+    n_src: null                 # Source block size (null = all N, slow for large N)
+    n_tgt: null                 # Target block size (null = all N)
+    top_k: 20                   # Top sources/sinks to report
 
 # ── Output ───────────────────────────────────────────────────────────────────
 output:

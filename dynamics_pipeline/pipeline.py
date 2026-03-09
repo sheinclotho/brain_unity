@@ -928,6 +928,100 @@ def run_phase4_validation(cfg: dict, results: Dict[str, Any],
     elif sp_cfg.get("enabled", False) and W_pert is None:
         logger.warning("  Structure-preserving random skipped: no square matrix.")
 
+    # 4j: Graph-structure random comparison (TASK 1) — OPTIONAL
+    # Compares brain graph vs degree-preserving and fully-random baselines using
+    # analytical spectral metrics + GNN-derived LLE/D2 from Phase 3 results.
+    rg_cfg = val_cfg.get("graph_structure_comparison", {})
+    if rg_cfg.get("enabled", False) and W_pert is not None:
+        try:
+            from analysis.random_comparison import run_graph_structure_comparison
+            rg = run_graph_structure_comparison(
+                W=W_pert,
+                trajectories=trajs,
+                lyapunov_results=results.get("lyapunov"),
+                attractor_results=results.get("attractor"),
+                n_random=rg_cfg.get("n_random", 5),
+                seed=seed,
+                output_dir=val_dir,
+            )
+            results["graph_structure_comparison"] = rg
+            brain_pr = rg.get("brain_graph", {}).get("participation_ratio", float("nan"))
+            rand_pr = rg.get("fully_random", {}).get("participation_ratio", float("nan"))
+            logger.info(
+                "  Graph structure comparison: brain PR=%.3f, random PR=%.3f",
+                brain_pr, rand_pr,
+            )
+        except Exception as e:
+            logger.warning("  Graph structure comparison failed: %s", e)
+    elif rg_cfg.get("enabled", False) and W_pert is None:
+        logger.warning("  Graph structure comparison skipped: no square connectivity matrix.")
+
+    # 4k: Input dimension control (TASK 2) — OPTIONAL
+    # Tests whether low-dimensional dynamics arise from network structure vs input drive.
+    # Operates on existing GNN trajectories — no additional model calls.
+    idc_cfg = val_cfg.get("input_dimension_control", {})
+    if idc_cfg.get("enabled", False) and trajs is not None:
+        try:
+            from analysis.input_dimension_control import run_input_dimension_control
+            idc = run_input_dimension_control(
+                trajectories=trajs,
+                noise_sigma=idc_cfg.get("noise_sigma", 0.5),
+                low_dim_k=idc_cfg.get("low_dim_k", 3),
+                seed=seed,
+                output_dir=val_dir,
+            )
+            results["input_dimension_control"] = idc
+            no_input_lle = idc.get("no_input", {}).get("lle", float("nan"))
+            hd_lle = idc.get("high_dim_noise", {}).get("lle", float("nan"))
+            logger.info(
+                "  Input dim control: no-input LLE=%.4f, high-dim-noise LLE=%.4f",
+                no_input_lle, hd_lle,
+            )
+        except Exception as e:
+            logger.warning("  Input dimension control failed: %s", e)
+
+    # 4l: Node ablation (TASK 4) — OPTIONAL
+    # Ranks nodes by how much the dynamical manifold depends on each one.
+    # Operates on existing GNN trajectories — no additional model calls.
+    na_cfg = val_cfg.get("node_ablation", {})
+    if na_cfg.get("enabled", False) and trajs is not None:
+        try:
+            from analysis.node_ablation import run_node_ablation
+            na = run_node_ablation(
+                trajectories=trajs,
+                n_top_variance=na_cfg.get("n_top_variance", 50),
+                n_random=na_cfg.get("n_random_sample", 50),
+                seed=seed,
+                output_dir=val_dir,
+            )
+            results["node_ablation"] = na
+            top5 = na.get("top_nodes", [])[:5]
+            logger.info("  Node ablation: top-5 nodes by |ΔLLE|: %s", top5)
+        except Exception as e:
+            logger.warning("  Node ablation failed: %s", e)
+
+    # 4m: Predictive dimension (TASK 7) — OPTIONAL
+    # Finds the optimal VAR(1) predictor dimension (MSE/AIC/BIC vs PCA dim m).
+    pd_val_cfg = val_cfg.get("predictive_dimension", {})
+    if pd_val_cfg.get("enabled", False) and trajs is not None:
+        try:
+            from analysis.predictive_dimension import run_predictive_dimension
+            pdim = run_predictive_dimension(
+                trajectories=trajs,
+                max_dim=pd_val_cfg.get("max_dim", 10),
+                train_fraction=pd_val_cfg.get("train_fraction", 0.70),
+                seed=seed,
+                output_dir=val_dir,
+            )
+            results["predictive_dimension"] = pdim
+            logger.info(
+                "  Predictive dimension: optimal_m (AIC)=%d, (BIC)=%d",
+                pdim.get("optimal_m_aic", -1),
+                pdim.get("optimal_m_bic", -1),
+            )
+        except Exception as e:
+            logger.warning("  Predictive dimension failed: %s", e)
+
 
 def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
                         simulator, output_dir: Path,
@@ -1074,15 +1168,65 @@ def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
                 trajectories=trajs, output_dir=adv_dir,
             )
             results["critical_slowing_down"] = csd
+            csd_agg = csd.get("aggregate", {})
             logger.info(
-                "  Critical slowing down: ar1_tau=%.3f (p=%.3f), var_tau=%.3f (p=%.3f)",
-                csd.get("ar1_trend_tau", float("nan")),
-                csd.get("ar1_trend_p", float("nan")),
-                csd.get("var_trend_tau", float("nan")),
-                csd.get("var_trend_p", float("nan")),
+                "  Critical slowing down: ac1_tau=%.3f, var_tau=%.3f, ews_score=%.3f",
+                csd_agg.get("ac1_tau_mean", float("nan")),
+                csd_agg.get("var_tau_mean", float("nan")),
+                csd_agg.get("ews_score_mean", float("nan")),
             )
         except Exception as e:
             logger.warning("  Critical slowing down failed: %s", e)
+
+    # 5g: Dynamic lesion experiment (TASK 5) — OPTIONAL
+    # Requires prior node_ablation (4l) results to select top nodes.
+    # Operates on existing GNN trajectories — no additional model calls.
+    lesion_cfg = adv_cfg.get("lesion_dynamics", {})
+    if lesion_cfg.get("enabled", False) and trajs is not None:
+        try:
+            from analysis.node_ablation import run_lesion_dynamics
+            na_results = results.get("node_ablation", {})
+            top_nodes = na_results.get("top_nodes", list(range(10)))
+            lesion = run_lesion_dynamics(
+                trajectories=trajs,
+                top_nodes=top_nodes,
+                n_control=lesion_cfg.get("n_control", 10),
+                n_lesion_nodes=lesion_cfg.get("n_lesion_nodes", 10),
+                lesion_step=lesion_cfg.get("lesion_step", 500),
+                seed=cfg["data_generation"].get("seed", 42),
+                output_dir=adv_dir,
+            )
+            results["lesion_dynamics"] = lesion
+            n_rows = len(lesion.get("lesion_results", []))
+            logger.info("  Lesion dynamics: %d nodes analysed (step=%d).",
+                        n_rows, lesion.get("lesion_step", 500))
+        except Exception as e:
+            logger.warning("  Lesion dynamics failed: %s", e)
+
+    # 5h: Granger causality (TASK 6) — OPTIONAL
+    # Pairwise Granger F-statistic matrix on GNN trajectories.
+    # Complements the Transfer-Entropy analysis in 5e.
+    gc_cfg = adv_cfg.get("granger_causality", {})
+    if gc_cfg.get("enabled", False) and trajs is not None:
+        try:
+            from analysis.granger_causality import run_granger_analysis
+            # Node-importance CSV for overlap analysis
+            _na_dir = adv_dir.parent / "validation"
+            _ni_csv = _na_dir / "node_importance.csv"
+            gc = run_granger_analysis(
+                trajectories=trajs,
+                max_lag=gc_cfg.get("max_lag", 1),
+                n_src=gc_cfg.get("n_src", None),
+                n_tgt=gc_cfg.get("n_tgt", None),
+                top_k=gc_cfg.get("top_k", 20),
+                node_importance_csv=_ni_csv if _ni_csv.exists() else None,
+                output_dir=adv_dir,
+            )
+            results["granger_causality"] = gc
+            top_src = gc.get("top_sources", [])[:5]
+            logger.info("  Granger causality: top-5 sources: %s", top_src)
+        except Exception as e:
+            logger.warning("  Granger causality failed: %s", e)
 
 
 def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
@@ -1344,7 +1488,9 @@ def _build_validation_table(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     spr = results.get("structure_preserving_random", {})
     if spr:
         delta_rho = spr.get("delta_rho")
-        verified_q4 = bool(delta_rho is not None and delta_rho > 0.05)
+        # |delta_rho| > 0.05 in either direction means the trained structure is distinctive.
+        # (delta_rho = original_rho - random_rho; negative = training reduces spectral radius)
+        verified_q4 = bool(delta_rho is not None and abs(delta_rho) > 0.05)
         verdict_q4 = spr.get("judgment", "?")
         ev_q4_str = f"delta_rho={delta_rho:.4f}" if delta_rho is not None else "no evidence"
     else:
@@ -1357,7 +1503,15 @@ def _build_validation_table(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     # Q5: Random networks lose structure? (Phase 4b: random_comparison)
     rc = results.get("random_comparison", {})
     if rc:
-        rand_lle = rc.get("random_lle_mean")
+        # rc has keys like "random_sr1.50" with mean_lyapunov inside, not "random_lle_mean".
+        # Compute the mean LLE across all random spectral-radius conditions.
+        rand_lles = [
+            v.get("mean_lyapunov")
+            for k, v in rc.items()
+            if k.startswith("random_sr") and isinstance(v, dict)
+        ]
+        rand_lles = [x for x in rand_lles if x is not None and np.isfinite(x)]
+        rand_lle = float(np.mean(rand_lles)) if rand_lles else None
         real_lle_val = lle
         if rand_lle is not None and real_lle_val is not None:
             verified_q5 = bool(real_lle_val > rand_lle + 0.01)
@@ -1529,30 +1683,28 @@ def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:
         }
         # CSD evidence for H3 (P0-3)
         if csd:
-            ar1_tau = csd.get("ar1_trend_tau")
-            ar1_p = csd.get("ar1_trend_p")
-            var_tau = csd.get("var_trend_tau")
-            var_p = csd.get("var_trend_p")
-            ews_score = csd.get("ews_score_mean")
+            csd_agg = csd.get("aggregate", {})
+            # CSD returns ac1_tau_mean / var_tau_mean (Kendall τ); no p-values.
+            ac1_tau = csd_agg.get("ac1_tau_mean")
+            var_tau = csd_agg.get("var_tau_mean")
+            ews_score = csd_agg.get("ews_score_mean")
             csd_parts = []
-            if ar1_tau is not None:
-                csd_parts.append(f"AR1_tau={ar1_tau:.2f}(p={ar1_p:.3f})")
+            if ac1_tau is not None:
+                csd_parts.append(f"AC1_tau={ac1_tau:.2f}")
             if var_tau is not None:
-                csd_parts.append(f"Var_tau={var_tau:.2f}(p={var_p:.3f})")
+                csd_parts.append(f"Var_tau={var_tau:.2f}")
             if ews_score is not None:
                 csd_parts.append(f"EWS={ews_score:.2f}")
             if csd_parts:
                 summary_parts.append("CSD:[" + ", ".join(csd_parts) + "]")
             h3_entry["csd"] = {
-                "ar1_trend_tau": ar1_tau,
-                "ar1_trend_p": ar1_p,
-                "var_trend_tau": var_tau,
-                "var_trend_p": var_p,
+                "ac1_tau_mean": ac1_tau,
+                "var_tau_mean": var_tau,
                 "ews_score_mean": ews_score,
             }
-            # Consistent CSD (rising AR1/variance near criticality) strengthens H3
+            # Rising AR1 and variance → consistent with approach to critical transition
             csd_consistent = (
-                ar1_tau is not None and ar1_tau > 0 and
+                ac1_tau is not None and ac1_tau > 0 and
                 var_tau is not None and var_tau > 0
             )
             h3_entry["csd_consistent_with_criticality"] = csd_consistent
