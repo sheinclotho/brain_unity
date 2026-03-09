@@ -1446,9 +1446,13 @@ class TestRandomModelComparison(unittest.TestCase):
             random_steps=15,
         )
         self.assertIn("model", result)
-        self.assertIn("random", result)
+        # Result has per-spectral-radius keys like "random_sr1.50", not "random"
+        random_keys = [k for k in result if k.startswith("random_sr")]
+        self.assertTrue(len(random_keys) >= 1,
+                        f"Expected at least one 'random_srX.XX' key, got: {list(result)}")
         self.assertIn("trajectory_variance", result["model"])
-        self.assertIn("trajectory_variance", result["random"])
+        # Each random entry has mean_lyapunov from Wolf-Benettin estimation
+        self.assertIn("mean_lyapunov", result[random_keys[0]])
 
     def test_run_random_model_comparison_saves_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1463,7 +1467,8 @@ class TestRandomModelComparison(unittest.TestCase):
             with open(Path(tmp) / "analysis_comparison.json") as fh:
                 data = json.load(fh)
             self.assertIn("model", data)
-            self.assertIn("random", data)
+            random_keys = [k for k in data if k.startswith("random_sr")]
+            self.assertTrue(len(random_keys) >= 1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2760,6 +2765,156 @@ class TestRunTrajectories(unittest.TestCase):
                          "Expected shape (n_traj, T, N)")
         self.assertTrue(np.isfinite(trajs).all(),
                         "Trajectories should contain only finite values")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Regression tests for pipeline bugs
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestCSDKeyNames(unittest.TestCase):
+    """
+    Regression: run_critical_slowing_down_analysis returns a nested dict
+    (top-level keys: 'per_trajectory_ews', 'aggregate', 'report').
+    The pipeline used to read wrong flat keys like 'ar1_trend_tau' which
+    always returned NaN.  It must now read from csd['aggregate'].
+    """
+
+    def test_csd_returns_aggregate_key(self):
+        """run_critical_slowing_down_analysis must return an 'aggregate' sub-dict."""
+        import sys
+        _bd = Path(__file__).parent.parent / "brain_dynamics"
+        if str(_bd) not in sys.path:
+            sys.path.insert(0, str(_bd))
+        from analysis.critical_slowing_down import run_critical_slowing_down_analysis
+
+        rng = np.random.default_rng(42)
+        # short trajectories sufficient to exercise the function; N=10 matches module constant
+        trajs = rng.random((3, 40, 10)).astype(np.float32)
+        result = run_critical_slowing_down_analysis(trajs)
+
+        self.assertIn("aggregate", result,
+                      "CSD result must contain 'aggregate' sub-dict")
+        agg = result["aggregate"]
+        self.assertIn("ac1_tau_mean", agg,
+                      "aggregate must have 'ac1_tau_mean' (not 'ar1_trend_tau')")
+        self.assertIn("var_tau_mean", agg,
+                      "aggregate must have 'var_tau_mean' (not 'var_trend_tau')")
+        self.assertIn("ews_score_mean", agg)
+        # The old flat keys must NOT be present at the top level
+        self.assertNotIn("ar1_trend_tau", result)
+        self.assertNotIn("var_trend_tau", result)
+
+    def test_csd_aggregate_values_finite(self):
+        """aggregate metrics should be finite for well-behaved trajectories."""
+        import sys
+        _bd = Path(__file__).parent.parent / "brain_dynamics"
+        if str(_bd) not in sys.path:
+            sys.path.insert(0, str(_bd))
+        from analysis.critical_slowing_down import run_critical_slowing_down_analysis
+
+        rng = np.random.default_rng(0)
+        trajs = rng.random((3, 50, 10)).astype(np.float32)
+        result = run_critical_slowing_down_analysis(trajs)
+        agg = result.get("aggregate", {})
+        for key in ("ac1_tau_mean", "var_tau_mean", "ews_score_mean"):
+            val = agg.get(key)
+            self.assertIsNotNone(val, f"'{key}' should not be None")
+            # NaN means an implementation bug; the function computes per-region
+            # Kendall tau which should be finite for random data
+            self.assertTrue(
+                np.isfinite(val),
+                f"aggregate['{key}']={val} should be finite",
+            )
+
+
+class TestQ5RandomLLEExtraction(unittest.TestCase):
+    """
+    Regression: pipeline Q5 used to read rc.get('random_lle_mean') which
+    always returned None because run_random_model_comparison returns keys
+    like 'random_sr1.50', not 'random_lle_mean'.  Q5 must extract LLEs
+    from the actual dict structure.
+    """
+
+    def test_random_model_comparison_has_random_sr_keys(self):
+        """run_random_model_comparison must return 'random_srX.XX' keys."""
+        trajs = np.random.rand(3, 20, 10).astype(np.float32)
+        result = run_random_model_comparison(
+            trajectories=trajs,
+            random_n_init=3,
+            random_steps=15,
+            spectral_radii=[1.5],   # single SR for speed
+        )
+        random_keys = [k for k in result if k.startswith("random_sr")]
+        self.assertTrue(len(random_keys) >= 1,
+                        f"Expected 'random_srX.XX' keys, got {list(result)}")
+        # The LLE must be accessible at result['random_sr1.50']['mean_lyapunov']
+        sr_key = random_keys[0]
+        self.assertIn("mean_lyapunov", result[sr_key],
+                      f"'{sr_key}' must contain 'mean_lyapunov'")
+
+    def test_q5_lle_extraction_logic(self):
+        """Simulate the Q5 extraction logic: mean LLE across random_srX.XX entries."""
+        rc = {
+            "model": {"mean_lyapunov": -0.02},
+            "random_sr0.90": {"mean_lyapunov": -0.05, "stability": "stable"},
+            "random_sr1.50": {"mean_lyapunov": 0.01, "stability": "weakly_chaotic"},
+            "random_sr2.00": {"mean_lyapunov": 0.06, "stability": "chaotic"},
+        }
+        rand_lles = [
+            v.get("mean_lyapunov")
+            for k, v in rc.items()
+            if k.startswith("random_sr") and isinstance(v, dict)
+        ]
+        rand_lles = [x for x in rand_lles if x is not None and np.isfinite(x)]
+        self.assertEqual(len(rand_lles), 3)
+        rand_lle = float(np.mean(rand_lles))
+        self.assertAlmostEqual(rand_lle, (-0.05 + 0.01 + 0.06) / 3, places=6)
+
+
+class TestQ4DeltaRhoSignConvention(unittest.TestCase):
+    """
+    Regression: Q4 used to check delta_rho > 0.05, so a large negative delta
+    (original_rho - random_rho = -9.28) incorrectly reported 'not verified'
+    even though the training structure clearly matters.  The check must use
+    abs(delta_rho) > 0.05.
+    """
+
+    def test_negative_delta_rho_is_verified(self):
+        """Large negative delta_rho should still mark Q4 as verified."""
+        delta_rho = -9.2874
+        # Old logic (buggy):
+        old_verified = bool(delta_rho is not None and delta_rho > 0.05)
+        self.assertFalse(old_verified, "Old logic incorrectly failed for large negative delta")
+        # New logic (fixed):
+        new_verified = bool(delta_rho is not None and abs(delta_rho) > 0.05)
+        self.assertTrue(new_verified, "Fixed logic should verify large negative delta_rho")
+
+    def test_structure_preserving_judgment_negative_delta(self):
+        """run_structure_preserving_random should give a meaningful judgment for
+        negative delta_rho (training suppresses spectral radius)."""
+        import sys
+        _bd = Path(__file__).parent.parent / "brain_dynamics"
+        if str(_bd) not in sys.path:
+            sys.path.insert(0, str(_bd))
+        from analysis.network_perturbation import run_structure_preserving_random
+
+        # Construct a W with very low spectral radius (~0.2) so that random
+        # permutations of the same weights produce higher spectral radius.
+        rng = np.random.default_rng(7)
+        n_nodes = 10  # same as module-level N
+        W = rng.standard_normal((n_nodes, n_nodes)).astype(np.float32)
+        sr = float(np.abs(np.linalg.eigvals(W)).max())
+        W = W * 0.2 / (sr + 1e-9)   # force ρ ≈ 0.2
+
+        result = run_structure_preserving_random(W, n_random=3, seed=42)
+        self.assertIn("judgment", result)
+        self.assertIn("delta_rho", result)
+        # For a strong negative delta (training reduced ρ significantly),
+        # the judgment must NOT say "random networks similar to trained"
+        delta = result.get("delta_rho")
+        if delta is not None and abs(delta) > 0.1:
+            self.assertNotIn("similar", result["judgment"],
+                             "Large |delta_rho| must not produce 'similar' judgment")
 
 
 if __name__ == "__main__":

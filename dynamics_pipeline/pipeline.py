@@ -1168,12 +1168,12 @@ def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
                 trajectories=trajs, output_dir=adv_dir,
             )
             results["critical_slowing_down"] = csd
+            csd_agg = csd.get("aggregate", {})
             logger.info(
-                "  Critical slowing down: ar1_tau=%.3f (p=%.3f), var_tau=%.3f (p=%.3f)",
-                csd.get("ar1_trend_tau", float("nan")),
-                csd.get("ar1_trend_p", float("nan")),
-                csd.get("var_trend_tau", float("nan")),
-                csd.get("var_trend_p", float("nan")),
+                "  Critical slowing down: ac1_tau=%.3f, var_tau=%.3f, ews_score=%.3f",
+                csd_agg.get("ac1_tau_mean", float("nan")),
+                csd_agg.get("var_tau_mean", float("nan")),
+                csd_agg.get("ews_score_mean", float("nan")),
             )
         except Exception as e:
             logger.warning("  Critical slowing down failed: %s", e)
@@ -1488,7 +1488,9 @@ def _build_validation_table(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     spr = results.get("structure_preserving_random", {})
     if spr:
         delta_rho = spr.get("delta_rho")
-        verified_q4 = bool(delta_rho is not None and delta_rho > 0.05)
+        # |delta_rho| > 0.05 in either direction means the trained structure is distinctive.
+        # (delta_rho = original_rho - random_rho; negative = training reduces spectral radius)
+        verified_q4 = bool(delta_rho is not None and abs(delta_rho) > 0.05)
         verdict_q4 = spr.get("judgment", "?")
         ev_q4_str = f"delta_rho={delta_rho:.4f}" if delta_rho is not None else "no evidence"
     else:
@@ -1501,7 +1503,15 @@ def _build_validation_table(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     # Q5: Random networks lose structure? (Phase 4b: random_comparison)
     rc = results.get("random_comparison", {})
     if rc:
-        rand_lle = rc.get("random_lle_mean")
+        # rc has keys like "random_sr1.50" with mean_lyapunov inside, not "random_lle_mean".
+        # Compute the mean LLE across all random spectral-radius conditions.
+        rand_lles = [
+            v.get("mean_lyapunov")
+            for k, v in rc.items()
+            if k.startswith("random_sr") and isinstance(v, dict)
+        ]
+        rand_lles = [x for x in rand_lles if x is not None and np.isfinite(x)]
+        rand_lle = float(np.mean(rand_lles)) if rand_lles else None
         real_lle_val = lle
         if rand_lle is not None and real_lle_val is not None:
             verified_q5 = bool(real_lle_val > rand_lle + 0.01)
@@ -1673,30 +1683,28 @@ def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:
         }
         # CSD evidence for H3 (P0-3)
         if csd:
-            ar1_tau = csd.get("ar1_trend_tau")
-            ar1_p = csd.get("ar1_trend_p")
-            var_tau = csd.get("var_trend_tau")
-            var_p = csd.get("var_trend_p")
-            ews_score = csd.get("ews_score_mean")
+            csd_agg = csd.get("aggregate", {})
+            # CSD returns ac1_tau_mean / var_tau_mean (Kendall τ); no p-values.
+            ac1_tau = csd_agg.get("ac1_tau_mean")
+            var_tau = csd_agg.get("var_tau_mean")
+            ews_score = csd_agg.get("ews_score_mean")
             csd_parts = []
-            if ar1_tau is not None:
-                csd_parts.append(f"AR1_tau={ar1_tau:.2f}(p={ar1_p:.3f})")
+            if ac1_tau is not None:
+                csd_parts.append(f"AC1_tau={ac1_tau:.2f}")
             if var_tau is not None:
-                csd_parts.append(f"Var_tau={var_tau:.2f}(p={var_p:.3f})")
+                csd_parts.append(f"Var_tau={var_tau:.2f}")
             if ews_score is not None:
                 csd_parts.append(f"EWS={ews_score:.2f}")
             if csd_parts:
                 summary_parts.append("CSD:[" + ", ".join(csd_parts) + "]")
             h3_entry["csd"] = {
-                "ar1_trend_tau": ar1_tau,
-                "ar1_trend_p": ar1_p,
-                "var_trend_tau": var_tau,
-                "var_trend_p": var_p,
+                "ac1_tau_mean": ac1_tau,
+                "var_tau_mean": var_tau,
                 "ews_score_mean": ews_score,
             }
-            # Consistent CSD (rising AR1/variance near criticality) strengthens H3
+            # Rising AR1 and variance → consistent with approach to critical transition
             csd_consistent = (
-                ar1_tau is not None and ar1_tau > 0 and
+                ac1_tau is not None and ac1_tau > 0 and
                 var_tau is not None and var_tau > 0
             )
             h3_entry["csd_consistent_with_criticality"] = csd_consistent

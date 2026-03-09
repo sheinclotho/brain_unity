@@ -544,8 +544,8 @@ def run_structure_preserving_random(
         original          dict  spectral metrics of W
         random_mean       dict  mean spectral metrics
         random_std        dict  std of spectral metrics
-        delta_rho         float spectral radius decrease (original - random)
-        delta_ky          float K-Y dimension decrease
+        delta_rho         float spectral radius difference (original - random); negative = training reduces ρ
+        delta_ky          float K-Y dimension difference
         judgment          str
     """
     if W.ndim != 2 or W.shape[0] != W.shape[1]:
@@ -600,12 +600,18 @@ def run_structure_preserving_random(
         sparsity * 100, n_edges,
     )
 
-    if np.isfinite(delta_rho) and delta_rho > 0.1:
-        judgment = (
-            f"trained structure creates distinctive dynamics "
-            f"(ρ delta={delta_rho:.4f}, K-Y delta={delta_ky:.2f})"
-        )
-    elif np.isfinite(delta_rho) and delta_rho > 0.02:
+    if np.isfinite(delta_rho) and abs(delta_rho) > 0.1:
+        if delta_rho > 0:
+            judgment = (
+                f"trained structure creates distinctive dynamics — higher spectral organization "
+                f"(ρ delta={delta_rho:.4f}, K-Y delta={delta_ky:.2f})"
+            )
+        else:
+            judgment = (
+                f"training suppresses spectral radius vs random — structured damping "
+                f"(ρ delta={delta_rho:.4f}, K-Y delta={delta_ky:.2f})"
+            )
+    elif np.isfinite(delta_rho) and abs(delta_rho) > 0.02:
         judgment = f"moderate structural effect (ρ delta={delta_rho:.4f})"
     else:
         delta_str = f"{delta_rho:.4f}" if np.isfinite(delta_rho) else "unknown"
