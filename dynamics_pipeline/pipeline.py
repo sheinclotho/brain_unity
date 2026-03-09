@@ -928,6 +928,100 @@ def run_phase4_validation(cfg: dict, results: Dict[str, Any],
     elif sp_cfg.get("enabled", False) and W_pert is None:
         logger.warning("  Structure-preserving random skipped: no square matrix.")
 
+    # 4j: Graph-structure random comparison (TASK 1) — OPTIONAL
+    # Compares brain graph vs degree-preserving and fully-random baselines using
+    # analytical spectral metrics + GNN-derived LLE/D2 from Phase 3 results.
+    rg_cfg = val_cfg.get("graph_structure_comparison", {})
+    if rg_cfg.get("enabled", False) and W_pert is not None:
+        try:
+            from analysis.random_comparison import run_graph_structure_comparison
+            rg = run_graph_structure_comparison(
+                W=W_pert,
+                trajectories=trajs,
+                lyapunov_results=results.get("lyapunov"),
+                attractor_results=results.get("attractor"),
+                n_random=rg_cfg.get("n_random", 5),
+                seed=seed,
+                output_dir=val_dir,
+            )
+            results["graph_structure_comparison"] = rg
+            brain_pr = rg.get("brain_graph", {}).get("participation_ratio", float("nan"))
+            rand_pr = rg.get("fully_random", {}).get("participation_ratio", float("nan"))
+            logger.info(
+                "  Graph structure comparison: brain PR=%.3f, random PR=%.3f",
+                brain_pr, rand_pr,
+            )
+        except Exception as e:
+            logger.warning("  Graph structure comparison failed: %s", e)
+    elif rg_cfg.get("enabled", False) and W_pert is None:
+        logger.warning("  Graph structure comparison skipped: no square connectivity matrix.")
+
+    # 4k: Input dimension control (TASK 2) — OPTIONAL
+    # Tests whether low-dimensional dynamics arise from network structure vs input drive.
+    # Operates on existing GNN trajectories — no additional model calls.
+    idc_cfg = val_cfg.get("input_dimension_control", {})
+    if idc_cfg.get("enabled", False) and trajs is not None:
+        try:
+            from analysis.input_dimension_control import run_input_dimension_control
+            idc = run_input_dimension_control(
+                trajectories=trajs,
+                noise_sigma=idc_cfg.get("noise_sigma", 0.5),
+                low_dim_k=idc_cfg.get("low_dim_k", 3),
+                seed=seed,
+                output_dir=val_dir,
+            )
+            results["input_dimension_control"] = idc
+            no_input_lle = idc.get("no_input", {}).get("lle", float("nan"))
+            hd_lle = idc.get("high_dim_noise", {}).get("lle", float("nan"))
+            logger.info(
+                "  Input dim control: no-input LLE=%.4f, high-dim-noise LLE=%.4f",
+                no_input_lle, hd_lle,
+            )
+        except Exception as e:
+            logger.warning("  Input dimension control failed: %s", e)
+
+    # 4l: Node ablation (TASK 4) — OPTIONAL
+    # Ranks nodes by how much the dynamical manifold depends on each one.
+    # Operates on existing GNN trajectories — no additional model calls.
+    na_cfg = val_cfg.get("node_ablation", {})
+    if na_cfg.get("enabled", False) and trajs is not None:
+        try:
+            from analysis.node_ablation import run_node_ablation
+            na = run_node_ablation(
+                trajectories=trajs,
+                n_top_variance=na_cfg.get("n_top_variance", 50),
+                n_random=na_cfg.get("n_random_sample", 50),
+                seed=seed,
+                output_dir=val_dir,
+            )
+            results["node_ablation"] = na
+            top5 = na.get("top_nodes", [])[:5]
+            logger.info("  Node ablation: top-5 nodes by |ΔLLE|: %s", top5)
+        except Exception as e:
+            logger.warning("  Node ablation failed: %s", e)
+
+    # 4m: Predictive dimension (TASK 7) — OPTIONAL
+    # Finds the optimal VAR(1) predictor dimension (MSE/AIC/BIC vs PCA dim m).
+    pd_val_cfg = val_cfg.get("predictive_dimension", {})
+    if pd_val_cfg.get("enabled", False) and trajs is not None:
+        try:
+            from analysis.predictive_dimension import run_predictive_dimension
+            pdim = run_predictive_dimension(
+                trajectories=trajs,
+                max_dim=pd_val_cfg.get("max_dim", 10),
+                train_fraction=pd_val_cfg.get("train_fraction", 0.70),
+                seed=seed,
+                output_dir=val_dir,
+            )
+            results["predictive_dimension"] = pdim
+            logger.info(
+                "  Predictive dimension: optimal_m (AIC)=%d, (BIC)=%d",
+                pdim.get("optimal_m_aic", -1),
+                pdim.get("optimal_m_bic", -1),
+            )
+        except Exception as e:
+            logger.warning("  Predictive dimension failed: %s", e)
+
 
 def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
                         simulator, output_dir: Path,
@@ -1083,6 +1177,56 @@ def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
             )
         except Exception as e:
             logger.warning("  Critical slowing down failed: %s", e)
+
+    # 5g: Dynamic lesion experiment (TASK 5) — OPTIONAL
+    # Requires prior node_ablation (4l) results to select top nodes.
+    # Operates on existing GNN trajectories — no additional model calls.
+    lesion_cfg = adv_cfg.get("lesion_dynamics", {})
+    if lesion_cfg.get("enabled", False) and trajs is not None:
+        try:
+            from analysis.node_ablation import run_lesion_dynamics
+            na_results = results.get("node_ablation", {})
+            top_nodes = na_results.get("top_nodes", list(range(10)))
+            lesion = run_lesion_dynamics(
+                trajectories=trajs,
+                top_nodes=top_nodes,
+                n_control=lesion_cfg.get("n_control", 10),
+                n_lesion_nodes=lesion_cfg.get("n_lesion_nodes", 10),
+                lesion_step=lesion_cfg.get("lesion_step", 500),
+                seed=cfg["data_generation"].get("seed", 42),
+                output_dir=adv_dir,
+            )
+            results["lesion_dynamics"] = lesion
+            n_rows = len(lesion.get("lesion_results", []))
+            logger.info("  Lesion dynamics: %d nodes analysed (step=%d).",
+                        n_rows, lesion.get("lesion_step", 500))
+        except Exception as e:
+            logger.warning("  Lesion dynamics failed: %s", e)
+
+    # 5h: Granger causality (TASK 6) — OPTIONAL
+    # Pairwise Granger F-statistic matrix on GNN trajectories.
+    # Complements the Transfer-Entropy analysis in 5e.
+    gc_cfg = adv_cfg.get("granger_causality", {})
+    if gc_cfg.get("enabled", False) and trajs is not None:
+        try:
+            from analysis.granger_causality import run_granger_analysis
+            # Node-importance CSV for overlap analysis
+            _na_dir = adv_dir.parent / "validation"
+            _ni_csv = _na_dir / "node_importance.csv"
+            gc = run_granger_analysis(
+                trajectories=trajs,
+                max_lag=gc_cfg.get("max_lag", 1),
+                n_src=gc_cfg.get("n_src", None),
+                n_tgt=gc_cfg.get("n_tgt", None),
+                top_k=gc_cfg.get("top_k", 20),
+                node_importance_csv=_ni_csv if _ni_csv.exists() else None,
+                output_dir=adv_dir,
+            )
+            results["granger_causality"] = gc
+            top_src = gc.get("top_sources", [])[:5]
+            logger.info("  Granger causality: top-5 sources: %s", top_src)
+        except Exception as e:
+            logger.warning("  Granger causality failed: %s", e)
 
 
 def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
