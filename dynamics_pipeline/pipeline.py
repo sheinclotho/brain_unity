@@ -452,8 +452,8 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
             results["pca"] = pca
             logger.info(
                 "  PCA: var_top5=%.1f%%, n@90%%=%d",
-                pca.get("variance_top5", 0) * 100,
-                pca.get("n_components_90", 0),
+                pca.get("variance_top5_pct", 0),
+                pca.get("n_components_90pct", 0),
             )
         except Exception as e:
             logger.warning("  PCA analysis failed: %s", e)

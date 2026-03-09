@@ -116,7 +116,7 @@ _DEFAULTS = {
             "frequency": 10.0, "duration": 30, "patterns": ["sine"],
         },
         "response_matrix": {"enabled": True, "n_nodes": 10, "stim_amplitude": 0.5},
-        "energy_constraint": {"enabled": False},
+        "energy_constraint": {"enabled": True},
         "phase_diagram": {"enabled": False},
         "controllability": {"enabled": False},
         "information_flow": {"enabled": False, "n_source_regions": 20, "n_target_regions": 20},

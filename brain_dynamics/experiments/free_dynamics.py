@@ -203,7 +203,13 @@ def run_free_dynamics(
     log_interval = max(1, n_init // 10)
     for i in range(n_init):
         window_idx = i % eff_windows
-        x0 = rng.random(n_regions).astype(np.float32)
+        # Use the simulator's own sampling with a larger noise scale (1.0σ) to
+        # generate diverse initial states across the full data distribution.
+        # This is preferable to rng.random(n_regions) (Uniform[0,1]) which is
+        # not aligned with z-scored data and produces low output diversity due
+        # to context dilution.  noise_scale=1.0 keeps values within ±3σ (the
+        # typical z-scored data range) while maximising trajectory diversity.
+        x0 = simulator.sample_random_state(rng, noise_scale=1.0)
         traj, _ = simulator.rollout(
             x0=x0, steps=steps, stimulus=None,
             context_window_idx=window_idx,

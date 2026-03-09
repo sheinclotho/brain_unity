@@ -1258,13 +1258,14 @@ class BrainDynamicsSimulator:
     # ── Convenience sampling ───────────────────────────────────────────────────
 
     def sample_random_state(
-        self, rng: Optional[np.random.Generator] = None
+        self, rng: Optional[np.random.Generator] = None,
+        noise_scale: float = _INITIAL_STATE_NOISE_SCALE,
     ) -> np.ndarray:
         """
         采样随机初始脑状态。
 
         **单模态模式 (fMRI / EEG)**：从 ``base_graph`` 数据的均值附近添加随机
-        噪声，噪声幅度按各通道的标准差缩放（0.3σ），确保初始状态位于数据的
+        噪声，噪声幅度按各通道的标准差缩放（默认 0.3σ），确保初始状态位于数据的
         自然分布范围内。对 z-score 归一化数据（值域约 ±3σ），**不裁剪**到
         [0, 1]；对 [0, 1]-归一化数据，仍执行裁剪以保留物理合理性。
 
@@ -1279,17 +1280,23 @@ class BrainDynamicsSimulator:
         ``_fmri_mean/std`` 和 ``_eeg_mean/std`` 对噪声缩放，再拼接成
         z-score 归一化的联合状态向量 ``[z_fmri | z_eeg]``，形状
         ``(n_fmri_regions + n_eeg_regions,)``。值域无 [0,1] 限制。
+
+        Args:
+            rng:         随机数生成器；None → 使用 self.seed 重新创建。
+            noise_scale: 噪声幅度（单位：数据标准差 σ）。默认 0.3σ 适合刺激
+                         分析（小扰动、无瞬态）。自由动力学实验可传入更大值
+                         （如 1.0σ）以增加初始状态多样性。
         """
         if rng is None:
             rng = np.random.default_rng(self.seed)
 
         if self.modality == "joint":
             # Sample z-scored state for fMRI part
-            fmri_noise = rng.normal(0.0, 0.1, self.n_fmri_regions).astype(np.float32)
+            fmri_noise = rng.normal(0.0, noise_scale, self.n_fmri_regions).astype(np.float32)
             fmri_x0_z = fmri_noise  # z-score ≈ mean_z + noise (mean_z ≈ 0 by definition)
 
             # Sample z-scored state for EEG part
-            eeg_noise = rng.normal(0.0, 0.1, self.n_eeg_regions).astype(np.float32)
+            eeg_noise = rng.normal(0.0, noise_scale, self.n_eeg_regions).astype(np.float32)
             eeg_x0_z = eeg_noise
 
             return np.concatenate([fmri_x0_z, eeg_x0_z])
@@ -1304,7 +1311,7 @@ class BrainDynamicsSimulator:
         # range.  For z-scored data (std ≈ 1) this gives ≈ ±0.3σ perturbations;
         # for [0,1]-normalised data (std ≈ 0.15–0.25) it gives proportionally
         # smaller perturbations — both within the natural data distribution.
-        noise = rng.normal(0.0, _INITIAL_STATE_NOISE_SCALE, self.n_regions).astype(np.float32)
+        noise = rng.normal(0.0, noise_scale, self.n_regions).astype(np.float32)
         x0 = (mean_state + noise * std_state).astype(np.float32)
 
         # Only clip to [0, 1] for strictly non-negative (legacy-normalised) data.
