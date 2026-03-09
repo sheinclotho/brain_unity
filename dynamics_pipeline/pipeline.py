@@ -649,6 +649,87 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
         if dim_results:
             results["attractor_dimension"] = dim_results
 
+    # 3i: Full Lyapunov Spectrum (Experiment 1)
+    # Extracts the complete linearised Lyapunov spectrum from DMD eigenvalues
+    # and assesses whether the system exhibits strange attractor dynamics.
+    # Zero extra model calls — uses DMD from 3e (if available).
+    lsp_cfg = dyn_cfg.get("lyapunov_spectrum", {})
+    if lsp_cfg.get("enabled", True):
+        try:
+            from analysis.lyapunov_spectrum import run_lyapunov_spectrum_analysis
+            dmd = results.get("dmd_spectrum", {})
+            lya = results.get("lyapunov", {})
+            lsp = run_lyapunov_spectrum_analysis(
+                dmd_spectrum=dmd,
+                trajectories=trajs,
+                rosenstein_lle=lya.get("mean_lyapunov"),
+                output_dir=dyn_dir,
+            )
+            if "error" not in lsp:
+                results["lyapunov_spectrum"] = lsp
+                logger.info(
+                    "  Lyapunov spectrum: K-Y=%.2f, n_pos=%d, n_neg=%d, "
+                    "strange_attractor=%s",
+                    lsp.get("ky_dimension", float("nan")),
+                    lsp.get("n_positive", 0),
+                    lsp.get("n_negative", 0),
+                    lsp.get("strange_attractor", "?"),
+                )
+        except Exception as e:
+            logger.warning("  Lyapunov spectrum analysis failed: %s", e)
+
+    # 3j: Node Contribution Analysis (Experiment 3)
+    # Identifies which brain regions are the primary drivers of the
+    # low-dimensional dynamical manifold via PCA, DMD, and response matrix.
+    # Zero extra model calls.
+    nc_cfg = dyn_cfg.get("node_contribution", {})
+    if nc_cfg.get("enabled", True):
+        try:
+            from analysis.node_contribution import run_node_contribution
+            nc = run_node_contribution(
+                trajectories=trajs,
+                dmd_spectrum=results.get("dmd_spectrum"),
+                response_matrix=results.get("response_matrix"),
+                top_k=nc_cfg.get("top_k", 20),
+                n_pca_components=nc_cfg.get("n_pca_components", 10),
+                output_dir=dyn_dir,
+            )
+            results["node_contribution"] = nc
+            logger.info(
+                "  Node contribution: core_size=%d, top10=%.1f%%, has_core=%s",
+                nc.get("dynamical_core_size", 0),
+                nc.get("top10_contribution_pct", 0.0),
+                nc.get("has_core", False),
+            )
+        except Exception as e:
+            logger.warning("  Node contribution analysis failed: %s", e)
+
+    # 3k: Attractor Basin Test (Experiment 2) — OPTIONAL, expensive
+    # Tests for a single global attractor by generating trajectories from
+    # diverse initial conditions (task / Gaussian / uniform).
+    bt_cfg = dyn_cfg.get("basin_test", {})
+    if bt_cfg.get("enabled", False):
+        try:
+            from experiments.basin_test import run_basin_test
+            basin = run_basin_test(
+                simulator=simulator,
+                n_diverse=bt_cfg.get("n_diverse", 50),
+                T=bt_cfg.get("T", 300),
+                tail_steps=bt_cfg.get("tail_steps", 50),
+                dominant_thresh=bt_cfg.get("dominant_thresh", 0.75),
+                seed=cfg["data_generation"].get("seed", 42),
+                device=simulator.device if hasattr(simulator, "device") else "cpu",
+                output_dir=dyn_dir,
+            )
+            results["basin_test"] = basin
+            logger.info(
+                "  Basin test: single_attractor=%s, dominant=%.1f%%",
+                basin.get("single_attractor", "?"),
+                basin.get("pooled_dominant_fraction", 0.0) * 100,
+            )
+        except Exception as e:
+            logger.warning("  Basin test failed: %s", e)
+
 
 def run_phase4_validation(cfg: dict, results: Dict[str, Any],
                           output_dir: Path) -> None:
@@ -763,6 +844,89 @@ def run_phase4_validation(cfg: dict, results: Dict[str, Any],
             )
         except Exception as e:
             logger.warning("  Intrinsic dimension (TwoNN) failed: %s", e)
+
+    # ── Network perturbation experiments (Experiments 4, 5, 6, 7) ─────────────
+    # These operate on the connectivity matrix W (response matrix or FC).
+    # No additional GNN model calls are needed.
+    W_pert = _get_square_connectivity(results, trajs)
+
+    # 4f: Hub Perturbation (Experiment 5) — OPTIONAL
+    hp_cfg = val_cfg.get("hub_perturbation", {})
+    if hp_cfg.get("enabled", False) and W_pert is not None:
+        try:
+            from analysis.network_perturbation import run_hub_perturbation
+            hp = run_hub_perturbation(
+                W=W_pert,
+                top_k_list=hp_cfg.get("top_k_list", [5, 10]),
+                output_dir=val_dir,
+            )
+            results["hub_perturbation"] = hp
+            logger.info("  Hub perturbation: %s", hp.get("judgment", "?"))
+        except Exception as e:
+            logger.warning("  Hub perturbation failed: %s", e)
+    elif hp_cfg.get("enabled", False) and W_pert is None:
+        logger.warning("  Hub perturbation skipped: no square connectivity matrix available.")
+
+    # 4g: Weight Randomisation (Experiment 6) — OPTIONAL
+    wr_cfg = val_cfg.get("weight_randomisation", {})
+    if wr_cfg.get("enabled", False) and W_pert is not None:
+        try:
+            from analysis.network_perturbation import run_weight_randomisation
+            wr = run_weight_randomisation(
+                W=W_pert,
+                n_shuffles=wr_cfg.get("n_shuffles", 5),
+                seed=seed,
+                output_dir=val_dir,
+            )
+            results["weight_randomisation"] = wr
+            logger.info("  Weight randomisation: %s", wr.get("judgment", "?"))
+        except Exception as e:
+            logger.warning("  Weight randomisation failed: %s", e)
+    elif wr_cfg.get("enabled", False) and W_pert is None:
+        logger.warning("  Weight randomisation skipped: no square connectivity matrix.")
+
+    # 4h: Subnetwork Scaling (Experiment 7) — OPTIONAL
+    ss_cfg = val_cfg.get("subnetwork_scaling", {})
+    if ss_cfg.get("enabled", False) and W_pert is not None:
+        try:
+            from analysis.network_perturbation import run_subnetwork_scaling
+            N_full = W_pert.shape[0]
+            default_scales = [
+                s for s in [120, 160, 200] if s < N_full
+            ] or [max(5, N_full // 2)]
+            ss = run_subnetwork_scaling(
+                W=W_pert,
+                scales=ss_cfg.get("scales", default_scales),
+                n_subnetworks=ss_cfg.get("n_subnetworks", 10),
+                seed=seed,
+                output_dir=val_dir,
+            )
+            results["subnetwork_scaling"] = ss
+            logger.info("  Subnetwork scaling: %s", ss.get("judgment", "?"))
+        except Exception as e:
+            logger.warning("  Subnetwork scaling failed: %s", e)
+    elif ss_cfg.get("enabled", False) and W_pert is None:
+        logger.warning("  Subnetwork scaling skipped: no square connectivity matrix.")
+
+    # 4i: Structure-Preserving Random Network (Experiment 4) — OPTIONAL
+    # Complements the existing random comparison (4b) by preserving the
+    # empirical edge weight distribution while rewiring connections.
+    sp_cfg = val_cfg.get("structure_preserving_random", {})
+    if sp_cfg.get("enabled", False) and W_pert is not None:
+        try:
+            from analysis.network_perturbation import run_structure_preserving_random
+            spr = run_structure_preserving_random(
+                W=W_pert,
+                n_random=sp_cfg.get("n_random", 5),
+                seed=seed,
+                output_dir=val_dir,
+            )
+            results["structure_preserving_random"] = spr
+            logger.info("  Structure-preserving random: %s", spr.get("judgment", "?"))
+        except Exception as e:
+            logger.warning("  Structure-preserving random network failed: %s", e)
+    elif sp_cfg.get("enabled", False) and W_pert is None:
+        logger.warning("  Structure-preserving random skipped: no square matrix.")
 
 
 def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
@@ -1071,6 +1235,16 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
     report["lle"] = float(mean_lle) if mean_lle is not None else None
     report["dmd_rho"] = float(rho_dmd) if rho_dmd is not None else None
 
+    # ── 9-question verification table (Experiments 1–8) ──────────────────────
+    # Synthesises results from the 8 validation experiments into a concise
+    # verification table answering the three core questions.
+    report["validation_table"] = _build_validation_table(results)
+    logger.info("  Validation table:")
+    for row in report["validation_table"]:
+        status = "✓" if row.get("verified") else ("○" if row.get("verified") is None else "✗")
+        logger.info("    %s Q%d: %s — %s",
+                    status, row["question_id"], row["question_short"], row["verdict"])
+
     # Save report
     report_path = output_dir / "pipeline_report.json"
     with open(report_path, "w", encoding="utf-8") as f:
@@ -1078,6 +1252,187 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
     logger.info("  → Report saved: %s", report_path)
 
     results["report"] = report
+
+
+def _build_validation_table(results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Build the 9-question verification table from all experiment results.
+
+    Returns a list of dicts, one per question, with keys:
+        question_id    int
+        question_short str
+        experiment     str  (which experiment answered this)
+        data_source    str  (which results key)
+        verdict        str
+        evidence       str
+        verified       bool or None (None = not tested)
+    """
+
+    def _q(qid, short, exp, src, verdict, evidence, verified):
+        return {
+            "question_id": qid,
+            "question_short": short,
+            "experiment": exp,
+            "data_source": src,
+            "verdict": verdict,
+            "evidence": evidence,
+            "verified": verified,
+        }
+
+    rows = []
+
+    # Q1: Single strange attractor? (Exp 1: Lyapunov Spectrum)
+    lsp = results.get("lyapunov_spectrum", {})
+    sa = lsp.get("strange_attractor")
+    lya = results.get("lyapunov", {})
+    lle = lya.get("mean_lyapunov")
+    if sa is not None:
+        verified_q1 = sa in ("likely", "possible")
+        verdict_q1 = f"strange_attractor={sa}"
+        ev_q1 = lsp.get("assessment", {}).get("evidence", [])
+        ev_q1_str = "; ".join(ev_q1[:3]) if ev_q1 else (
+            f"K-Y={lsp.get('ky_dimension', '?'):.2f}, n_pos={lsp.get('n_positive', '?')}"
+            if isinstance(lsp.get("ky_dimension"), float) else "see lyapunov_spectrum_report.json"
+        )
+    else:
+        verified_q1 = None
+        verdict_q1 = "not_tested (Phase 3e DMD disabled or failed)"
+        ev_q1_str = "Enable dmd_spectrum in config to compute Lyapunov spectrum."
+    rows.append(_q(1, "single strange attractor", "Exp1 (Lyapunov Spectrum)",
+                   "lyapunov_spectrum", verdict_q1, ev_q1_str, verified_q1))
+
+    # Q2: Low-dimensional chaos stable? (Exp 3: Node Contribution + Exp 7: Subnetwork)
+    nc = results.get("node_contribution", {})
+    ss = results.get("subnetwork_scaling", {})
+    has_core = nc.get("has_core")
+    core_pct = nc.get("top10_contribution_pct", float("nan"))
+    ss_stab = ss.get("stability_index")
+    if has_core is not None or ss_stab is not None:
+        verified_q2 = (has_core is True) or (ss_stab is not None and ss_stab < 0.15)
+        ev_parts = []
+        if has_core is not None:
+            ev_parts.append(f"top10_nodes={core_pct:.1f}%")
+        if ss_stab is not None:
+            ev_parts.append(f"scale_CV={ss_stab:.1%}")
+        verdict_q2 = "low-dim chaos stable" if verified_q2 else "insufficient evidence"
+        ev_q2_str = ", ".join(ev_parts) or "no evidence"
+    else:
+        verified_q2 = None
+        verdict_q2 = "not_tested (enable node_contribution and/or subnetwork_scaling)"
+        ev_q2_str = ""
+    rows.append(_q(2, "low-dimensional chaos stable", "Exp3 (Node Contribution) + Exp7 (Subnetwork)",
+                   "node_contribution, subnetwork_scaling", verdict_q2, ev_q2_str, verified_q2))
+
+    # Q3: Dynamical core nodes? (Exp 3: Node Contribution)
+    if has_core is not None:
+        core_size = nc.get("dynamical_core_size", 0)
+        N_reg = results.get("lyapunov_spectrum", {}).get("spectrum", np.array([])).shape[0]
+        verdict_q3 = (
+            f"core_size={core_size} nodes explain ≥50% (top10={core_pct:.1f}%)"
+            if has_core else f"no strong core (top10={core_pct:.1f}% ≤ 50%)"
+        )
+        ev_q3_str = nc.get("top_nodes", [])[:5]
+        ev_q3_str = f"top nodes: {ev_q3_str}"
+    else:
+        has_core = None
+        verdict_q3 = "not_tested (enable node_contribution)"
+        ev_q3_str = ""
+    rows.append(_q(3, "dynamical core nodes exist", "Exp3 (Node Contribution)",
+                   "node_contribution", verdict_q3, ev_q3_str, has_core))
+
+    # Q4: Training structure determines dynamics? (Exp 4: Structure-Preserving Random)
+    spr = results.get("structure_preserving_random", {})
+    if spr:
+        delta_rho = spr.get("delta_rho")
+        verified_q4 = bool(delta_rho is not None and delta_rho > 0.05)
+        verdict_q4 = spr.get("judgment", "?")
+        ev_q4_str = f"delta_rho={delta_rho:.4f}" if delta_rho is not None else "no evidence"
+    else:
+        verified_q4 = None
+        verdict_q4 = "not_tested (enable structure_preserving_random)"
+        ev_q4_str = ""
+    rows.append(_q(4, "training structure determines dynamics", "Exp4 (Structure-Preserving Random)",
+                   "structure_preserving_random", verdict_q4, ev_q4_str, verified_q4))
+
+    # Q5: Random networks lose structure? (Phase 4b: random_comparison)
+    rc = results.get("random_comparison", {})
+    if rc:
+        rand_lle = rc.get("random_lle_mean")
+        real_lle_val = lle
+        if rand_lle is not None and real_lle_val is not None:
+            verified_q5 = bool(real_lle_val > rand_lle + 0.01)
+            verdict_q5 = (
+                f"real LLE={real_lle_val:.4f} > random={rand_lle:.4f} — trained dynamics differ"
+                if verified_q5
+                else f"real LLE={real_lle_val:.4f} ≈ random={rand_lle:.4f} — similar"
+            )
+            ev_q5_str = verdict_q5
+        else:
+            verified_q5 = None
+            verdict_q5 = "random comparison run but LLE comparison unavailable"
+            ev_q5_str = str(rc)[:200]
+    else:
+        verified_q5 = None
+        verdict_q5 = "not_tested (enable random_comparison)"
+        ev_q5_str = ""
+    rows.append(_q(5, "random networks lose structure", "Exp4 + Phase4b (random_comparison)",
+                   "random_comparison", verdict_q5, ev_q5_str, verified_q5))
+
+    # Q6: Hub nodes control dynamics? (Exp 5: Hub Perturbation)
+    hp = results.get("hub_perturbation", {})
+    if hp:
+        max_shift = max(
+            (v for v in hp.get("spectral_shift", {}).values() if v is not None), default=None
+        )
+        verified_q6 = bool(max_shift is not None and max_shift > 0.10)
+        verdict_q6 = hp.get("judgment", "?")
+        ev_q6_str = f"max_rho_shift={max_shift:.1%}" if max_shift is not None else "?"
+    else:
+        verified_q6 = None
+        verdict_q6 = "not_tested (enable hub_perturbation)"
+        ev_q6_str = ""
+    rows.append(_q(6, "hub nodes control manifold", "Exp5 (Hub Perturbation)",
+                   "hub_perturbation", verdict_q6, ev_q6_str, verified_q6))
+
+    # Q7: Weight structure matters? (Exp 6: Weight Randomisation)
+    wr = results.get("weight_randomisation", {})
+    if wr:
+        rho_shift = wr.get("rho_shift")
+        verified_q7 = bool(rho_shift is not None and rho_shift > 0.10)
+        verdict_q7 = wr.get("judgment", "?")
+        ev_q7_str = f"rho_shift={rho_shift:.1%}" if rho_shift is not None else "?"
+    else:
+        verified_q7 = None
+        verdict_q7 = "not_tested (enable weight_randomisation)"
+        ev_q7_str = ""
+    rows.append(_q(7, "weight structure determines dynamics", "Exp6 (Weight Randomisation)",
+                   "weight_randomisation", verdict_q7, ev_q7_str, verified_q7))
+
+    # Q8: Scale invariance / subnetwork stability? (Exp 7: Subnetwork Scaling)
+    if ss:
+        stab = ss.get("stability_index")
+        verified_q8 = bool(stab is not None and stab < 0.15)
+        verdict_q8 = ss.get("judgment", "?")
+        ev_q8_str = f"rho_CV={stab:.1%}" if stab is not None else "?"
+    else:
+        verified_q8 = None
+        verdict_q8 = "not_tested (enable subnetwork_scaling)"
+        ev_q8_str = ""
+    rows.append(_q(8, "dynamics scale-invariant", "Exp7 (Subnetwork Scaling)",
+                   "subnetwork_scaling", verdict_q8, ev_q8_str, verified_q8))
+
+    # Q9: Modalities share dynamical core? (Exp 8: already addressed by --modality both)
+    # Check if we have results for both fMRI and EEG modalities (both mode)
+    rows.append(_q(
+        9, "modalities share dynamical core",
+        "Exp8 (--modality both)",
+        "fmri_report + eeg_report",
+        "compare fmri/eeg/pipeline_report.json files with --modality both",
+        "Use --modality both to run pipeline for each modality and compare.",
+        None,  # always not_tested in single-modality run
+    ))
+
+    return rows
 
 
 def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:

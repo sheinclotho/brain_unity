@@ -60,6 +60,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 from sklearn.decomposition import PCA
+from spectral_dynamics.plot_utils import write_fallback_png as _write_fallback_png
 
 logger = logging.getLogger(__name__)
 
@@ -481,6 +482,7 @@ def _try_plot_phase_portrait_pair(
         from spectral_dynamics.plot_utils import configure_matplotlib
         configure_matplotlib()
     except ImportError:
+        _write_fallback_png(output_path)
         return
 
     if X_pca.shape[1] <= max(pc_a, pc_b):
@@ -638,6 +640,7 @@ def _try_plot_poincare_section(poincare: Dict, output_path: Path) -> None:
         from spectral_dynamics.plot_utils import configure_matplotlib
         configure_matplotlib()
     except ImportError:
+        _write_fallback_png(output_path)
         return
 
     points = poincare["points"]
