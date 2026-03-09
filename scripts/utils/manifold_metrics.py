@@ -57,15 +57,16 @@ def procrustes_distance(
 
     # Joint PCA basis
     joint = np.vstack([Xf, Yf])
-    joint -= joint.mean(axis=0)
+    joint_mean = joint.mean(axis=0)
+    joint_centered = joint - joint_mean
     try:
-        _, _, Vt = np.linalg.svd(joint, full_matrices=False)
+        _, _, Vt = np.linalg.svd(joint_centered, full_matrices=False)
         components = Vt[:n_components]
     except np.linalg.LinAlgError:
-        components = np.eye(min(n_components, joint.shape[1]))
+        components = np.eye(min(n_components, joint_centered.shape[1]))
 
-    Xp = (Xf - joint.mean(axis=0)) @ components.T
-    Yp = (Yf - joint.mean(axis=0)) @ components.T
+    Xp = (Xf - joint_mean) @ components.T
+    Yp = (Yf - joint_mean) @ components.T
 
     # Match lengths
     n = min(len(Xp), len(Yp))

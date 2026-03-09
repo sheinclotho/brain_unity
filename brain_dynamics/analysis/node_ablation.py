@@ -210,10 +210,11 @@ def run_node_ablation(
 
     ablation_rows = []
     for k, node in enumerate(nodes_to_test):
-        # Mask node: replace with per-trajectory mean
+        # Mask node: replace each trajectory's node activity with its per-trajectory mean.
+        # node_mean shape: (n_traj, 1) broadcasts to (n_traj, T) for the column assignment.
         ablated = trajs.copy()
         node_mean = ablated[:, :, node].mean(axis=1, keepdims=True)  # (n_traj, 1)
-        ablated[:, :, node] = node_mean
+        ablated[:, :, node] = node_mean  # broadcast: (n_traj, 1) → (n_traj, T)
 
         abl_lle = _lle(ablated)
         abl_d2 = _d2(ablated)
@@ -246,10 +247,10 @@ def run_node_ablation(
                 delta_lle, delta_d2, delta_rho_pct, proc,
             )
 
-    # Sort by |ΔLLE| descending
+    # Sort by |ΔLLE| descending (NaN treated as 0 so they sort last)
     def _sort_key(r):
         v = r["delta_lle"]
-        return abs(v) if not (v != v) else 0.0  # NaN-safe
+        return abs(v) if not np.isnan(v) else 0.0
 
     ablation_rows.sort(key=_sort_key, reverse=True)
     top_nodes = [r["node"] for r in ablation_rows]

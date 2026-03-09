@@ -33,7 +33,9 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import struct
 import time
+import zlib
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -166,7 +168,9 @@ def compute_granger_matrix(
 
         if j % 20 == 0:
             elapsed = time.time() - t0
-            eta = elapsed / (j + 1) * (n_src - j - 1)
+            rows_done = (j + 1) * n_tgt
+            rows_total = n_src * n_tgt
+            eta = elapsed / rows_done * (rows_total - rows_done) if rows_done > 0 else 0.0
             logger.info("  Granger: %d/%d rows done (ETA %.0fs)", j + 1, n_src, eta)
 
     return G
@@ -361,10 +365,11 @@ def _overlap_with_importance(
 
 
 def _fallback_png(path: str) -> None:
-    import struct, zlib
+    """Write a minimal valid 2x2 grey PNG using stdlib only."""
     def _c(tag, data):
         raw = tag + data
         return struct.pack(">I", len(data)) + raw + struct.pack(">I", zlib.crc32(raw) & 0xffffffff)
+    # Two deflate-compressed scanlines: filter-byte + 3-byte RGB pixels
     with open(path, "wb") as fh:
         fh.write(b"\x89PNG\r\n\x1a\n")
         fh.write(_c(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)))

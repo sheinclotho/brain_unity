@@ -63,6 +63,8 @@ def _fallback_png(path: str) -> None:
     with open(path, "wb") as fh:
         fh.write(b"\x89PNG\r\n\x1a\n")
         fh.write(_chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)))
+        # Two deflate-compressed scanlines: pixel data for a 2x2 RGB grey image.
+        # Each scanline: filter-byte (0x00) + 3-byte pixel (0xff 0x80 0x80 / 0x40 0xc0 0x80)
         fh.write(_chunk(b"IDAT", zlib.compress(b"\x00\xff\x80\x80\x00\x40\xc0\x80")))
         fh.write(_chunk(b"IEND", b""))
 

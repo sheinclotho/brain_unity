@@ -169,6 +169,9 @@ def run_predictive_dimension(
             continue
 
         mean_mse = float(np.mean(mse_list))
+        # Note: log-likelihoods are averaged across trajectories before computing
+        # AIC/BIC.  This assumes approximate independence between trajectories,
+        # which is a simplifying assumption for computational tractability.
         mean_loglik = float(np.mean(loglik_list))
         mean_n = float(np.mean(n_obs_list))
         k_params = float(np.mean(n_params_list))

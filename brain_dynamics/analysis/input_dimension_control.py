@@ -46,6 +46,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+_NORM_GUARD = 1e-8   # prevent division by zero when normalising projection columns
 _CONDITIONS = ["no_input", "high_dim_noise", "low_dim_drive"]
 _CONDITION_LABELS = ["A: No input", "B: High-dim noise", "C: 3-D low-dim drive"]
 
@@ -81,7 +82,7 @@ def _add_low_dim_drive(
     N = trajectories.shape[-1]
     # Random projection matrix (each column unit-normalised)
     P = rng.standard_normal((N, low_dim_k)).astype(np.float32)
-    P /= np.linalg.norm(P, axis=0, keepdims=True) + 1e-8  # (N, k)
+    P /= np.linalg.norm(P, axis=0, keepdims=True) + _NORM_GUARD  # (N, k)
 
     # Project all frames: (n_traj, T, N) → (n_traj, T, k) → (n_traj, T, N)
     flat = trajectories.reshape(-1, N)          # (n_traj*T, N)

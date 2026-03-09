@@ -518,7 +518,7 @@ def run_random_model_comparison(
 def _degree_preserving_rewire(W: np.ndarray, n_swaps: int, seed: int) -> np.ndarray:
     """Maslov-Sneppen degree-preserving edge rewiring for a weighted matrix.
 
-    Rewires ``n_swaps`` pairs of edges while preserving the row/column
+    Rewires ``n_swaps`` valid edge-pairs while preserving the row/column
     (degree) distribution.  Weights are also swapped so the weight
     distribution is preserved.
     """
@@ -528,7 +528,11 @@ def _degree_preserving_rewire(W: np.ndarray, n_swaps: int, seed: int) -> np.ndar
     rows, cols = np.nonzero(W_rw)
     if len(rows) < 4:
         return W_rw
-    for _ in range(n_swaps):
+    completed = 0
+    max_attempts = n_swaps * 10  # guard against infinite loops on dense graphs
+    for _attempt in range(max_attempts):
+        if completed >= n_swaps:
+            break
         idx = rng.choice(len(rows), size=2, replace=False)
         r1, c1 = rows[idx[0]], cols[idx[0]]
         r2, c2 = rows[idx[1]], cols[idx[1]]
@@ -543,6 +547,7 @@ def _degree_preserving_rewire(W: np.ndarray, n_swaps: int, seed: int) -> np.ndar
         W_rw[r2, c1] = w2
         rows[idx[0]], cols[idx[0]] = r1, c2
         rows[idx[1]], cols[idx[1]] = r2, c1
+        completed += 1
     return W_rw
 
 
@@ -657,6 +662,8 @@ def run_graph_structure_comparison(
         }
 
     # Degree-preserving rewire
+    # n_swaps = 10% of N² = empirically sufficient to decorrelate edge positions
+    # while the max_attempts guard in _degree_preserving_rewire prevents infinite loops.
     n_swaps = max(N * N // 10, 100)
     dp_matrices = [
         _degree_preserving_rewire(W, n_swaps=n_swaps, seed=seed + i)
