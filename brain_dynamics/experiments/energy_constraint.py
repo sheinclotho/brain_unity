@@ -250,8 +250,11 @@ class EnergyConstrainedSimulator:
     @property
     def n_temporal_windows(self) -> int:   return self._sim.n_temporal_windows
 
-    def sample_random_state(self, rng=None) -> np.ndarray:
-        return self._sim.sample_random_state(rng=rng)
+    def sample_random_state(self, rng=None, from_data: bool = False,
+                            step_idx=None) -> np.ndarray:
+        return self._sim.sample_random_state(
+            rng=rng, from_data=from_data, step_idx=step_idx
+        )
 
     # ── Core: constrained step-by-step rollout ────────────────────────────────
     def rollout(
