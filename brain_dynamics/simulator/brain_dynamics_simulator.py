@@ -512,6 +512,7 @@ class BrainDynamicsSimulator:
         x0: Optional[np.ndarray] = None,
         steps: int = 50,
         stimuli: Optional[List[Stimulus]] = None,
+        context_window_idx: int = 0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         多脑区同时刺激的连续模拟（TwinBrainDigitalTwin）。
@@ -520,19 +521,28 @@ class BrainDynamicsSimulator:
         同时将所有活跃刺激的脑区和幅度打包为 ``interventions`` 字典。
 
         Args:
-            x0:       初始脑状态；注入为初始上下文最后一步（见 rollout）。
-            steps:    模拟步数。
-            stimuli:  多个 ``Stimulus`` 对象的列表（None → 自由演化，等同于 rollout）。
+            x0:                 初始脑状态；注入为初始上下文最后一步（见 rollout）。
+            steps:              模拟步数。
+            stimuli:            多个 ``Stimulus`` 对象的列表（None → 自由演化，等同于 rollout）。
+            context_window_idx: 使用哪个历史时序窗口作为初始上下文（0 = 最近窗口）。
+                                与 ``rollout`` 的 ``context_window_idx`` 含义相同，
+                                确保 stimulated/counterfactual 两路从相同历史出发。
 
         Returns:
             trajectory: shape (steps, n_regions)。
             times:      shape (steps,)。
         """
         if self.modality == "joint":
-            return self._rollout_multi_stim_joint(steps=steps, stimuli=stimuli, x0=x0)
+            return self._rollout_multi_stim_joint(
+                steps=steps, stimuli=stimuli, x0=x0,
+                context_window_idx=context_window_idx,
+            )
         if stimuli is None:
             stimuli = []
-        return self._rollout_multi_stim_with_twin(steps=steps, stimuli=stimuli, x0=x0)
+        return self._rollout_multi_stim_with_twin(
+            steps=steps, stimuli=stimuli, x0=x0,
+            context_window_idx=context_window_idx,
+        )
 
     # ── Wolf-Benettin rollout pair ────────────────────────────────────────────
 
@@ -1206,18 +1216,22 @@ class BrainDynamicsSimulator:
         steps: int,
         stimuli: List[Stimulus],
         x0: Optional[np.ndarray] = None,
+        context_window_idx: int = 0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Autoregressive rollout with multiple simultaneous stimuli using TwinBrainDigitalTwin.
 
         All active stimuli in a chunk are packed into the ``interventions`` dict.
-        Context trimming (same as ``_rollout_with_twin``) and x0 injection are
-        applied to reduce encoder activation memory and support varied initial states.
+        Context selection matches ``_rollout_with_twin`` via ``_get_context_for_window``
+        so that a stimulated run and its counterfactual (``stimuli=[]``) start from
+        exactly the same historical context when given the same ``context_window_idx``.
         All modalities are advanced together after each prediction step.
         """
         chunk_size: int = getattr(getattr(self.model, "model", None), "prediction_steps", 50)
 
-        context = self._trim_context(_clone_hetero_graph(self.base_graph))
+        # Use the same context-window selection as _rollout_with_twin so that
+        # stimulated and counterfactual rollouts share an identical starting context.
+        context = self._get_context_for_window(context_window_idx)
         self._inject_x0_into_context(context, x0)
 
         trajectory = np.empty((steps, self.n_regions), dtype=np.float32)

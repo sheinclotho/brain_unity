@@ -39,6 +39,10 @@ let loadedMeta = { nFmriRegions: 0, nEegChannels: 0 };
 // Shown when the user clicks "○ 对照轨迹" in the timeline bar.
 let counterFactualFrames = [];
 let showingCounterFactual = false;
+// Real recorded data frames for the same time window as the last simulation,
+// returned by the BrainDynamicsSimulator path for direct comparison.
+let realDataFrames = [];
+let showingRealData = false;
 // Original loaded data frames (never overwritten by simulation results).
 // Used as the source for stimulation initial_state so re-running a simulation
 // always starts from the actual recorded data, not from a previous simulation.
@@ -448,9 +452,16 @@ function handleMsg(msg) {
       // Show/configure modality toggle (only on new data load, not simulation)
       updateModalityToggle(msg.modalities || []);
     }
-    // Pick the active modality's frames (fall back to primary frames)
+    // isStim must be defined before finalFrames so it can be used in the expression.
+    const isStim = msg.type === 'simulation_result';
+    // For simulation_result: always display the simulation output (msg.frames).
+    // For cache_loaded: respect the active modality selection.
+    // BUG-FIX: previously _getModalityFrames() returned the cached fMRI data even for
+    // simulation results, causing the simulation output to be silently discarded and
+    // the frontend to appear unchanged after every stimulation run.
     const modFrames = _getModalityFrames();
-    const finalFrames = modFrames.length > 0 ? modFrames : msg.frames;
+    const finalFrames = isStim ? msg.frames
+                                : (modFrames.length > 0 ? modFrames : msg.frames);
     // Determine label for modality badge
     let modalityLabel = msg.modality || null;
     if (!modalityLabel) {
@@ -462,19 +473,29 @@ function handleMsg(msg) {
       modalityLabel = '⚡ 仿真';
     }
     // Store counterfactual frames (null-stimulation baseline) for comparison
-    if (msg.type === 'simulation_result' && Array.isArray(msg.counterfactual_frames)
+    if (isStim && Array.isArray(msg.counterfactual_frames)
         && msg.counterfactual_frames.length > 0) {
       counterFactualFrames = msg.counterfactual_frames;
       showingCounterFactual = false;
       const cfBtn = document.getElementById('btn-cf-toggle');
       if (cfBtn) { cfBtn.style.display = ''; cfBtn.textContent = '○ 对照轨迹'; }
-    } else if (msg.type !== 'simulation_result') {
-      // Clear CF button when loading new cache data (not simulation)
+    } else if (!isStim) {
+      // Clear CF / real-data buttons when loading new cache data (not simulation)
       counterFactualFrames = [];
+      realDataFrames = [];
+      showingRealData = false;
       const cfBtn = document.getElementById('btn-cf-toggle');
       if (cfBtn) cfBtn.style.display = 'none';
+      const rdBtn = document.getElementById('btn-real-toggle');
+      if (rdBtn) rdBtn.style.display = 'none';
     }
-    const isStim = msg.type === 'simulation_result';
+    // Store real data frames for comparison (provided by BrainDynamicsSimulator path)
+    if (isStim && Array.isArray(msg.real_frames) && msg.real_frames.length > 0) {
+      realDataFrames = msg.real_frames;
+      showingRealData = false;
+      const rdBtn = document.getElementById('btn-real-toggle');
+      if (rdBtn) { rdBtn.style.display = ''; rdBtn.textContent = '□ 真实数据'; }
+    }
     if (isStim) {
       // Backup stimulation frames so the CF toggle can restore them later
       stimFrames = finalFrames.slice();
@@ -894,6 +915,12 @@ document.getElementById('btn-stim').addEventListener('click', () => {
       amplitude, pattern, frequency,
       duration: parseInt(document.getElementById('duration').value) || 60,
       initial_state,
+      // Send the current frame position so the server can select the matching
+      // context window (context ending at this frame → predict forward from here).
+      current_frame_idx: origCurFrame,
+      // Tell the server which modality is currently active so it uses the right
+      // node type in BrainDynamicsSimulator.
+      active_modality: activeModality,
     }));
   } else {
     // Offline mode: generate a simple stimulation animation so the effect persists
@@ -1028,15 +1055,19 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   stimFrames = [];
   counterFactualFrames = [];
   showingCounterFactual = false;
+  showingRealData = false;
+  realDataFrames = [];
   viewingSimulation = false;
   origCurFrame = 0;
   curFrame  = 0;
   slider.max = 0;
   slider.value = 0;
   updateFrameLabel();
-  // Hide counterfactual toggle, delta-view button and return-data button
+  // Hide counterfactual toggle, real-data toggle, delta-view button and return-data button
   const cfBtn = document.getElementById('btn-cf-toggle');
   if (cfBtn) cfBtn.style.display = 'none';
+  const realToggleBtn = document.getElementById('btn-real-toggle');
+  if (realToggleBtn) realToggleBtn.style.display = 'none';
   const rdBtn = document.getElementById('btn-return-data');
   if (rdBtn) rdBtn.style.display = 'none';
   const deltaBtn = document.getElementById('btn-delta-view');
@@ -1343,7 +1374,9 @@ document.getElementById('btn-hide-ec').addEventListener('click', () => {
 document.getElementById('btn-cf-toggle').addEventListener('click', () => {
   if (!counterFactualFrames.length) return;
   showingCounterFactual = !showingCounterFactual;
+  if (showingRealData) { showingRealData = false; }  // exit real-data view if active
   const cfBtn = document.getElementById('btn-cf-toggle');
+  const rdBtn = document.getElementById('btn-real-toggle');
   // Preserve the current frame position so the two trajectories stay in sync.
   const switchFrame = curFrame;
   if (showingCounterFactual) {
@@ -1352,6 +1385,7 @@ document.getElementById('btn-cf-toggle').addEventListener('click', () => {
     cfBtn.style.background = 'rgba(126,184,255,0.18)';
     cfBtn.style.color = '#7eb8ff';
     cfBtn.style.borderColor = 'rgba(126,184,255,0.4)';
+    if (rdBtn) { rdBtn.textContent = '□ 真实数据'; rdBtn.style.background = ''; rdBtn.style.color = ''; rdBtn.style.borderColor = ''; }
     loadFrameSeq(counterFactualFrames, null, '○ 对照', true, switchFrame);
   } else {
     // Switch back to stimulated trajectory using the backed-up stimFrames
@@ -1363,6 +1397,32 @@ document.getElementById('btn-cf-toggle').addEventListener('click', () => {
   }
 });
 
+// ── Real-data toggle: compare simulation against actual recorded frames ─────────
+document.getElementById('btn-real-toggle').addEventListener('click', () => {
+  if (!realDataFrames.length) return;
+  showingRealData = !showingRealData;
+  if (showingCounterFactual) { showingCounterFactual = false; }  // exit CF view if active
+  const rdBtn  = document.getElementById('btn-real-toggle');
+  const cfBtn  = document.getElementById('btn-cf-toggle');
+  const switchFrame = curFrame;
+  if (showingRealData) {
+    // Show actual recorded data for the same time window
+    rdBtn.textContent = '⚡ 仿真轨迹';
+    rdBtn.style.background = 'rgba(100,220,120,0.18)';
+    rdBtn.style.color = '#88ffaa';
+    rdBtn.style.borderColor = 'rgba(100,220,120,0.4)';
+    if (cfBtn) { cfBtn.textContent = '○ 对照轨迹'; cfBtn.style.background = ''; cfBtn.style.color = ''; cfBtn.style.borderColor = ''; }
+    loadFrameSeq(realDataFrames, null, '□ 真实', true, Math.min(switchFrame, realDataFrames.length - 1));
+  } else {
+    // Switch back to stimulated trajectory
+    rdBtn.textContent = '□ 真实数据';
+    rdBtn.style.background = '';
+    rdBtn.style.color = '';
+    rdBtn.style.borderColor = '';
+    loadFrameSeq(stimFrames.length > 0 ? stimFrames : [], null, '⚡ 仿真', true, switchFrame);
+  }
+});
+
 // ── Return to original data ────────────────────────────────────────────────────
 document.getElementById('btn-return-data').addEventListener('click', () => {
   if (!origFrames.length) return;
@@ -1370,15 +1430,19 @@ document.getElementById('btn-return-data').addEventListener('click', () => {
   let label = null;
   if (framesFmri.length > 0 && activeModality === 'fmri') label = 'fMRI';
   else if (framesEeg.length > 0 && activeModality === 'eeg') label = 'EEG';
-  // Hide the CF toggle (simulation context is gone)
+  // Hide the CF toggle and real-data toggle (simulation context is gone)
   const cfBtn = document.getElementById('btn-cf-toggle');
   if (cfBtn) cfBtn.style.display = 'none';
+  const rdBtn = document.getElementById('btn-real-toggle');
+  if (rdBtn) rdBtn.style.display = 'none';
   // Hide delta view button when leaving simulation
   const deltaBtn = document.getElementById('btn-delta-view');
   if (deltaBtn) deltaBtn.style.display = 'none';
   showingDeltaView = false;
   counterFactualFrames = [];
+  realDataFrames = [];
   showingCounterFactual = false;
+  showingRealData = false;
   // Restore original data at the frame the user was on before simulation started
   loadFrameSeq(origFrames, null, label, false, origCurFrame);
   // Pause immediately so the user can see the exact frame they paused on
