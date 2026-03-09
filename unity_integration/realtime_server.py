@@ -516,16 +516,21 @@ class BrainVisualizationServer:
                         n_display = len(self._loaded_time_series)
                         T_data = int(self._loaded_graph[active_mod].x.shape[1])
                         # Map display-frame index → data-frame index (accounts for
-                        # linspace subsampling if T_data > _MAX_FRAMES_PER_MODALITY)
-                        data_fi = round(
-                            current_frame_idx * (T_data - 1) / max(n_display - 1, 1)
+                        # linspace subsampling if T_data > _MAX_FRAMES_PER_MODALITY).
+                        # Clamp to [0, T_data-1] to guard against n_display==1 or
+                        # any other edge case that could push data_fi out of range.
+                        data_fi = min(
+                            round(
+                                current_frame_idx * (T_data - 1) / max(n_display - 1, 1)
+                            ),
+                            T_data - 1,
                         )
                         # window_idx such that the context window ends near data_fi
                         stride = sim._get_stride()
                         end_target = min(data_fi + 1, T_data)
                         window_idx = max(
                             0,
-                            round((T_data - end_target) / max(stride, 1))
+                            round((T_data - end_target) / stride)
                         )
                         window_idx = min(
                             window_idx, max(0, sim.n_temporal_windows - 1)
@@ -610,16 +615,12 @@ class BrainVisualizationServer:
                     real_frames: list = []
                     if self._loaded_time_series is not None:
                         n_ts    = len(self._loaded_time_series)
-                        r_start = max(0, min(
-                            current_frame_idx if current_frame_idx >= 0 else 0,
-                            n_ts - 1
-                        ))
-                        r_end = min(r_start + prediction_steps, n_ts)
-                        if r_start < n_ts:
-                            real_frames = [
-                                {"activity": row.tolist()}
-                                for row in self._loaded_time_series[r_start:r_end]
-                            ]
+                        r_start = min(max(0, current_frame_idx), n_ts - 1)
+                        r_end   = min(r_start + prediction_steps, n_ts)
+                        real_frames = [
+                            {"activity": row.tolist()}
+                            for row in self._loaded_time_series[r_start:r_end]
+                        ]
 
                     # Find the peak frame (maximum mean |stim − cf| difference)
                     delta_np = stim_traj - cf_traj       # [steps, N_model]
