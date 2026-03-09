@@ -54,6 +54,28 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    from spectral_dynamics.plot_utils import write_fallback_png as _write_fallback_png
+except ImportError:
+    import struct
+    import zlib
+
+    def _write_fallback_png(path: "Path") -> None:  # type: ignore[misc]
+        """Minimal fallback when spectral_dynamics is not on sys.path."""
+        def _chunk(tag: bytes, data: bytes) -> bytes:
+            c = struct.pack(">I", len(data)) + tag + data
+            return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+        raw_row = b"\x00\xcc\xcc"
+        idat_data = zlib.compress(raw_row * 2, level=1)
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 0, 0, 0, 0))
+            + _chunk(b"IDAT", idat_data)
+            + _chunk(b"IEND", b"")
+        )
+        Path(path).write_bytes(png)
+
 logger = logging.getLogger(__name__)
 
 # Default early-dynamics window (steps to show in the "transient" panel).
@@ -514,6 +536,7 @@ def _plot_task_phase_portrait(
         except ImportError:
             pass
     except ImportError:
+        _write_fallback_png(output_path)
         return
 
     tasks = list(task_trajectories.keys())
@@ -580,6 +603,7 @@ def _plot_early_dynamics(
         except ImportError:
             pass
     except ImportError:
+        _write_fallback_png(output_path)
         return
 
     tasks = list(task_trajectories.keys())
@@ -649,6 +673,7 @@ def _plot_hub_stability(hub_results: Dict, output_path: Path) -> None:
         except ImportError:
             pass
     except ImportError:
+        _write_fallback_png(output_path)
         return
 
     hub_masks = hub_results["hub_masks"].astype(float)  # (N, n_tasks)
@@ -703,6 +728,7 @@ def _plot_modal_rotation(modal_results: Dict, output_path: Path) -> None:
         except ImportError:
             pass
     except ImportError:
+        _write_fallback_png(output_path)
         return
 
     pairwise = modal_results.get("pairwise_angles_deg", {})

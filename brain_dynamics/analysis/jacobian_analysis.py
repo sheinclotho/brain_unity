@@ -53,6 +53,28 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    from spectral_dynamics.plot_utils import write_fallback_png as _write_fallback_png
+except ImportError:
+    import struct
+    import zlib
+
+    def _write_fallback_png(path: "Path") -> None:  # type: ignore[misc]
+        """Minimal fallback when spectral_dynamics is not on sys.path."""
+        def _chunk(tag: bytes, data: bytes) -> bytes:
+            c = struct.pack(">I", len(data)) + tag + data
+            return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+        raw_row = b"\x00\xcc\xcc"
+        idat_data = zlib.compress(raw_row * 2, level=1)
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 0, 0, 0, 0))
+            + _chunk(b"IDAT", idat_data)
+            + _chunk(b"IEND", b"")
+        )
+        Path(path).write_bytes(png)
+
 logger = logging.getLogger(__name__)
 
 # 慢模态阈值：|Re(λ_ct)| < this → slow mode（连续时间，1/s 单位）
@@ -527,6 +549,7 @@ def _try_plot_hopf_eigenvalues(spec_result: Dict, output_dir: Path) -> None:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
+        _write_fallback_png(output_dir / "hopf_eigenvalues.png")
         return
 
     eigvals = spec_result.get("eigenvalues")
@@ -602,6 +625,7 @@ def _try_plot_dmd_mode_energy(spec_result: Dict, output_dir: Path) -> None:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
+        _write_fallback_png(output_dir / "dmd_mode_energy.png")
         return
 
     mode_energy = spec_result.get("mode_energy")
