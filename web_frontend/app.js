@@ -11,7 +11,7 @@ const RECONNECT_MS     = 3000;
 const MAX_RECONNECT_MS = 30000;  // exponential backoff ceiling
 const SPHERE_R     = 4.0;   // base sphere radius (Three.js units ≈ mm)
 const LERP_ALPHA       = 0.15;  // activity lerp speed per render frame (~60 fps)
-const PLAY_INTERVAL_MS = 200;   // auto-play frame interval in ms (5 fps)
+const PLAY_INTERVAL_MS = 400;   // auto-play frame interval in ms (2.5 fps default)
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const canvas      = document.getElementById('brain-canvas');
@@ -64,6 +64,8 @@ let stimTopAffected = [];
 let peakDelta = null;
 // Whether the user is currently viewing the delta overlay (∆ 效果图 mode).
 let showingDeltaView = false;
+// Current playback interval in ms. Updated by the speed slider.
+let _playIntervalMs = PLAY_INTERVAL_MS;
 
 // ── Guard: Three.js must be loaded ────────────────────────────────────────────
 if (typeof THREE === 'undefined') {
@@ -405,6 +407,8 @@ function handleMsg(msg) {
     if (frameSeq.length === 0) updateActivity(msg.activity);
     return;
   }
+  // Capture stimPending BEFORE unlocking, so error handler can still check it.
+  const wasStimPending = stimPending;
   // Unlock stim button whenever a simulation result or error arrives
   if (msg.type === 'simulation_result' || msg.type === 'error') {
     _unlockStimBtn();
@@ -417,28 +421,33 @@ function handleMsg(msg) {
     // Store per-modality frames when the server provides them.
     // When the server sends fMRI as the primary ``frames`` and omits
     // ``frames_fmri`` to avoid duplicating the payload, reconstruct it here.
-    if (Array.isArray(msg.frames_fmri) && msg.frames_fmri.length > 0) {
-      framesFmri = msg.frames_fmri;
-    } else if (msg.type === 'cache_loaded'
-               && Array.isArray(msg.modalities)
-               && msg.modalities.includes('fmri')) {
-      // frames_fmri was omitted to save bandwidth; frames IS the fMRI data.
-      framesFmri = msg.frames;
-    } else {
-      framesFmri = [];
+    // For simulation_result, preserve existing per-modality frames — the
+    // simulation doesn't replace the underlying real data.
+    if (msg.type === 'cache_loaded') {
+      if (Array.isArray(msg.frames_fmri) && msg.frames_fmri.length > 0) {
+        framesFmri = msg.frames_fmri;
+      } else if (Array.isArray(msg.modalities) && msg.modalities.includes('fmri')) {
+        // frames_fmri was omitted to save bandwidth; frames IS the fMRI data.
+        framesFmri = msg.frames;
+      } else {
+        framesFmri = [];
+      }
+      if (Array.isArray(msg.frames_eeg) && msg.frames_eeg.length > 0) {
+        framesEeg = msg.frames_eeg;
+      } else {
+        framesEeg = [];
+      }
+      // Store actual channel / region counts so the UI can describe the data
+      loadedMeta = {
+        nFmriRegions: msg.n_fmri_regions || (framesFmri.length > 0 ? 200 : 0),
+        nEegChannels: msg.n_eeg_channels || 0,
+      };
+      // On cache load, reset to fMRI if available, else stay with EEG
+      if (framesFmri.length > 0) activeModality = 'fmri';
+      else if (framesEeg.length > 0) activeModality = 'eeg';
+      // Show/configure modality toggle (only on new data load, not simulation)
+      updateModalityToggle(msg.modalities || []);
     }
-    if (Array.isArray(msg.frames_eeg) && msg.frames_eeg.length > 0) {
-      framesEeg = msg.frames_eeg;
-    } else {
-      framesEeg = [];
-    }
-    // Store actual channel / region counts so the UI can describe the data
-    loadedMeta = {
-      nFmriRegions: msg.n_fmri_regions || (framesFmri.length > 0 ? 200 : 0),
-      nEegChannels: msg.n_eeg_channels || 0,
-    };
-    // Show/configure modality toggle
-    updateModalityToggle(msg.modalities || []);
     // Pick the active modality's frames (fall back to primary frames)
     const modFrames = _getModalityFrames();
     const finalFrames = modFrames.length > 0 ? modFrames : msg.frames;
@@ -542,7 +551,7 @@ function handleMsg(msg) {
       fi.textContent = `⚠ 加载失败: ${msg.message || '未知错误'}`;
     }
     // If a simulation was pending, also show the error in the stim info bar
-    if (stimPending) {
+    if (wasStimPending) {
       if (fi) fi.textContent = `⚠ 仿真失败: ${msg.message || '未知错误'}`;
     }
   }
@@ -595,7 +604,14 @@ function _populateCacheSelect(files) {
 // Refresh button: request the file list from the server
 document.getElementById('btn-refresh-cache').addEventListener('click', () => {
   if (!connected || !ws || ws.readyState !== WebSocket.OPEN) {
-    alert('请先连接后端服务器（运行 python start.py）');
+    // Show a non-intrusive hint instead of a blocking alert
+    const fi = document.getElementById('frame-info');
+    if (fi) {
+      const prev = fi.textContent;
+      fi.textContent = '⚠ 刷新需要后端连接（运行 python start.py）';
+      fi.style.color = '#ff8844';
+      setTimeout(() => { fi.textContent = prev; fi.style.color = ''; }, 3000);
+    }
     return;
   }
   ws.send(JSON.stringify({ type: "list_cache_files" }));
@@ -769,7 +785,7 @@ function playSeq() {
     } else {
       _prevAct = act;
     }
-  }, PLAY_INTERVAL_MS);   // 5 fps
+  }, _playIntervalMs);   // configurable fps
 }
 
 function pauseSeq() {
@@ -787,6 +803,27 @@ slider.addEventListener('input', e => {
   updateFrameLabel();
   if (frameSeq[curFrame]) updateActivity(frameSeq[curFrame].activity, frameSeq[curFrame].raw);
 });
+
+// ── Playback speed slider ─────────────────────────────────────────────────────
+// Maps slider value (1-8) to interval in ms. Higher value = faster playback.
+// Value:  1    2    3    4    5    6    7    8
+// FPS:   0.5   1   2.5   4    5    8   10   20
+const _SPEED_INTERVALS = [2000, 1000, 400, 250, 200, 125, 100, 50];
+const _SPEED_LABELS    = ['×0.5', '×1', '×2.5', '×4', '×5', '×8', '×10', '×20'];
+(function () {
+  const slider = document.getElementById('speed-slider');
+  const label  = document.getElementById('speed-val');
+  if (!slider || !label) return;
+  function _applySpeed(val) {
+    const idx = Math.max(0, Math.min(_SPEED_INTERVALS.length - 1, val - 1));
+    _playIntervalMs = _SPEED_INTERVALS[idx];
+    label.textContent = _SPEED_LABELS[idx];
+    // Restart the playback timer with the new interval (avoids duplicate intervals).
+    if (isPlaying) { pauseSeq(); playSeq(); }
+  }
+  slider.addEventListener('input', e => _applySpeed(parseInt(e.target.value)));
+  _applySpeed(parseInt(slider.value));  // initialise
+})();
 
 // ── Button wiring ─────────────────────────────────────────────────────────────
 document.getElementById('amplitude').addEventListener('input', e => {
@@ -942,7 +979,21 @@ document.getElementById('btn-stim').addEventListener('click', () => {
     }
     simStartFrame = offlineStartFrame;
 
-    // Compute counterfactual (no-stim) baseline and derive top_affected offline.
+    // Counterfactual (no-stim) frames: the deviation-based leaky integrator has
+    // act0 as its fixed point, so with zero stimulation every region stays at act0.
+    counterFactualFrames = Array.from({ length: PRE + DUR + POST },
+                                       () => ({ activity: act0.slice() }));
+    showingCounterFactual = false;
+    const cfBtnOffline = document.getElementById('btn-cf-toggle');
+    if (cfBtnOffline) {
+      cfBtnOffline.style.display = '';
+      cfBtnOffline.textContent = '○ 对照轨迹';
+      cfBtnOffline.style.background = 'rgba(255,160,44,0.18)';
+      cfBtnOffline.style.color = '#ffcc66';
+      cfBtnOffline.style.borderColor = 'rgba(255,160,44,0.4)';
+    }
+
+    // Compute counterfactual delta and derive top_affected offline.
     // No-stim: act0 never changes (leak = 0 when deviation = 0), so CF activity = act0.
     const peakAct  = localFrames[Math.min(offlineStartFrame, localFrames.length - 1)].activity;
     const offlineDelta = peakAct.map((v, i) => v - act0[i]);

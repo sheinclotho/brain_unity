@@ -119,8 +119,9 @@
       display: flex;
       align-items: center;
       padding: 0 14px;
-      gap: 10px;
+      gap: 8px;
       flex-shrink: 0;
+      overflow: hidden;
     }
     #btn-play {
       width: 34px; height: 34px; padding: 0;
@@ -342,6 +343,12 @@
   <input type="range" id="timeline-slider" min="0" max="0" value="0" />
   <span id="modality-badge"></span>
   <span id="frame-label">—</span>
+  <!-- Playback speed control -->
+  <label for="speed-slider" style="font-size:0.72rem;color:#666;white-space:nowrap;flex-shrink:0">速度</label>
+  <input type="range" id="speed-slider" min="1" max="8" step="1" value="3"
+         title="播放速度（1=慢, 8=快）"
+         style="width:70px;flex-shrink:0;accent-color:#7eb8ff" />
+  <span id="speed-val" style="font-size:0.72rem;color:#888;white-space:nowrap;flex-shrink:0;min-width:24px">×1</span>
   <!-- Shown while viewing a simulation: click to go back to original data -->
   <button id="btn-return-data" title="返回原始数据帧"
           style="display:none;width:auto;padding:4px 10px;font-size:0.75rem;
