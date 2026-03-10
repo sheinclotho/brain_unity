@@ -353,10 +353,11 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
             if sig_info:
                 logger.info(
                     "  Community (FC): Q=%.4f, k=%d, method=%s | "
-                    "null z=%.2f, p=%.4f (%s)",
+                    "null z=%.2f, %s (%s)",
                     comm["modularity_q"], comm["n_communities"],
                     comm.get("method", "unknown"),
-                    sig_info["z_score"], sig_info["p_value"],
+                    sig_info["z_score"],
+                    sig_info.get("p_formatted", f"p={sig_info['p_value']:.4f}"),
                     "significant" if sig_info["significant"] else "not significant",
                 )
             else:
@@ -1806,12 +1807,13 @@ def _generate_ai_report(
         if sig:
             sig_verdict = "significant (p<0.05)" if sig.get("significant") else "not significant (p≥0.05)"
             null_model_label = sig.get("null_model", "degree-preserving rewiring")
+            p_disp = sig.get("p_formatted") or f"p={_na(sig.get('p_value'), '.4f')}"
             lines.append(
                 f"- **Q significance test** (null model: {null_model_label}, n={sig.get('n_null')}):"
                 f"  null mean={_na(sig.get('null_mean'), '.4f')} ± "
                 f"{_na(sig.get('null_std'), '.4f')},"
                 f"  z={_na(sig.get('z_score'), '.2f')},"
-                f"  p={_na(sig.get('p_value'), '.4f')} — **{sig_verdict}**"
+                f"  {p_disp} — **{sig_verdict}**"
             )
             if not sig.get("significant"):
                 lines.append(

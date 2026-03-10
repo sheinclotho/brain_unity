@@ -202,6 +202,12 @@ def _wolf_lle_random(
         rng = np.random.default_rng(0)
     n = len(x0)
 
+    # Floor for collapsed perturbations: log(1e-30 / eps) per period.
+    # This represents the minimum measurable separation (machine precision floor).
+    # Recording floor values rather than skipping gives the correct large-negative
+    # LLE for strongly contracting systems (e.g. tanh saturation with FC matrices).
+    _FLOOR_LOG_GROWTH = np.log(1e-30 / eps)  # ≈ -55.3 for eps=1e-6
+
     def _step(x: np.ndarray) -> np.ndarray:
         return np.clip(np.tanh(W @ x), 0.0, 1.0)
 
@@ -211,8 +217,8 @@ def _wolf_lle_random(
         x_base = _step(x_base)
 
     # Random unit-norm perturbation direction
-    direction = rng.standard_normal(n).astype(np.float32)
-    direction /= np.linalg.norm(direction) + 1e-30
+    direction = rng.standard_normal(n).astype(np.float64)
+    direction /= np.linalg.norm(direction) + 1e-300
     x_pert = x_base + eps * direction
 
     log_growths: List[float] = []
@@ -225,21 +231,21 @@ def _wolf_lle_random(
 
         delta = x_pert - x_base
         r = float(np.linalg.norm(delta))
-        if r > 1e-30:
+        if r > 0.0:
             log_growths.append(np.log(r / eps))
             # Renormalize: keep separation = eps
             x_pert = x_base + eps * delta / r
         else:
-            # Perturbation collapsed to near machine precision (strong contraction).
-            # The exact log-growth is unreliable due to floating-point limits;
-            # skip this period rather than recording a spurious large value, and
-            # re-perturb to continue the Wolf traversal.
-            direction = rng.standard_normal(n).astype(np.float32)
-            direction /= np.linalg.norm(direction) + 1e-30
+            # Perturbation collapsed to exactly zero (machine precision).
+            # Record the floor log-growth (genuinely large-negative for a
+            # strongly contracting system) and re-perturb to continue.
+            log_growths.append(_FLOOR_LOG_GROWTH)
+            direction = rng.standard_normal(n).astype(np.float64)
+            direction /= np.linalg.norm(direction) + 1e-300
             x_pert = x_base + eps * direction
 
     if not log_growths:
-        return 0.0
+        return float(_FLOOR_LOG_GROWTH / renorm_steps)
     return float(np.mean(log_growths)) / renorm_steps
 
 
@@ -839,6 +845,29 @@ def run_graph_structure_comparison(
         N, n_random, n_tanh_init, tanh_steps, lle_steps,
     )
 
+    # ── Spectral-radius normalization for fair tanh-dynamics comparison ────────
+    # When W is derived from FC (Pearson correlations), its spectral radius is
+    # typically >> 1 (Marchenko-Pastur bulk). At such high coupling, tanh(W@x)
+    # saturates immediately and all three network types converge to the same
+    # trivial fixed point — making LLE comparisons meaningless (all return the
+    # floor sentinel).  To produce informative comparisons we normalise ALL
+    # matrices to a fixed coupling strength before computing tanh dynamics.
+    #
+    # _TANH_COMPARE_SR = 2.0 is known to be mildly chaotic for random N=190
+    # matrices (Wolf LLE ≈ +0.06 from empirical calibration in AGENTS.md).
+    # This ensures all three networks operate in an interesting dynamical regime
+    # while still allowing brain-specific topology to produce visibly different LLE.
+    _TANH_COMPARE_SR: float = 2.0
+
+    def _normalise_w(mat: np.ndarray) -> np.ndarray:
+        """Scale mat so that its spectral radius equals _TANH_COMPARE_SR."""
+        m = np.asarray(mat, dtype=np.float64)
+        eigs = np.linalg.eigvals(m)
+        sr = float(np.abs(eigs).max())
+        if sr > 1e-8:
+            m = m * (_TANH_COMPARE_SR / sr)
+        return m
+
     # ── 1. GNN dynamics metrics for real brain graph ──────────────────────────
     real_lle_gnn = (lyapunov_results or {}).get("primary_mean", float("nan"))
     real_n_attractors = (attractor_results or {}).get("n_attractors", float("nan"))
@@ -862,14 +891,17 @@ def run_graph_structure_comparison(
 
     # ── 2. tanh(W @ x) dynamics for fair three-way comparison ────────────────
     # Helper to average metrics over n_random matrix realisations.
+    # NOTE: each matrix is normalised to _TANH_COMPARE_SR so that the
+    # comparison reflects topology differences, not coupling-scale differences.
     def _avg_tanh_metrics(matrices: List[np.ndarray]) -> Dict:
         """Average LLE over all matrices; PCA/D2 from first matrix only."""
         lles = []
-        for W_i in matrices:
+        norm_matrices = [_normalise_w(m) for m in matrices]
+        for W_i in norm_matrices:
             x0_i = rng.random(N)
             lles.append(_wolf_lle_random(W_i, x0=x0_i, steps=lle_steps, rng=rng))
         pca_d2 = _tanh_dynamics_metrics(
-            matrices[0],
+            norm_matrices[0],
             n_init=n_tanh_init,
             steps=tanh_steps,
             lle_steps=lle_steps,
@@ -892,15 +924,18 @@ def run_graph_structure_comparison(
         }
 
     # Brain graph — tanh dynamics (comparable to baselines)
+    # Spectral metrics are computed on the ORIGINAL W (true topology properties).
+    # LLE/PCA/D2 are computed on W normalised to _TANH_COMPARE_SR (fair comparison).
+    brain_spectral = _spectral_metrics_rc(W)
+    W_norm = _normalise_w(W)
     brain_tanh = _tanh_dynamics_metrics(
-        W,
+        W_norm,
         n_init=n_tanh_init,
         steps=tanh_steps,
         lle_steps=lle_steps,
         seed=seed,
         rng=rng,
     )
-    brain_spectral = _spectral_metrics_rc(W)
     brain_entry = {
         "network": "Brain (GNN)",
         # GNN metrics — gold standard for the trained model
@@ -908,10 +943,11 @@ def run_graph_structure_comparison(
         "d2_gnn": float(real_d2_gnn),
         "pca_dim_gnn": int(real_pca_dim_gnn),
         "n_attractors": float(real_n_attractors),
-        # tanh(W @ x) metrics — directly comparable to baselines
+        # tanh(W @ x) metrics at _TANH_COMPARE_SR — directly comparable to baselines
         "lle": brain_tanh["lle"],
         "d2": brain_tanh["d2"],
         "pca_dim_90pct": brain_tanh["pca_dim_90pct"],
+        "tanh_compare_sr": _TANH_COMPARE_SR,
         **brain_spectral,
     }
 
@@ -932,8 +968,10 @@ def run_graph_structure_comparison(
         **dp_spectral,
     }
 
-    # ── 4. Fully random Gaussian (same spectral radius as brain) ─────────────
-    target_sr = brain_spectral["spectral_radius"]
+    # ── 4. Fully random Gaussian (normalised to _TANH_COMPARE_SR) ─────────────
+    # Previously these were matched to brain's original spectral radius, which
+    # was not meaningful when brain SR >> 1 (FC matrix).  Now all three networks
+    # are run at the same _TANH_COMPARE_SR, making the comparison fair.
     fr_matrices: List[np.ndarray] = []
     for i in range(n_random):
         W_fr = rng.standard_normal((N, N))
@@ -941,7 +979,7 @@ def run_graph_structure_comparison(
         eigs = np.linalg.eigvals(W_fr)
         sr_fr = float(np.abs(eigs).max())
         if sr_fr > 1e-8:
-            W_fr *= target_sr / sr_fr
+            W_fr *= _TANH_COMPARE_SR / sr_fr
         fr_matrices.append(W_fr)
     fr_tanh = _avg_tanh_metrics(fr_matrices)
     fr_spectral = _avg_spectral(fr_matrices)
@@ -953,10 +991,11 @@ def run_graph_structure_comparison(
     }
 
     logger.info(
-        "  Brain tanh(W@x) LLE=%.4f [analytical surrogate, NOT GNN model; "
+        "  Brain tanh(W@x) LLE=%.4f [analytical surrogate at ρ=%.1f, NOT GNN model; "
         "see brain_graph['lle_gnn'] for the GNN Rosenstein LLE] | "
         "Degree-preserving LLE=%.4f±%.4f | Fully-random LLE=%.4f±%.4f",
         brain_tanh["lle"],
+        _TANH_COMPARE_SR,
         dp_tanh["lle"], dp_tanh["lle_std"],
         fr_tanh["lle"], fr_tanh["lle_std"],
     )
@@ -965,13 +1004,17 @@ def run_graph_structure_comparison(
         "brain_graph": brain_entry,
         "degree_preserving": dp_entry,
         "fully_random": fr_entry,
+        "tanh_compare_sr": _TANH_COMPARE_SR,
         "note": (
-            "All three network types are compared under the SAME dynamics rule "
-            "tanh(W @ x): (1) original brain graph W, (2) Maslov-Sneppen "
-            "degree-preserving rewire of W (same degree & weight distribution, "
-            "shuffled edge topology), (3) fully random Gaussian W (same spectral "
-            "radius). GNN dynamics metrics (lle_gnn, d2_gnn, pca_dim_gnn) are "
-            "additionally reported for the brain graph from Phase 1 trajectories."
+            f"All three network types are compared under the SAME dynamics rule "
+            f"x(t+1)=clip(tanh(W_norm@x),0,1) where W_norm is each matrix scaled "
+            f"to spectral radius {_TANH_COMPARE_SR} (near-chaotic regime for N={N}). "
+            f"Spectral-radius normalisation is required because the brain FC matrix "
+            f"has ρ >> 1, which would otherwise trivially saturate tanh for all "
+            f"three networks, making the comparison uninformative. "
+            f"Original spectral radii are preserved in each entry. "
+            f"GNN dynamics metrics (lle_gnn, d2_gnn, pca_dim_gnn) are "
+            f"additionally reported for the brain graph from Phase 1 trajectories."
         ),
     }
 

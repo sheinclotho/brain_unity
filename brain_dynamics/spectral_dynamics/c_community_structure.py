@@ -610,13 +610,46 @@ def q_significance_test(
         z_score = (observed_q - null_mean) / null_std
     # One-sided empirical p-value: P(Q_null ≥ Q_observed)
     p_value = float(np.mean(arr >= observed_q))
+
+    # ── Paper-quality p-value string ─────────────────────────────────────────
+    # The empirical p_value resolves only to 1/n_null (e.g. 0.01 for n=100).
+    # When no null sample exceeds the observed Q, report the upper bound and
+    # supplement with the Gaussian normal-tail p-value derived from z_score.
+    n_null = len(null_qs)
+    if p_value == 0.0:
+        # Exact empirical bound: p < 1/n_null
+        p_bound = 1.0 / n_null
+        # Gaussian tail approximation (valid when z >> 1)
+        try:
+            import math
+            # Use log-space for large z to avoid underflow: log10(p) ≈ -z²/2/ln(10)
+            if z_score > 37:  # scipy.stats.norm.sf would underflow to 0.0
+                log10_p = -(z_score ** 2) / (2.0 * math.log(10))
+                # Format: p < X.XXe-NN
+                exp = int(math.floor(log10_p))
+                mantissa = 10 ** (log10_p - exp)
+                p_gaussian_str = f"{mantissa:.2f}×10^{exp}"
+            else:
+                from scipy.stats import norm as _norm
+                p_gauss = float(_norm.sf(z_score))
+                if p_gauss < 1e-4:
+                    p_gaussian_str = f"{p_gauss:.2e}"
+                else:
+                    p_gaussian_str = f"{p_gauss:.4f}"
+        except Exception:
+            p_gaussian_str = "N/A"
+        p_formatted = f"p < {p_bound:.2e} (empirical); p_Gauss = {p_gaussian_str}"
+    else:
+        p_formatted = f"p = {p_value:.4f}"
+
     return {
         "null_mean": round(null_mean, 5),
         "null_std": round(null_std, 5),
         "z_score": round(z_score, 4),
         "p_value": round(p_value, 4),
+        "p_formatted": p_formatted,
         "significant": bool(z_score > 1.96),
-        "n_null": len(null_qs),
+        "n_null": n_null,
     }
 
 
@@ -647,13 +680,13 @@ def _try_plot_q_null_distribution(
                lw=1, ls="--", label=f"Null mean={sig.get('null_mean', 0):.4f}")
 
     z = sig.get("z_score", 0)
-    p = sig.get("p_value", 1)
-    sig_txt = "p<0.05 (significant)" if sig.get("significant") else "p>=0.05 (not significant)"
+    p_display = sig.get("p_formatted") or f"p={sig.get('p_value', 1):.4f}"
+    sig_txt = "significant (p<0.05)" if sig.get("significant") else "not significant (p>=0.05)"
     ax.set_xlabel("Modularity Q")
     ax.set_ylabel("Count")
     ax.set_title(
         f"Q Null Distribution ({null_model_type})  [{label}]\n"
-        f"z={z:.2f}, p={p:.4f} — {sig_txt}"
+        f"z={z:.2f}, {p_display} — {sig_txt}"
     )
     ax.legend(fontsize=8)
     fig.tight_layout()
@@ -772,10 +805,11 @@ def run_community_structure(
         result["q_significance"] = sig
         sig_str = "显著 ✓" if sig["significant"] else "不显著"
         logger.info(
-            "  Q 显著性 [%s]: Q=%.4f, null mean=%.4f±%.4f, z=%.2f, p=%.4f (%s)",
+            "  Q 显著性 [%s]: Q=%.4f, null mean=%.4f±%.4f, z=%.2f, %s (%s)",
             null_model_type,
             Q, sig["null_mean"], sig["null_std"],
-            sig["z_score"], sig["p_value"], sig_str,
+            sig["z_score"], sig.get("p_formatted", f"p={sig['p_value']:.4f}"),
+            sig_str,
         )
 
     if output_dir is not None:

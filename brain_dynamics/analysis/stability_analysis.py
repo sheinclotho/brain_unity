@@ -247,6 +247,7 @@ def classify_dynamics_delay(
     limit_cycle_acf_strong: float = _ADAPTIVE_LC_ACF_STRONG,
     metastable_tol: float = 0.1,
     tail_fraction: float = 0.5,
+    traj_rms: Optional[float] = None,
 ) -> str:
     """
     基于延迟距离对轨迹动力学进行分类（方法 B，改进版）。
@@ -268,6 +269,10 @@ def classify_dynamics_delay(
       → ACF 单独确认强周期振荡 → 极限环
       （覆盖相位同步场景：cv_delay 可达 0.5，但 acf 接近 1.0。）
 
+    **v3 修复（跨数据集一致性）**：
+    亚稳态判断改用相对阈值（delta_mean / traj_rms < 0.15），与方法 C 保持一致，
+    消除不同数据归一化方式对绝对阈值的影响。需传入 traj_rms 以启用。
+
     Args:
         trajectory:              shape (T, n_regions)。
         delay_dt:                延迟步数（推荐 50）。
@@ -276,8 +281,10 @@ def classify_dynamics_delay(
         limit_cycle_acf_with_cv: 与 CV 联合使用的 ACF 最低值（默认 0.20）。
                                  纯噪声的 ACF << 0.20，可有效避免高维系统的假阳性。
         limit_cycle_acf_strong:  ACF 单独确认极限环的下限（默认 0.35）。
-        metastable_tol:          Δ_mean < tol → metastable。
+        metastable_tol:          Δ_mean < tol → metastable（绝对回退阈值）。
         tail_fraction:           使用轨迹末尾的哪个比例判断（0.0–1.0）。
+        traj_rms:                轨迹 RMS（来自 compute_trajectory_features），用于
+                                 亚稳态相对阈值；未提供时回退到绝对阈值 metastable_tol。
 
     Returns:
         classification: "fixed_point" | "limit_cycle" | "metastable" | "unstable"
@@ -310,8 +317,14 @@ def classify_dynamics_delay(
     if acf_score > limit_cycle_acf_strong:
         return "limit_cycle"
 
-    if delta_mean < metastable_tol:
-        return "metastable"
+    # Metastable: moderate motion without clear periodicity.
+    # Use relative threshold when traj_rms is available (consistent with method C).
+    if traj_rms is not None and traj_rms > 1e-12:
+        if delta_mean / traj_rms < _ADAPTIVE_META_RATIO:
+            return "metastable"
+    else:
+        if delta_mean < metastable_tol:
+            return "metastable"
     return "unstable"
 
 
@@ -507,6 +520,7 @@ def classify_dynamics(
     period_max_lag: int = 100,
     tail_fraction: float = 0.2,
     trajectory: Optional[np.ndarray] = None,
+    traj_rms: Optional[float] = None,
 ) -> str:
     """
     根据状态变化模式对轨迹动力学进行分类。
@@ -519,6 +533,11 @@ def classify_dynamics(
         （覆盖相位同步场景：step_cv 可达 0.5，但 acf 接近 1.0。）
     (c) ACF 周期峰阈值从 0.5 降至 0.3：高维系统 ACF 峰因噪声而偏低。
 
+    **v3 修复（跨数据集一致性）**：
+    亚稳态判断改用相对阈值（mean_delta / traj_rms < 0.15），与方法 C 保持一致，
+    消除不同数据归一化方式（z-score 与 [0,1] 归一化）对绝对阈值的影响。
+    需传入 traj_rms（来自 compute_trajectory_features）以启用相对阈值。
+
     传入 trajectory（可选）可获得更精确的 ACF 评分；未传时对邻接差分序列
     计算 ACF（快速但精度稍低）。
 
@@ -528,6 +547,8 @@ def classify_dynamics(
         period_max_lag:    检测周期轨道的最大延迟（步）。
         tail_fraction:     使用轨迹末尾的哪个比例来判断（0.0–1.0）。
         trajectory:        原始轨迹 shape (T, n_regions)，用于 ACF 评分（可选）。
+        traj_rms:          轨迹 RMS（来自 compute_trajectory_features），用于
+                           亚稳态相对阈值；未提供时回退到绝对阈值 0.05。
 
     Returns:
         classification: "fixed_point" | "limit_cycle" | "metastable" | "unstable"
@@ -568,9 +589,17 @@ def classify_dynamics(
             if secondary_peaks and autocorr[secondary_peaks[0] + 5] > 0.3:
                 return "limit_cycle"
 
-    # 4. Metastable: slow drift (small but non-zero mean delta, low std)
-    if mean_delta < 0.05 and std_delta < mean_delta:
-        return "metastable"
+    # 4. Metastable: slow drift (small but non-zero mean delta, low std).
+    # Use relative threshold (delta_ratio) when traj_rms is available to ensure
+    # consistency across datasets with different amplitude normalizations.
+    if traj_rms is not None and traj_rms > 1e-12:
+        # Relative: same threshold as method C (_ADAPTIVE_META_RATIO = 0.15)
+        if mean_delta / traj_rms < _ADAPTIVE_META_RATIO and std_delta < mean_delta:
+            return "metastable"
+    else:
+        # Fallback absolute threshold (backward compatibility)
+        if mean_delta < 0.05 and std_delta < mean_delta:
+            return "metastable"
 
     # 5. Unstable / chaotic: large or growing deltas
     return "unstable"
@@ -612,16 +641,25 @@ def analyze_trajectory_stability(
     convergence_tol = float(convergence_tol)
     deltas = compute_state_deltas(trajectory)
 
+    # Compute features first (includes traj_rms) so all three methods
+    # can share the same relative normalisation baseline.
+    features = compute_trajectory_features(trajectory, delay_dt=delay_dt)
+    traj_rms = features.get("traj_rms")
+
     classification_v1 = classify_dynamics(
         deltas,
         convergence_tol=convergence_tol,
         period_max_lag=period_max_lag,
         trajectory=trajectory,  # pass for ACF-based conditions
+        traj_rms=traj_rms,      # v3: relative metastable threshold
     )
-    classification_v2 = classify_dynamics_delay(trajectory, delay_dt=delay_dt)
+    classification_v2 = classify_dynamics_delay(
+        trajectory,
+        delay_dt=delay_dt,
+        traj_rms=traj_rms,      # v3: relative metastable threshold
+    )
 
     # Method C: adaptive relative-threshold classification
-    features = compute_trajectory_features(trajectory, delay_dt=delay_dt)
     classification_v3 = classify_dynamics_adaptive(features)
 
     # Convergence step (method A): first step where delta falls below threshold
