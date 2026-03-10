@@ -174,8 +174,18 @@ def run_phase1_data(cfg: dict, simulator, output_dir: Path,
     # copy are stored; downstream phases use the (potentially normalised) copy.
     sim_cfg = cfg.get("simulator", {})
     if sim_cfg.get("normalize_amplitude", False):
-        norms = np.linalg.norm(trajectories, axis=-1, keepdims=True)
-        # Guard against zero norms (degenerate states)
+        norms = np.linalg.norm(trajectories, axis=-1, keepdims=True)  # (n_traj, T, 1)
+        # Detect and warn about degenerate zero-norm states (e.g., all-zero initialisation)
+        n_zero = int(np.sum(norms < 1e-30))
+        if n_zero > 0:
+            logger.warning(
+                "  Amplitude normalisation: %d time steps have near-zero L2 norm "
+                "(||x||₂ < 1e-30).  These states are likely degenerate (all-zero) "
+                "and will be left unchanged (divided by 1).  Investigate whether "
+                "the model produces zero-valued outputs for these initial conditions.",
+                n_zero,
+            )
+        # Replace zero norms with 1 to avoid division-by-zero; zero states stay zero
         norms = np.where(norms < 1e-30, 1.0, norms)
         trajectories_norm = trajectories / norms
         results["trajectories_raw"] = trajectories          # original

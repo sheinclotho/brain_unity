@@ -526,6 +526,10 @@ def compute_q_null_distribution(
     n_nonzero = int(np.sum(np.triu(W_sym, k=1) != 0))
     density = n_nonzero / max(n_upper, 1)
 
+    # n_swaps is only used by maslov_sneppen; initialise to 0 to satisfy
+    # static-analysis tools that flag potentially-undefined references.
+    n_swaps: int = 0
+
     if density > _DENSE_THRESHOLD:
         null_model_type = "weight_permutation"
         logger.info(
@@ -551,8 +555,14 @@ def compute_q_null_distribution(
         if null_model_type == "weight_permutation":
             W_rand = _weight_permutation_null(W_sym, rng)
         else:
-            W_rand = _degree_preserving_rewire_sym(W_sym, n_swaps, rng)  # type: ignore[arg-type]
+            # n_swaps is defined in the maslov_sneppen branch above
+            W_rand = _degree_preserving_rewire_sym(W_sym, n_swaps, rng)
 
+        # Use a different community-detection seed for each null realisation.
+        # A single fixed seed would give identical community assignments on
+        # nearly-identical rewired matrices, collapsing the null distribution.
+        # louvain_seed + i guarantees independent Louvain runs while remaining
+        # deterministic and reproducible given the same louvain_seed argument.
         louvain_result = _try_louvain(W_rand, seed=louvain_seed + i)
         if louvain_result is not None:
             _, q_rand = louvain_result
