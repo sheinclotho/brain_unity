@@ -45,6 +45,8 @@ from spectral_dynamics.c_community_structure import (
     spectral_community_detection,
     find_optimal_k,
     run_community_structure,
+    compute_q_null_distribution,
+    q_significance_test,
 )
 from spectral_dynamics.d_hierarchical_structure import (
     _weight_to_distance,
@@ -696,6 +698,45 @@ class TestCommunityStructure(unittest.TestCase):
     def test_q_interpretation_values(self):
         result = run_community_structure(self.W, k_range=[2, 3])
         self.assertIn(result["q_interpretation"], ("strong", "moderate", "weak"))
+
+    def test_q_significance_test_high_q(self):
+        """Clearly significant Q should have z_score > 1.96."""
+        null_qs = [0.1, 0.12, 0.11, 0.13, 0.09, 0.10, 0.11, 0.12, 0.10, 0.11]
+        result = q_significance_test(0.5, null_qs)
+        self.assertIn("z_score", result)
+        self.assertIn("p_value", result)
+        self.assertIn("significant", result)
+        self.assertIn("n_null", result)
+        self.assertTrue(result["significant"])
+        self.assertGreater(result["z_score"], 1.96)
+        self.assertEqual(result["n_null"], 10)
+
+    def test_q_significance_test_low_q(self):
+        """Q equal to null mean should not be significant."""
+        null_qs = [0.17, 0.18, 0.16, 0.17, 0.18]
+        result = q_significance_test(0.17, null_qs)
+        self.assertFalse(result["significant"])
+
+    def test_q_null_distribution_length(self):
+        """compute_q_null_distribution should return n_null values."""
+        null_qs = compute_q_null_distribution(self.W, n_null=5, seed=0)
+        self.assertEqual(len(null_qs), 5)
+        for q in null_qs:
+            self.assertTrue(np.isfinite(q), f"Non-finite Q in null: {q}")
+
+    def test_run_community_structure_with_significance(self):
+        """run_community_structure should include q_significance when n_null > 0."""
+        result = run_community_structure(self.W, k_range=[2, 3], n_null=10, seed=42)
+        self.assertIn("q_significance", result)
+        sig = result["q_significance"]
+        for key in ("null_mean", "null_std", "z_score", "p_value", "significant", "n_null"):
+            self.assertIn(key, sig)
+        self.assertEqual(sig["n_null"], 10)
+
+    def test_run_community_structure_no_significance_when_n_null_zero(self):
+        """n_null=0 should not add q_significance to result."""
+        result = run_community_structure(self.W, k_range=[2, 3], n_null=0)
+        self.assertNotIn("q_significance", result)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
