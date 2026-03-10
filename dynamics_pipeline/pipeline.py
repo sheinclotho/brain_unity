@@ -1282,14 +1282,31 @@ def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
 
 
 def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
-                         output_dir: Path) -> None:
-    """Phase 6: Synthesis — consistency checks & hypothesis evaluation."""
+                         output_dir: Path,
+                         modality: Optional[str] = None) -> None:
+    """Phase 6: Synthesis — consistency checks & hypothesis evaluation.
+
+    Args:
+        cfg:        Merged pipeline configuration.
+        results:    Accumulated analysis results from phases 1–5.
+        output_dir: Directory where ``pipeline_report.json`` and
+                    ``analysis_report.md`` are written.
+        modality:   The modality actually being analysed (``"fmri"``,
+                    ``"eeg"``, or ``"joint"``).  When provided, this value
+                    is used in the report metadata instead of
+                    ``cfg["simulator"]["modality"]`` (which is ``"both"``
+                    in ``--modality both`` runs, not the per-modality string).
+    """
     _step(6, "Synthesis & Report")
 
     # ── P2-1: Run metadata ────────────────────────────────────────────────────
     import hashlib
     dg = cfg.get("data_generation", {})
     sim_cfg = cfg.get("simulator", {})
+    # Prefer the caller-supplied modality (correct when running --modality both,
+    # where cfg["simulator"]["modality"] == "both" but each sub-run is "fmri"
+    # or "eeg").  Fall back to cfg value for single-modality / joint runs.
+    actual_modality = modality or sim_cfg.get("modality", "fmri")
     try:
         cfg_hash = hashlib.sha256(
             json.dumps(cfg, sort_keys=True, default=str).encode()
@@ -1303,7 +1320,7 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
             "seed": dg.get("seed", 42),
             "n_init": dg.get("n_init"),
             "steps": dg.get("steps"),
-            "modality": sim_cfg.get("modality", "fmri"),
+            "modality": actual_modality,
             "cfg_hash": cfg_hash,
             "output_dir": str(output_dir),
         },
@@ -2360,12 +2377,151 @@ def _run_phases_for_modality(
     run_phase3_dynamics(cfg, results, simulator, output_dir, modality=modality)
     run_phase4_validation(cfg, results, output_dir)
     run_phase5_advanced(cfg, results, simulator, output_dir, modality=modality)
-    run_phase6_synthesis(cfg, results, output_dir)
+    run_phase6_synthesis(cfg, results, output_dir, modality=modality)
 
     if cfg["output"].get("save_plots"):
         _save_summary_plots(results, output_dir, simulator)
 
     return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Both-mode summary helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _write_both_mode_summary(
+    output_dir: Path,
+    modalities: List[str],
+    all_results: Dict[str, Any],
+    elapsed: float,
+) -> None:
+    """Write a root-level summary for ``--modality both`` runs.
+
+    Creates two files in *output_dir*:
+
+    * ``both_mode_summary.json`` — machine-readable index with per-modality
+      paths and key metrics.
+    * ``analysis_report.md`` — human/AI-readable overview that links to each
+      modality's ``analysis_report.md`` and shows a side-by-side comparison
+      of the most important dynamics metrics.
+
+    This prevents confusion when users run ``--modality both`` into the same
+    directory as a previous ``joint`` or single-modality run: they now find
+    a clear index rather than stale per-modality reports.
+    """
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── JSON index ────────────────────────────────────────────────────────────
+    summary: Dict[str, Any] = {
+        "mode": "both",
+        "run_timestamp": ts,
+        "elapsed_seconds": round(elapsed, 1),
+        "modalities_run": modalities,
+        "results_directories": {
+            mod: str(output_dir / mod) for mod in modalities
+        },
+        "per_modality_metrics": {},
+    }
+
+    _KEY_METRICS = [
+        ("lyapunov", "mean_lyapunov"),
+        ("lyapunov", "chaos_regime"),
+        ("convergence", "distance_ratio"),
+        ("convergence", "convergence_label"),
+        ("dmd_spectrum", "spectral_radius"),
+        ("stability", "fraction_converged"),
+        ("stability", "fraction_limit_cycle"),
+        ("stability", "fraction_unstable"),
+    ]
+    for mod in modalities:
+        r = all_results.get(mod, {})
+        if "error" in r:
+            summary["per_modality_metrics"][mod] = {"error": r["error"]}
+            continue
+        m: Dict[str, Any] = {}
+        for section, key in _KEY_METRICS:
+            v = r.get(section)
+            if isinstance(v, dict):
+                raw = v.get(key)
+                if isinstance(raw, dict):
+                    raw = raw.get("regime", raw)  # chaos_regime → string
+                m[f"{section}.{key}"] = raw
+        summary["per_modality_metrics"][mod] = m
+
+    try:
+        with open(output_dir / "both_mode_summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+    except Exception as exc:
+        logger.warning("both-mode summary JSON write failed: %s", exc)
+
+    # ── Markdown overview ─────────────────────────────────────────────────────
+    lines: List[str] = []
+    lines.append("# Brain Dynamics Analysis — Both-Modality Mode\n")
+    lines.append(f"**Generated**: {ts}  ")
+    lines.append(f"**Total runtime**: {elapsed:.1f} s  ")
+    lines.append(f"**Modalities analysed**: {', '.join(modalities)}  \n")
+    lines.append(
+        "> **Note**: Each modality was run independently through the full "
+        "6-phase pipeline. Per-modality detailed reports are in the "
+        "sub-directories listed below. This file provides a comparative "
+        "overview only.\n"
+    )
+
+    lines.append("## Per-Modality Report Locations\n")
+    for mod in modalities:
+        rel = f"{mod}/analysis_report.md"
+        lines.append(f"- **{mod.upper()}**: `{output_dir / mod}/analysis_report.md`")
+    lines.append("")
+
+    lines.append("## Side-by-Side Key Metrics\n")
+    lines.append("| Metric | " + " | ".join(m.upper() for m in modalities) + " |")
+    lines.append("|--------|" + "|".join("-----" for _ in modalities) + "|")
+
+    _DISPLAY = [
+        ("LLE (Rosenstein λ₁)",   "lyapunov.mean_lyapunov"),
+        ("Chaos regime",           "lyapunov.chaos_regime"),
+        ("Convergence ratio",      "convergence.distance_ratio"),
+        ("Convergence label",      "convergence.convergence_label"),
+        ("DMD spectral radius ρ",  "dmd_spectrum.spectral_radius"),
+        ("Frac. converged",        "stability.fraction_converged"),
+        ("Frac. limit-cycle",      "stability.fraction_limit_cycle"),
+        ("Frac. unstable",         "stability.fraction_unstable"),
+    ]
+    for label, key in _DISPLAY:
+        vals = []
+        for mod in modalities:
+            v = summary["per_modality_metrics"].get(mod, {}).get(key)
+            if v is None:
+                vals.append("N/A")
+            elif isinstance(v, float):
+                vals.append(f"{v:.4f}")
+            else:
+                vals.append(str(v))
+        lines.append(f"| {label} | " + " | ".join(vals) + " |")
+
+    lines.append("\n## Interpretation Guide\n")
+    lines.append(
+        "When comparing modalities, expect **fMRI** and **EEG** to show "
+        "different dynamics: fMRI captures slow hemodynamic signals (TR ≈ 2 s) "
+        "and often exhibits convergence toward a limit-cycle attractor. EEG "
+        "captures fast electrical activity and may show higher Lyapunov exponents "
+        "and lower convergence. **This is normal and expected — not a bug.** "
+        "The `--modality both` flag is designed precisely to reveal these "
+        "differences.\n"
+    )
+    lines.append(
+        "> For joint analysis of fMRI + EEG in a single state vector, use "
+        "`--modality joint`.  Note that joint mode results can be scale-sensitive "
+        "(see `pipeline_report.json → metadata → modality` in each sub-directory)."
+    )
+
+    md_text = "\n".join(lines)
+    try:
+        with open(output_dir / "analysis_report.md", "w", encoding="utf-8") as f:
+            f.write(md_text)
+        logger.info("  both-mode summary: %s", output_dir / "analysis_report.md")
+    except Exception as exc:
+        logger.warning("both-mode summary Markdown write failed: %s", exc)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2550,6 +2706,10 @@ def run_pipeline(cfg: dict) -> Dict[str, Any]:
         "✓ Both-modality pipeline complete in %.1f s. Results in: %s/{%s}",
         elapsed, output_dir.resolve(), ",".join(modalities_to_run),
     )
+
+    # ── Write a root-level summary so users always find the right files ────────
+    _write_both_mode_summary(output_dir, modalities_to_run, all_results, elapsed)
+
     return all_results
 
 

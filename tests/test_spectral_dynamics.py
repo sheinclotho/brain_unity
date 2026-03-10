@@ -1029,3 +1029,121 @@ class TestRunAllNewExperiments(unittest.TestCase):
             self.assertIn("E_mean", hyp["H5_energy_constraint_criticality"])
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pipeline: both-mode summary + phase6 modality metadata
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBothModeSummary(unittest.TestCase):
+    """Tests for _write_both_mode_summary and run_phase6_synthesis modality fix."""
+
+    def _make_results(self, lle: float = -0.05, regime: str = "stable") -> dict:
+        """Minimal per-modality results for summary generation."""
+        return {
+            "trajectories": np.zeros((5, 50, 10), dtype=np.float32),
+            "lyapunov": {
+                "mean_lyapunov": lle,
+                "chaos_regime": {"regime": regime},
+            },
+            "convergence": {
+                "distance_ratio": 0.3,
+                "convergence_label": "converging",
+            },
+            "dmd_spectrum": {"spectral_radius": 0.85},
+            "stability": {
+                "fraction_converged": 0.7,
+                "fraction_limit_cycle": 0.1,
+                "fraction_unstable": 0.2,
+            },
+        }
+
+    def test_write_both_mode_summary_creates_files(self):
+        """_write_both_mode_summary creates analysis_report.md and both_mode_summary.json."""
+        from dynamics_pipeline.pipeline import _write_both_mode_summary
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir)
+            all_results = {
+                "fmri": self._make_results(-0.02, "stable"),
+                "eeg": self._make_results(0.01, "weakly_chaotic"),
+            }
+            _write_both_mode_summary(out, ["fmri", "eeg"], all_results, elapsed=12.3)
+            self.assertTrue((out / "both_mode_summary.json").exists())
+            self.assertTrue((out / "analysis_report.md").exists())
+
+    def test_both_mode_summary_json_structure(self):
+        """both_mode_summary.json has expected keys and per-modality metrics."""
+        from dynamics_pipeline.pipeline import _write_both_mode_summary
+        import json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir)
+            all_results = {
+                "fmri": self._make_results(-0.02, "stable"),
+                "eeg": self._make_results(0.01, "weakly_chaotic"),
+            }
+            _write_both_mode_summary(out, ["fmri", "eeg"], all_results, elapsed=8.5)
+            with open(out / "both_mode_summary.json") as f:
+                j = json.load(f)
+            self.assertEqual(j["mode"], "both")
+            self.assertIn("fmri", j["per_modality_metrics"])
+            self.assertIn("eeg", j["per_modality_metrics"])
+            fmri_m = j["per_modality_metrics"]["fmri"]
+            self.assertIn("lyapunov.mean_lyapunov", fmri_m)
+
+    def test_both_mode_summary_markdown_contains_table(self):
+        """analysis_report.md contains the side-by-side comparison table."""
+        from dynamics_pipeline.pipeline import _write_both_mode_summary
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir)
+            _write_both_mode_summary(
+                out, ["fmri", "eeg"],
+                {"fmri": self._make_results(), "eeg": self._make_results()},
+                elapsed=5.0,
+            )
+            text = (out / "analysis_report.md").read_text()
+            self.assertIn("Side-by-Side", text)
+            self.assertIn("FMRI", text.upper())
+            self.assertIn("EEG", text.upper())
+
+    def test_both_mode_summary_with_error_modality(self):
+        """Error modality is included in the JSON without crashing."""
+        from dynamics_pipeline.pipeline import _write_both_mode_summary
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir)
+            _write_both_mode_summary(
+                out, ["fmri", "eeg"],
+                {"fmri": self._make_results(), "eeg": {"error": "EEG failed"}},
+                elapsed=3.0,
+            )
+            import json
+            with open(out / "both_mode_summary.json") as f:
+                j = json.load(f)
+            self.assertIn("error", j["per_modality_metrics"]["eeg"])
+
+    def test_phase6_synthesis_modality_param_overrides_cfg(self):
+        """run_phase6_synthesis should write modality from parameter, not cfg."""
+        import json as _json
+        from dynamics_pipeline.pipeline import run_phase6_synthesis
+
+        cfg = {
+            "data_generation": {"seed": 42, "n_init": 5, "steps": 50},
+            "simulator": {"modality": "both"},   # ← both, NOT fmri
+            "output": {"save_plots": False},
+        }
+        results = {
+            "trajectories": np.zeros((5, 50, 10), dtype=np.float32),
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir)
+            # Pass modality="fmri" explicitly (as _run_phases_for_modality does)
+            run_phase6_synthesis(cfg, results, out, modality="fmri")
+            report_path = out / "pipeline_report.json"
+            self.assertTrue(report_path.exists())
+            report = _json.loads(report_path.read_text())
+            # The report should say "fmri", NOT "both"
+            self.assertEqual(report["metadata"]["modality"], "fmri")
+
+

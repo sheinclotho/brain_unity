@@ -413,10 +413,14 @@ def _degree_preserving_rewire_sym(
         # Swap weights
         wij = W_out[i, j]
         wkl = W_out[k, l]
-        W_out[i, j] = 0.0;  W_out[j, i] = 0.0
-        W_out[k, l] = 0.0;  W_out[l, k] = 0.0
-        W_out[i, l] = wij;  W_out[l, i] = wij
-        W_out[k, j] = wkl;  W_out[j, k] = wkl
+        W_out[i, j] = 0.0
+        W_out[j, i] = 0.0
+        W_out[k, l] = 0.0
+        W_out[l, k] = 0.0
+        W_out[i, l] = wij
+        W_out[l, i] = wij
+        W_out[k, j] = wkl
+        W_out[j, k] = wkl
         rows[idx[0]], cols[idx[0]] = i, l
         rows[idx[1]], cols[idx[1]] = k, j
 
