@@ -44,6 +44,53 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared trajectory-metric helpers (imported by node_ablation,
+# input_dimension_control, and this module)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def avg_rosenstein_lle(
+    trajs: np.ndarray,
+    max_lag: int = 50,
+    min_temporal_sep: int = 20,
+) -> float:
+    """Estimate LLE by averaging Rosenstein estimates across all trajectories.
+
+    Calls ``rosenstein_lyapunov`` directly (no simulator required) on each
+    trajectory (shape T × N) and returns the mean of finite values.
+
+    Args:
+        trajs:             shape (n_traj, T, N).
+        max_lag:           Rosenstein maximum tracking lag.
+        min_temporal_sep:  Minimum temporal separation for nearest-neighbour.
+
+    Returns:
+        Mean LLE (float); NaN when no finite estimate could be obtained.
+    """
+    try:
+        from analysis.lyapunov import rosenstein_lyapunov
+        vals = []
+        for traj in trajs:   # traj: (T, N)
+            lle, _ = rosenstein_lyapunov(
+                traj.astype(np.float64),
+                max_lag=max_lag,
+                min_temporal_sep=min_temporal_sep,
+            )
+            if np.isfinite(lle):
+                vals.append(lle)
+        if not vals:
+            logger.warning(
+                "avg_rosenstein_lle: all %d trajectories returned NaN. "
+                "Check that T >> max_lag (%d) and N is reasonable.",
+                len(trajs), max_lag,
+            )
+            return float("nan")
+        return float(np.mean(vals))
+    except Exception as exc:
+        logger.debug("avg_rosenstein_lle failed: %s", exc)
+        return float("nan")
+
+
 def _degree_preserving_rewire(
     W: np.ndarray,
     n_swaps: int,
@@ -73,9 +120,8 @@ def _degree_preserving_rewire(
         return W_out
 
     for _ in range(n_swaps):
-        idx = rng.integers(0, n_edges, size=2)
-        if idx[0] == idx[1]:
-            continue
+        # Use replace=False to guarantee two distinct indices in one call
+        idx = rng.choice(n_edges, size=2, replace=False)
         i, j = int(rows[idx[0]]), int(cols[idx[0]])
         k, l = int(rows[idx[1]]), int(cols[idx[1]])
         if i == l or k == j:

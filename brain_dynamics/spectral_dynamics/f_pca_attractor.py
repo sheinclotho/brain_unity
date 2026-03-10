@@ -140,14 +140,35 @@ def _build_delay_portrait(
 
     T_embed = T_eff - (m - 1) * tau
     if T_embed < 4:
-        # Fallback: reduce m or tau
+        # Fallback stage 1: halve τ
         tau = max(1, tau // 2)
         T_embed = T_eff - (m - 1) * tau
-        if T_embed < 4:
-            m = 3
-            tau = 1
-            T_embed = T_eff - (m - 1) * tau
+    if T_embed < 4:
+        # Fallback stage 2: minimum-possible embedding (m=2, τ=1 for m-param,
+        # overriding any caller-supplied m > 2 with a warning).
+        if m != 3:
+            logger.warning(
+                "_build_delay_portrait: reducing m from %d to 3 (τ=1) "
+                "because T_eff=%d is too short for the requested embedding.",
+                m, T_eff,
+            )
+        m = 3
+        tau = 1
+        T_embed = T_eff - (m - 1) * tau
+    if T_embed < 4:
+        # Trajectories are too short even for the minimal embedding;
+        # return an empty array so callers can skip plotting gracefully.
+        logger.warning(
+            "_build_delay_portrait: T_eff=%d too short for delay embedding "
+            "(need T_eff >= 4 + 2*tau); returning empty array.",
+            T_eff,
+        )
+        return np.empty((0, m), dtype=np.float64), tau, 0
 
+    # Build delay portrait.
+    # Each slice obs[j*tau : j*tau + T_embed] has exactly T_embed elements
+    # by construction: for j in [0, m-1], end = j*tau + T_embed
+    # ≤ (m-1)*tau + T_embed = T_eff (by definition of T_embed). ✓
     rows = []
     for i in range(n_traj):
         obs = obs_all[i].astype(np.float64)
@@ -529,24 +550,31 @@ def run_pca_attractor(
         )
         result["delay_embed_tau"] = int(tau_used)
         result["delay_embed_T"] = int(T_embed)
-        _try_plot_delay_portrait(
-            X_delay, n_traj=n_traj, steps_per_traj=T_embed, tau=tau_used,
-            output_path=out / "phase_portrait_delay_embed.png",
-        )
+        if T_embed > 0:
+            _try_plot_delay_portrait(
+                X_delay, n_traj=n_traj, steps_per_traj=T_embed, tau=tau_used,
+                output_path=out / "phase_portrait_delay_embed.png",
+            )
 
-        # ── New Test 3: Poincaré Section (delay-embedding coordinates) ───────
-        # Use delay-embedding coordinates instead of PC coordinates so the
-        # section reflects the true attractor geometry (not a linear shadow).
-        poincare = compute_poincare_section(X_delay, n_traj, T_embed)
-        result["poincare_n_crossings"] = poincare["n_crossings"]
-        result["poincare_interpretation"] = poincare["interpretation"]
-        np.save(out / "poincare_points.npy", poincare["points"])
-        _try_plot_poincare_section(
-            poincare,
-            output_path=out / "poincare_section.png",
-            coord_labels=("y(t+tau)", "y(t+2*tau)"),
-            section_label="y(t)=0, y(t+tau)>0",
-        )
+            # ── New Test 3: Poincaré Section (delay-embedding coordinates) ────
+            # Use delay-embedding coordinates instead of PC coordinates so the
+            # section reflects the true attractor geometry (not a linear shadow).
+            poincare = compute_poincare_section(X_delay, n_traj, T_embed)
+            result["poincare_n_crossings"] = poincare["n_crossings"]
+            result["poincare_interpretation"] = poincare["interpretation"]
+            np.save(out / "poincare_points.npy", poincare["points"])
+            _try_plot_poincare_section(
+                poincare,
+                output_path=out / "poincare_section.png",
+                coord_labels=("y(t+tau)", "y(t+2*tau)"),
+                section_label="y(t)=0, y(t+tau)>0",
+            )
+        else:
+            result["poincare_n_crossings"] = 0
+            result["poincare_interpretation"] = "trajectory_too_short"
+            # Save empty array so downstream code that expects the file always
+            # finds it regardless of whether delay embedding was possible.
+            np.save(out / "poincare_points.npy", np.empty((0, 2), dtype=np.float32))
 
     return result
 

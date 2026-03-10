@@ -99,16 +99,18 @@ def _compute_d2(trajs: np.ndarray) -> float:
     """Estimate correlation dimension D2.
 
     Passes the first trajectory as a 2-D array (T × N) to
-    ``correlation_dimension``, which requires a 2-D input.  The old code
-    incorrectly flattened to 1-D and used unsupported keyword arguments.
+    ``correlation_dimension``, which requires a 2-D input.
     """
     try:
         from analysis.embedding_dimension import correlation_dimension
         traj = trajs[0].astype(np.float64)   # (T, N)
         result = correlation_dimension(traj, max_points=2000)
         return float(result["D2"])
-    except Exception as exc:
+    except (ImportError, KeyError, ValueError) as exc:
         logger.debug("D2 failed: %s", exc)
+        return float("nan")
+    except Exception as exc:
+        logger.debug("D2 unexpected error: %s", exc)
         return float("nan")
 
 
@@ -124,29 +126,12 @@ def _compute_pca_dim(trajs: np.ndarray, var_threshold: float = 0.90) -> int:
 
 
 def _compute_lle(trajs: np.ndarray) -> float:
-    """Estimate LLE using Rosenstein method averaged over all trajectories.
-
-    Calls ``rosenstein_lyapunov`` directly (no simulator required) instead of
-    the old ``run_lyapunov_analysis`` call that failed because it requires a
-    simulator and used wrong keyword argument names.
-    """
-    try:
-        from analysis.lyapunov import rosenstein_lyapunov
-        vals = []
-        for traj in trajs:               # traj: (T, N)
-            lle, _ = rosenstein_lyapunov(
-                traj.astype(np.float64),
-                max_lag=50,
-                min_temporal_sep=20,
-            )
-            if np.isfinite(lle):
-                vals.append(lle)
-        return float(np.mean(vals)) if vals else float("nan")
-    except Exception as exc:
-        logger.debug("LLE failed: %s", exc)
-        return float("nan")
-
-
+    """Estimate LLE using shared Rosenstein helper from random_comparison."""
+    from analysis.random_comparison import avg_rosenstein_lle
+    lle = avg_rosenstein_lle(trajs)
+    if np.isnan(lle):
+        logger.debug("LLE returned NaN for this condition.")
+    return lle
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------

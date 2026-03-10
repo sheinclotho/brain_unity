@@ -65,40 +65,24 @@ _STD_GUARD = 1e-8
 # ---------------------------------------------------------------------------
 
 def _lle(trajs: np.ndarray) -> float:
-    """Estimate LLE by averaging Rosenstein estimates across all trajectories.
-
-    Calls ``rosenstein_lyapunov`` directly (no simulator required) on each
-    individual trajectory (shape T × N) and returns the mean, skipping NaN.
-    """
-    try:
-        from analysis.lyapunov import rosenstein_lyapunov
-        vals = []
-        for traj in trajs:               # traj: (T, N)
-            lle, _ = rosenstein_lyapunov(
-                traj.astype(np.float64),
-                max_lag=50,
-                min_temporal_sep=20,
-            )
-            if np.isfinite(lle):
-                vals.append(lle)
-        return float(np.mean(vals)) if vals else float("nan")
-    except Exception:
-        return float("nan")
+    """Estimate LLE using Rosenstein method averaged over all trajectories."""
+    from analysis.random_comparison import avg_rosenstein_lle
+    return avg_rosenstein_lle(trajs)
 
 
 def _d2(trajs: np.ndarray) -> float:
-    """Estimate correlation dimension D2 on a single representative trajectory.
+    """Estimate correlation dimension D2 on the first trajectory (T × N).
 
-    Uses the first trajectory (shape T × N) so that ``correlation_dimension``
-    receives the expected 2-D array.  The old code incorrectly flattened the
-    array to 1-D and passed unsupported keyword arguments.
+    Uses the first trajectory as a 2-D array so ``correlation_dimension``
+    receives its expected 2-D input.
     """
     try:
         from analysis.embedding_dimension import correlation_dimension
         traj = trajs[0].astype(np.float64)   # (T, N)
         result = correlation_dimension(traj, max_points=1000)
         return float(result["D2"])
-    except Exception:
+    except Exception as exc:
+        logger.debug("_d2 failed: %s", exc)
         return float("nan")
 
 
