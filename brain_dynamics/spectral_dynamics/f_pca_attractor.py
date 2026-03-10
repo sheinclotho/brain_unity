@@ -328,7 +328,17 @@ def _try_plot_attractor_2d(
     label: str,
     max_traj_show: int = 8,
 ) -> None:
-    """F2 2D: PC1 vs PC2 吸引子投影，颜色编码时间。"""
+    """F2 2D: PC1 vs PC2 attractor projection.
+
+    Two-panel layout:
+      Left  — density heatmap (hexbin) of all trajectory points: reveals where
+              the trajectory *spends its time* (attractor invariant measure).
+      Right — sparse trajectory overlay (subsampled): reveals *how* the
+              trajectory moves through the attractor.
+
+    Replaces the old per-segment T-1 loop which produced visually noisy,
+    uninterpretable plots when T was large.
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -340,9 +350,31 @@ def _try_plot_attractor_2d(
 
     n_show = min(max_traj_show, n_traj)
     T = steps_per_traj
+    # Subsampling stride: target ~100 visible points per trajectory.
+    stride = max(1, T // 100)
 
-    fig, ax = plt.subplots(figsize=(7, 6))
-    cmap = plt.cm.coolwarm
+    # Collect all points for the density panel (exactly n_show trajectories)
+    all_pts = X_pca[:n_show * T, :2]
+
+    fig, (ax_dens, ax_traj) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # ── Left panel: density heatmap ──────────────────────────────────────────
+    hb = ax_dens.hexbin(
+        all_pts[:, 0], all_pts[:, 1],
+        gridsize=40, cmap="YlOrRd", mincnt=1,
+    )
+    plt.colorbar(hb, ax=ax_dens, label="Visit count")
+    ax_dens.set_xlabel("PC1")
+    ax_dens.set_ylabel("PC2")
+    ax_dens.set_title(
+        f"Attractor Density (PC1-PC2, {n_show} traj)\n"
+        f"Bright = trajectory spends more time here  [{label}]"
+    )
+    ax_dens.set_aspect("equal", adjustable="datalim")
+
+    # ── Right panel: sparse trajectory overlay ───────────────────────────────
+    traj_colors = plt.cm.tab10(np.linspace(0, 1, n_show))
+    cmap_time = plt.cm.viridis
 
     for i in range(n_show):
         start = i * T
@@ -350,27 +382,39 @@ def _try_plot_attractor_2d(
         if end > X_pca.shape[0]:
             break
         traj_pca = X_pca[start:end, :2]
-        colors = cmap(np.linspace(0.1, 0.9, T))
-        # Draw trajectory with color gradient
-        for t in range(T - 1):
-            ax.plot(traj_pca[t:t+2, 0], traj_pca[t:t+2, 1],
-                    color=colors[t], lw=0.8, alpha=0.7)
-        # Mark start and end
-        ax.scatter(traj_pca[0, 0], traj_pca[0, 1], color="blue", s=30, zorder=5,
-                   marker="o", alpha=0.8)
-        ax.scatter(traj_pca[-1, 0], traj_pca[-1, 1], color="red", s=30, zorder=5,
-                   marker="x", alpha=0.8)
 
-    # Colorbar for time
-    sm = plt.cm.ScalarMappable(cmap=cmap,
-                                norm=plt.Normalize(vmin=0, vmax=T))
+        # Sub-sample: indices at regular stride
+        idx = np.arange(0, T, stride)
+        sub = traj_pca[idx]
+        sub_t = idx / float(T - 1 if T > 1 else 1)  # normalised time in [0,1]
+
+        # Thin connecting line (single colour per trajectory)
+        ax_traj.plot(sub[:, 0], sub[:, 1], "-",
+                     color=traj_colors[i], lw=0.8, alpha=0.45, zorder=2)
+        # Scattered dots coloured by time within the trajectory
+        sc = ax_traj.scatter(sub[:, 0], sub[:, 1],
+                             c=sub_t, cmap=cmap_time,
+                             s=6, alpha=0.8, zorder=3, linewidths=0)
+        # Start / end markers
+        ax_traj.scatter(traj_pca[0, 0], traj_pca[0, 1],
+                        color=traj_colors[i], s=50, marker="o",
+                        edgecolors="k", linewidths=0.5, zorder=5)
+        ax_traj.scatter(traj_pca[-1, 0], traj_pca[-1, 1],
+                        color=traj_colors[i], s=50, marker="X",
+                        edgecolors="k", linewidths=0.5, zorder=5)
+
+    # Single shared time colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap_time, norm=plt.Normalize(0, T))
     sm.set_array([])
-    plt.colorbar(sm, ax=ax, label="Time Step")
+    plt.colorbar(sm, ax=ax_traj, label="Time step")
+    ax_traj.set_xlabel("PC1")
+    ax_traj.set_ylabel("PC2")
+    ax_traj.set_title(
+        f"Attractor Trajectories (PC1-PC2, {n_show} traj)\n"
+        f"Circle=start, X=end, colour=time  [{label}]"
+    )
+    ax_traj.set_aspect("equal", adjustable="datalim")
 
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
-    ax.set_title(f"Attractor Projection (PC1 vs PC2, {n_show} traj)\n"
-                 f"Blue=start, Red x=end, color=time  [{label}]")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -385,7 +429,13 @@ def _try_plot_attractor_3d(
     label: str,
     max_traj_show: int = 5,
 ) -> None:
-    """F2 3D: PC1-PC2-PC3 吸引子投影。"""
+    """F2 3D: PC1-PC2-PC3 attractor projection.
+
+    Each trajectory is plotted as a subsampled scatter (dots coloured by time)
+    connected by a thin per-trajectory line.  This is dramatically cleaner
+    than the old approach of drawing T-1 individual coloured line segments,
+    which produced visually noisy / jagged plots for long trajectories.
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -402,7 +452,12 @@ def _try_plot_attractor_3d(
 
     n_show = min(max_traj_show, n_traj)
     T = steps_per_traj
-    cmap = plt.cm.coolwarm
+    # Subsampling: target ~80 visible points per trajectory to keep the
+    # 3-D plot legible without losing temporal structure.
+    stride = max(1, T // 80)
+
+    traj_colors = plt.cm.tab10(np.linspace(0, 1, max(n_show, 1)))
+    cmap_time = plt.cm.viridis
 
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection="3d")
@@ -413,21 +468,37 @@ def _try_plot_attractor_3d(
         if end > X_pca.shape[0]:
             break
         traj_pca = X_pca[start:end, :3]
-        colors = cmap(np.linspace(0.1, 0.9, T))
-        for t in range(T - 1):
-            ax.plot(
-                traj_pca[t:t+2, 0], traj_pca[t:t+2, 1], traj_pca[t:t+2, 2],
-                color=colors[t], lw=0.8, alpha=0.6,
-            )
-        ax.scatter(traj_pca[0, 0], traj_pca[0, 1], traj_pca[0, 2],
-                   color="blue", s=25, zorder=5)
-        ax.scatter(traj_pca[-1, 0], traj_pca[-1, 1], traj_pca[-1, 2],
-                   color="red", s=25, marker="x", zorder=5)
+
+        # Sub-sample indices
+        idx = np.arange(0, T, stride)
+        sub = traj_pca[idx]
+        sub_t = idx / float(T - 1 if T > 1 else 1)  # [0,1] normalised time
+
+        # Thin background line (single per-trajectory colour, low alpha)
+        ax.plot(sub[:, 0], sub[:, 1], sub[:, 2],
+                "-", color=traj_colors[i], lw=0.7, alpha=0.30, zorder=2)
+        # Scatter dots coloured by time
+        ax.scatter(sub[:, 0], sub[:, 1], sub[:, 2],
+                   c=sub_t, cmap=cmap_time, s=8, alpha=0.75, zorder=3,
+                   linewidths=0)
+        # Start / end markers
+        ax.scatter(*traj_pca[0], color=traj_colors[i], s=40, marker="o",
+                   depthshade=False, edgecolors="k", linewidths=0.5, zorder=5)
+        ax.scatter(*traj_pca[-1], color=traj_colors[i], s=40, marker="X",
+                   depthshade=False, edgecolors="k", linewidths=0.5, zorder=5)
 
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
     ax.set_zlabel("PC3")
-    ax.set_title(f"Attractor 3D Projection (PC1-PC3, {n_show} traj)  [{label}]")
+    ax.set_title(
+        f"Attractor 3D Projection (PC1-PC3, {n_show} traj)  [{label}]\n"
+        f"Circle=start, X=end, colour=time (dark→early, bright→late)"
+    )
+    # Shared time colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap_time, norm=plt.Normalize(0, T))
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax, shrink=0.5, pad=0.1, label="Time step")
+
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)

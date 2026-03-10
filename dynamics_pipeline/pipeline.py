@@ -823,6 +823,52 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
         except Exception as e:
             logger.warning("  Basin test failed: %s", e)
 
+    # 3l: Attractor Topology Analysis — multi-evidence hypothesis testing
+    # Zero extra model calls; reuses Phase-1 trajectories.
+    # Produces: freq_spectrum_pcs.png, velocity_field_pca.png,
+    #           recurrence_plot.png, hypothesis_scorecard.png,
+    #           attractor_topology_report.json
+    at_cfg = dyn_cfg.get("attractor_topology", {})
+    if at_cfg.get("enabled", True):
+        try:
+            from analysis.attractor_topology import run_attractor_topology
+            # Require 3-D trajectory array (n_traj, T, N)
+            if trajs.ndim != 3:
+                logger.warning(
+                    "  Attractor topology skipped: trajectories must be 3-D "
+                    "(n_traj, T, N), got shape %s", trajs.shape
+                )
+            else:
+                # Pass pre-computed Rosenstein LLE and PCA n@90% if available
+                _lle = results.get("lyapunov", {}).get("mean_lyapunov")
+                _n90 = results.get("pca", {}).get("n_components_90pct")
+                _burnin_at = _pca_burnin(trajs.shape[1])
+                at = run_attractor_topology(
+                    trajectories=trajs,
+                    output_dir=dyn_dir / "attractor_topology",
+                    burnin=_burnin_at,
+                    dt=at_cfg.get("dt", 1.0),
+                    n_pcs=at_cfg.get("n_pcs", 6),
+                    rosenstein_lle=_lle,
+                    n_pca_90=_n90,
+                    seed=cfg["data_generation"].get("seed", 42),
+                    rqa_max_T=at_cfg.get("rqa_max_T", 500),
+                )
+                if "error" not in at:
+                    results["attractor_topology"] = at
+                    logger.info(
+                        "  Attractor topology: top=%s (%s confidence), "
+                        "freq=%s, DET=%.3f, local_dim=%.2f",
+                        at.get("top_hypothesis_name", "?"),
+                        at.get("confidence", "?"),
+                        at.get("spectral", {}).get("freq_classification", "?"),
+                        at.get("recurrence", {}).get("DET", float("nan")),
+                        at.get("local_dimensionality", {}).get("local_dim_mean",
+                                                               float("nan")),
+                    )
+        except Exception as e:
+            logger.warning("  Attractor topology analysis failed: %s", e)
+
 
 def run_phase4_validation(cfg: dict, results: Dict[str, Any],
                           output_dir: Path) -> None:
@@ -1911,6 +1957,39 @@ def _generate_ai_report(
 
     # ── Phase 4: Statistical Validation ──────────────────────────────────────
     _h(2, "Phase 4 — Statistical Validation")
+
+    # 3l Attractor Topology (inserted here for readability — logically Phase 3)
+    at_res = results.get("attractor_topology", {})
+    if at_res:
+        _h(3, "3l Attractor Topology Analysis (multi-evidence)")
+        top_h = at_res.get("top_hypothesis_name", "N/A")
+        conf  = at_res.get("confidence", "N/A")
+        lines.append(
+            f"- **Top hypothesis**: {top_h}  "
+            f"**Confidence**: {conf}"
+        )
+        sc = at_res.get("scoring", {})
+        if sc.get("hypothesis_ranking"):
+            lines.append("\n| Hypothesis | Score |")
+            lines.append("|-----------|-------|")
+            for h in sc["hypothesis_ranking"]:
+                lines.append(
+                    f"| {h.get('name', 'Unknown')} | {h.get('score', 0.0):.3f} |"
+                )
+        sp = at_res.get("spectral", {})
+        _row("Freq classification (E1)", sp.get("freq_classification", "N/A"),
+             f"n_peaks={sp.get('n_total_peaks', 'N/A')}")
+        vf = at_res.get("velocity_field", {})
+        _row("Rotation index (E2)", _na(vf.get("rotation_index"), ".3f"),
+             ">0.6 → oscillatory flow")
+        _row("Neutral direction (E2)", vf.get("has_neutral_direction", "N/A"),
+             "True → continuous attractor")
+        rqa_r = at_res.get("recurrence", {})
+        _row("DET / LAM (E3)", f"{_na(rqa_r.get('DET'), '.3f')} / {_na(rqa_r.get('LAM'), '.3f')}",
+             "DET>0.9 → periodic")
+        ld_r = at_res.get("local_dimensionality", {})
+        _row("Local dim (E4)", _na(ld_r.get("local_dim_mean"), ".2f"),
+             "≈1→line, ≈2→cycle, ≈3→torus")
 
     # 4a Surrogate test
     surr = results.get("surrogate_test", {})

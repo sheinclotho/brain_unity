@@ -165,6 +165,22 @@ dynamics:
     tail_steps: 50              # Steps for tail-state extraction
     dominant_thresh: 0.75       # Fraction threshold for "single attractor"
 
+  # ── Phase 3l: Attractor Topology Analysis ────────────────────────────────
+  # Multi-evidence hypothesis testing: identifies the attractor type (fixed
+  # point / limit cycle / quasi-periodic / continuous attractor / strange
+  # attractor) from five convergent evidence streams.
+  # Zero extra model calls — reuses Phase-1 trajectories.
+  # Outputs: attractor_topology_report.json
+  #           freq_spectrum_pcs.png        — FFT of PC1-PC3 with peak annotations
+  #           velocity_field_pca.png       — phase velocity quiver
+  #           recurrence_plot.png          — recurrence matrix + RQA metrics
+  #           hypothesis_scorecard.png     — ranked hypothesis bar-chart
+  attractor_topology:
+    enabled: true
+    n_pcs: 6                    # PCA components to use internally
+    dt: 1.0                     # Time step label for frequency axis
+    rqa_max_T: 500              # Truncate trajectory for RQA (avoids O(T²) cost)
+
 # ── Phase 4: Statistical Validation ─────────────────────────────────────────
 validation:
   surrogate_test:
