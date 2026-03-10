@@ -40,6 +40,18 @@ simulator:
   # Internal fMRI sub-sampling factor (kept for compatibility; model infers
   # dt from the graph cache automatically).
   fmri_subsample: 25
+  # Amplitude normalisation (useful for diagnosing joint-mode spectral radius >> 1).
+  # When true, each state vector x(t) of every generated trajectory is normalised
+  # to unit L2 norm after Phase 1: x_hat(t) = x(t) / ||x(t)||₂.
+  # This removes the amplitude dimension and studies direction-only dynamics.
+  # Expected effects:
+  #   - DMD spectral radius typically decreases toward ≤1 (amplitude no longer
+  #     inflates the linear operator).
+  #   - Rosenstein LLE measures divergence on the unit sphere; near-critical
+  #     behaviour may be preserved or slightly altered.
+  # Use to isolate whether joint-mode ρ>>1 is amplitude-driven or structure-driven.
+  # Default: false (preserve original amplitude information for all analyses).
+  normalize_amplitude: false
 
 # ── Phase 1: Data Generation ────────────────────────────────────────────────
 data_generation:
@@ -61,7 +73,13 @@ network_structure:
     enabled: true               # Louvain/spectral community detection
     k_range: [3, 4, 5, 6, 7, 8]
     n_null: 100                 # Null networks for Q significance test (0 = skip)
-                                # Uses degree-preserving rewiring (Maslov-Sneppen)
+                                # Strategy auto-selected by matrix density:
+                                #   sparse (≤50% non-zero): Maslov-Sneppen degree-
+                                #     preserving rewiring (preserves strength sequence)
+                                #   dense  (>50% non-zero, typical for brain FC):
+                                #     weight-permutation null model (randomises which
+                                #     node-pairs carry which weights; Maslov-Sneppen
+                                #     is inapplicable — all swaps rejected for dense graphs)
   hierarchy:
     enabled: false              # Hierarchical clustering dendrogram
   modal_energy:

@@ -165,6 +165,41 @@ def run_phase1_data(cfg: dict, simulator, output_dir: Path,
     results["trajectories"] = trajectories
     logger.info("  → trajectories shape: %s", trajectories.shape)
 
+    # ── Amplitude normalisation (optional, for studying joint-mode dynamics) ──
+    # When simulator.modality == 'joint' the concatenated z-score state can
+    # have high L2 norms, which inflates the DMD spectral radius beyond 1 even
+    # when the system is near-critical.  Setting normalize_amplitude=true
+    # projects each time step onto the unit sphere so that only the directional
+    # dynamics are analysed.  Both trajectories AND the amplitude-normalised
+    # copy are stored; downstream phases use the (potentially normalised) copy.
+    sim_cfg = cfg.get("simulator", {})
+    if sim_cfg.get("normalize_amplitude", False):
+        norms = np.linalg.norm(trajectories, axis=-1, keepdims=True)  # (n_traj, T, 1)
+        # Detect and warn about degenerate zero-norm states (e.g., all-zero initialisation)
+        n_zero = int(np.sum(norms < 1e-30))
+        if n_zero > 0:
+            logger.warning(
+                "  Amplitude normalisation: %d time steps have near-zero L2 norm "
+                "(||x||₂ < 1e-30).  These states are likely degenerate (all-zero) "
+                "and will be left unchanged (divided by 1).  Investigate whether "
+                "the model produces zero-valued outputs for these initial conditions.",
+                n_zero,
+            )
+        # Replace zero norms with 1 to avoid division-by-zero; zero states stay zero
+        norms = np.where(norms < 1e-30, 1.0, norms)
+        trajectories_norm = trajectories / norms
+        results["trajectories_raw"] = trajectories          # original
+        results["trajectories"] = trajectories_norm         # normalised (used by all phases)
+        mean_norm = float(np.mean(np.linalg.norm(trajectories, axis=-1)))
+        logger.info(
+            "  Amplitude normalisation: each state vector projected onto unit sphere. "
+            "Original mean ||x||₂=%.4f. "
+            "DMD spectral radius may now differ from the unnormalised run.",
+            mean_norm,
+        )
+    else:
+        results["amplitude_normalised"] = False
+
     # Response matrix (Phase 5 / advanced, but generated here for Phase 2)
     adv = cfg.get("advanced", {})
     rm_cfg = adv.get("response_matrix", {})
@@ -397,8 +432,14 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
                 output_dir=dyn_dir,
             )
             results["stability"] = stab
-            v2 = stab.get("classification_counts_v2", {})
-            logger.info("  Stability (Method C): %s", v2)
+            vc = stab.get("classification_counts", {})  # Method C (adaptive)
+            n_traj = max(sum(vc.values()), 1) if vc else 1
+            primary_c = max(vc, key=lambda k: vc.get(k, 0)) if vc else "N/A"
+            logger.info(
+                "  Stability (Method C adaptive): %s (%.0f%% of trajectories)",
+                primary_c,
+                vc.get(primary_c, 0) / n_traj * 100,
+            )
         except Exception as e:
             logger.warning("  Stability analysis failed: %s", e)
 
@@ -416,7 +457,7 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
             results["attractor"] = att
             logger.info(
                 "  Attractor: k=%d, basins=%s",
-                att.get("k_best", 0),
+                att.get("kmeans_k", 0),
                 att.get("basin_distribution", {}),
             )
         except Exception as e:
@@ -693,7 +734,7 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
 
         # PCA effective dimension as upper bound
         pca = results.get("pca", {})
-        n90 = pca.get("n_components_90")
+        n90 = pca.get("n_components_90pct")  # correct key from f_pca_attractor.py
         if n90 is not None:
             dim_results["PCA_n90"] = n90
             logger.info("  Attractor dim: PCA n@90%%=%d (upper bound)", n90)
@@ -1321,6 +1362,7 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
             "n_init": dg.get("n_init"),
             "steps": dg.get("steps"),
             "modality": actual_modality,
+            "normalize_amplitude": sim_cfg.get("normalize_amplitude", False),
             "cfg_hash": cfg_hash,
             "output_dir": str(output_dir),
         },
@@ -1518,7 +1560,7 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
     pca_res = results.get("pca", {})
     spec_res = results.get("spectral", {})
     if pca_res and spec_res:
-        n90 = pca_res.get("n_components_90")
+        n90 = pca_res.get("n_components_90pct")  # correct key from f_pca_attractor.py
         pr = spec_res.get("participation_ratio")
         N_reg = spec_res.get("n_regions")
         if n90 is not None and pr is not None and N_reg is not None and N_reg > 0:
@@ -1648,6 +1690,17 @@ def _generate_ai_report(
     lines.append(f"**n_init**: {meta.get('n_init', 'N/A')}  "
                  f"**steps**: {meta.get('steps', 'N/A')}  "
                  f"**seed**: {meta.get('seed', 42)}  ")
+    norm_amp = meta.get("normalize_amplitude", False)
+    lines.append(
+        f"**Amplitude normalised**: {'✓ Yes (unit-sphere projection)' if norm_amp else 'No (raw amplitudes)'}  "
+    )
+    if norm_amp:
+        lines.append(
+            "> ⚠ Amplitude normalisation is active: each state vector was projected "
+            "onto the unit sphere before all Phase 2–6 analyses. "
+            "DMD spectral radius reflects directional dynamics only; "
+            "compare with a non-normalised run to assess amplitude-driven effects."
+        )
     conn_src = report.get("connectivity_source", "unknown")
     ev_grade = report.get("evidence_grade", "unknown")
     lines.append(f"**Connectivity source**: {conn_src}  "
@@ -1706,8 +1759,9 @@ def _generate_ai_report(
         sig = comm.get("q_significance")
         if sig:
             sig_verdict = "significant (p<0.05)" if sig.get("significant") else "not significant (p≥0.05)"
+            null_model_label = sig.get("null_model", "degree-preserving rewiring")
             lines.append(
-                f"- **Q significance test** (degree-preserving null, n={sig.get('n_null')}):"
+                f"- **Q significance test** (null model: {null_model_label}, n={sig.get('n_null')}):"
                 f"  null mean={_na(sig.get('null_mean'), '.4f')} ± "
                 f"{_na(sig.get('null_std'), '.4f')},"
                 f"  z={_na(sig.get('z_score'), '.2f')},"
@@ -1744,14 +1798,37 @@ def _generate_ai_report(
     stab = results.get("stability", {})
     if stab:
         _h(3, "3a Stability Classification")
-        _row("Primary regime", stab.get("primary_regime", "N/A"))
-        _row("Classification method C (adaptive)", stab.get("regime_adaptive", "N/A"))
+        # Primary regime: dominant class in Method-C (adaptive) counts
+        counts_c = stab.get("classification_counts", {})
+        if counts_c:
+            primary = max(counts_c, key=lambda k: counts_c.get(k, 0))
+            frac = counts_c.get(primary, 0) / max(sum(counts_c.values()), 1)
+            _row("Primary regime (Method C)", f"{primary} ({frac:.0%} of trajectories)")
+        else:
+            _row("Primary regime (Method C)", "N/A")
+        # Method-C fraction breakdown
+        n_traj = sum(counts_c.values()) if counts_c else 0
+        if n_traj > 0:
+            parts = [
+                f"{k}={v/n_traj:.0%}"
+                for k, v in counts_c.items()
+                if v > 0
+            ]
+            _row("Method C breakdown", ", ".join(parts))
+        dr = stab.get("delta_ratio_stats", {})
+        if dr:
+            _row("delta_ratio (mean)", _na(dr.get("mean"), ".4f"),
+                 "relative oscillation amplitude; > adaptive threshold → limit cycle / weakly chaotic")
 
     # 3b Attractor
     attr = results.get("attractor", {})
     if attr:
         _h(3, "3b Attractor Analysis")
-        _row("n_attractors (KMeans)", attr.get("n_clusters", "N/A"))
+        _row("n_attractors (KMeans)", attr.get("kmeans_k", "N/A"))
+        sil = attr.get("silhouette_score")
+        if sil is not None:
+            _row("silhouette score", _na(sil, ".4f"))
+        _row("DBSCAN n_clusters", attr.get("dbscan_n_clusters", "N/A"))
 
     # 3c Convergence
     conv = results.get("convergence", {})
@@ -1787,36 +1864,50 @@ def _generate_ai_report(
         _h(3, "3e Linearised Spectrum (DMD) — complementary, NOT the chaos indicator")
         _row("DMD spectral radius ρ_DMD", _na(dmd.get("spectral_radius"), ".4f"),
              "ρ≈1 → near-critical (linearised view)")
-        _row("n_slow modes (|Re(λ)|<0.05)", dmd.get("n_slow", "N/A"))
-        _row("n_Hopf pairs", dmd.get("n_hopf", "N/A"),
+        _row("n_slow modes (|Re(λ)|<0.05)", dmd.get("n_slow_modes", "N/A"))
+        _row("n_Hopf pairs", dmd.get("n_hopf_pairs", "N/A"),
              "oscillatory modes")
-        _row("K-Y dimension (linearised)", _na(dmd.get("ky_dimension"), ".2f"))
+        _row("K-Y dimension (linearised)", _na(dmd.get("linearised_ky_dim"), ".2f"))
         lines.append(
             f"  > {report.get('dmd_interpretation_note', '')}"
         )
 
     # 3f PSD
-    psd = results.get("psd", {})
+    psd = results.get("power_spectrum", {})
     if psd:
         _h(3, "3f Power Spectral Density")
-        _row("Dominant frequency", f"{_na(psd.get('dominant_freq_hz'), '.4f')} Hz")
-        _row("Delta power fraction", _na(psd.get("delta_pct"), ".1f"))
-        _row("Theta power fraction", _na(psd.get("theta_pct"), ".1f"))
+        ba = psd.get("band_analysis", {})
+        _row("Dominant frequency", f"{_na(ba.get('dominant_freq_hz'), '.4f')} Hz",
+             ba.get("dominant_freq_band", ""))
+        # Band power fractions are stored inside band_analysis["bands_used"] as
+        # a list of (name, low, high) tuples, not as top-level pct keys.
+        # Report Nyquist and dominant band only.
+        _row("Nyquist frequency", f"{_na(ba.get('nyquist_hz'), '.4f')} Hz")
 
     # 3g PCA
     pca_res = results.get("pca", {})
     if pca_res:
         _h(3, "3g PCA Dimensionality")
-        _row("n@90% variance (linear embedding dim)", pca_res.get("n_components_90", "N/A"),
+        _row("n@90% variance (linear embedding dim)", pca_res.get("n_components_90pct", "N/A"),
              "upper bound on attractor dim (H2)")
+        _row("Top-5 modes cumulative variance",
+             f"{_na(pca_res.get('variance_top5_pct'), '.1f')}%")
 
     # 3h Attractor dimension
     d2_res = results.get("attractor_dimension", {})
     if d2_res:
         _h(3, "3h Attractor Dimension (three-way estimate)")
-        _row("D₂ (correlation dimension, nonlinear)", _na(d2_res.get("D2"), ".2f"))
-        _row("K-Y_linear (DMD linearised)", _na(d2_res.get("ky_linear"), ".2f"))
-        _row("PCA n@90% (linear upper bound)", d2_res.get("pca_n90", "N/A"))
+        d2_mean = d2_res.get("D2_mean", d2_res.get("D2"))
+        d2_std = d2_res.get("D2_std")
+        d2_str = _na(d2_mean, ".2f")
+        if d2_std is not None and np.isfinite(float(d2_std)):
+            d2_str += f"±{d2_std:.2f}"
+        fail = d2_res.get("D2_fail_rate")
+        if fail is not None:
+            d2_str += f" (fail={fail:.0%})"
+        _row("D₂ (correlation dimension, nonlinear)", d2_str)
+        _row("K-Y_linear (DMD linearised)", _na(d2_res.get("KY_linearised"), ".2f"))
+        _row("PCA n@90% (linear upper bound)", d2_res.get("PCA_n90", "N/A"))
 
     # ── Phase 4: Statistical Validation ──────────────────────────────────────
     _h(2, "Phase 4 — Statistical Validation")
@@ -1848,8 +1939,12 @@ def _generate_ai_report(
     id_res = results.get("intrinsic_dimension", {})
     if id_res:
         _h(3, "4e TwoNN Intrinsic Dimension")
-        _row("mean local dim", _na(id_res.get("mean_dim"), ".2f"))
-        _row("median local dim", _na(id_res.get("median_dim"), ".2f"))
+        _row("mean local dim", _na(id_res.get("d_mean"), ".2f"))
+        _row("median local dim", _na(id_res.get("d_median"), ".2f"))
+        _row("std", _na(id_res.get("d_std"), ".2f"))
+        n_valid = id_res.get("n_valid", 0)
+        n_total = id_res.get("n_total", 0)
+        _row("n_valid / n_total", f"{n_valid} / {n_total}")
 
     # 4j Graph structure comparison
     gsc = results.get("graph_structure_comparison", {})
@@ -2210,7 +2305,7 @@ def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:
     # H2: Low-dimensional dynamics
     # Evidence: PCA n@90%, correlation dimension D₂ (distribution), linearised K-Y dimension
     pca = results.get("pca", {})
-    n90 = pca.get("n_components_90")
+    n90 = pca.get("n_components_90pct")  # correct key from f_pca_attractor.py
     ad = results.get("attractor_dimension", {})
     d2 = ad.get("D2")  # scalar mean (backward-compat)
     d2_mean = ad.get("D2_mean", d2)
@@ -2237,7 +2332,7 @@ def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:
             "name": "Low-dimensional dynamics",
             "verdict": "SUPPORTED" if supported else "NOT_SUPPORTED",
             "summary": ", ".join(summary_parts),
-            "n_components_90": n90,
+            "n_components_90pct": n90,
             "dim_ratio": float(dim_ratio),
             "D2": float(d2_mean) if d2_mean is not None and np.isfinite(d2_mean) else None,
             "D2_std": float(d2_std) if d2_std is not None else None,
