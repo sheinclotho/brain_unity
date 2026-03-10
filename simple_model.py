@@ -9,6 +9,10 @@ from scipy.spatial.distance import pdist, squareform
 from scipy.stats import linregress
 from sklearn.decomposition import PCA
 
+
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']  # Windows 系统
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+
 # ================== 参数设置 ==================
 np.random.seed(42)                     # 可重复性
 
