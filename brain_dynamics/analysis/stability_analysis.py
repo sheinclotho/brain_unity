@@ -659,7 +659,8 @@ def analyze_trajectory_stability(
         traj_rms=traj_rms,      # v3: relative metastable threshold
     )
 
-    # Method C: adaptive relative-threshold classification
+    # Method C: adaptive relative-threshold classification.
+    # Uses the same `features` dict already computed above — no redundant call.
     classification_v3 = classify_dynamics_adaptive(features)
 
     # Convergence step (method A): first step where delta falls below threshold
