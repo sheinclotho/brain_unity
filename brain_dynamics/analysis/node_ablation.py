@@ -65,22 +65,39 @@ _STD_GUARD = 1e-8
 # ---------------------------------------------------------------------------
 
 def _lle(trajs: np.ndarray) -> float:
+    """Estimate LLE by averaging Rosenstein estimates across all trajectories.
+
+    Calls ``rosenstein_lyapunov`` directly (no simulator required) on each
+    individual trajectory (shape T × N) and returns the mean, skipping NaN.
+    """
     try:
-        from analysis.lyapunov import run_lyapunov_analysis
-        r = run_lyapunov_analysis(
-            trajectories=trajs, method="rosenstein",
-            max_lag=50, min_sep=20, n_segments=1,
-        )
-        return float(r.get("primary_mean", float("nan")))
+        from analysis.lyapunov import rosenstein_lyapunov
+        vals = []
+        for traj in trajs:               # traj: (T, N)
+            lle, _ = rosenstein_lyapunov(
+                traj.astype(np.float64),
+                max_lag=50,
+                min_temporal_sep=20,
+            )
+            if np.isfinite(lle):
+                vals.append(lle)
+        return float(np.mean(vals)) if vals else float("nan")
     except Exception:
         return float("nan")
 
 
 def _d2(trajs: np.ndarray) -> float:
+    """Estimate correlation dimension D2 on a single representative trajectory.
+
+    Uses the first trajectory (shape T × N) so that ``correlation_dimension``
+    receives the expected 2-D array.  The old code incorrectly flattened the
+    array to 1-D and passed unsupported keyword arguments.
+    """
     try:
         from analysis.embedding_dimension import correlation_dimension
-        flat = trajs[:, :, 0].reshape(-1)
-        return float(correlation_dimension(flat, max_dim=20, n_points=1000))
+        traj = trajs[0].astype(np.float64)   # (T, N)
+        result = correlation_dimension(traj, max_points=1000)
+        return float(result["D2"])
     except Exception:
         return float("nan")
 

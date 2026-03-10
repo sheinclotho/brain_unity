@@ -72,6 +72,93 @@ _POINCARE_QUASI_RATIO: float = 0.50      # std/range < this → smooth manifold 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Delay-embedding helpers (Takens' theorem)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _estimate_tau(obs: np.ndarray, max_tau: int = 100) -> int:
+    """Estimate optimal delay τ as the first zero-crossing of the
+    autocorrelation function (Takens / Fraser-Swinney criterion).
+
+    Args:
+        obs:     1-D observation time series (float64).
+        max_tau: Maximum τ to search.
+
+    Returns:
+        τ (int, ≥ 1).  Falls back to 1 if no zero-crossing is found.
+    """
+    obs = obs - obs.mean()
+    norm = float(np.dot(obs, obs))
+    if norm < 1e-30:
+        return 1
+    for tau in range(1, min(max_tau, len(obs) // 4)):
+        acf = float(np.dot(obs[:-tau], obs[tau:])) / norm
+        if acf <= 0.0:
+            return tau
+    return max(1, min(max_tau, len(obs) // 8))
+
+
+def _build_delay_portrait(
+    trajectories: np.ndarray,
+    burnin: int,
+    m: int = 3,
+    tau: Optional[int] = None,
+) -> np.ndarray:
+    """Build Takens delay-embedding coordinates from multi-channel trajectories.
+
+    For each trajectory the *mean across all channels* is used as the scalar
+    observation y(t).  The delay portrait is then::
+
+        z(t) = [y(t), y(t+τ), y(t+2τ), ..., y(t+(m-1)τ)]
+
+    which, by Takens' theorem, preserves the topological structure of the
+    attractor for m ≥ 2D+1 (D = intrinsic dimension).  This avoids the
+    flattening artefacts of PCA linear projection.
+
+    Args:
+        trajectories: shape (n_traj, T, N).
+        burnin:       Steps to skip at the start of each trajectory.
+        m:            Embedding dimension (default 3 for 2-D / 3-D portraits).
+        tau:          Time delay (steps).  If None, estimated automatically
+                      from the mean-channel autocorrelation of the first
+                      trajectory.
+
+    Returns:
+        X_delay: shape (n_traj * T_embed, m) — all trajectories stacked.
+        tau_used: int — the τ actually used.
+        T_embed: int — number of delay-vector time points per trajectory.
+    """
+    n_traj, T, N = trajectories.shape
+    burnin = min(burnin, T - 1)
+
+    # Scalar observable: mean over all channels (after burnin)
+    obs_all = trajectories[:, burnin:, :].mean(axis=-1)   # (n_traj, T_eff)
+    T_eff = obs_all.shape[1]
+
+    # Estimate τ from first trajectory if not supplied
+    if tau is None:
+        tau = _estimate_tau(obs_all[0].astype(np.float64))
+
+    T_embed = T_eff - (m - 1) * tau
+    if T_embed < 4:
+        # Fallback: reduce m or tau
+        tau = max(1, tau // 2)
+        T_embed = T_eff - (m - 1) * tau
+        if T_embed < 4:
+            m = 3
+            tau = 1
+            T_embed = T_eff - (m - 1) * tau
+
+    rows = []
+    for i in range(n_traj):
+        obs = obs_all[i].astype(np.float64)
+        mat = np.stack([obs[j * tau: j * tau + T_embed] for j in range(m)], axis=1)
+        rows.append(mat)
+
+    X_delay = np.concatenate(rows, axis=0)   # (n_traj * T_embed, m)
+    return X_delay, tau, T_embed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # F1: PCA explained variance
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -412,7 +499,7 @@ def run_pca_attractor(
             label=label,
         )
 
-        # ── New Test 2: Phase Portrait (pair-wise PC projections) ─────────────
+        # ── New Test 2a: Phase Portrait (pair-wise PC projections) ──────────
         X_pca = pca_result["X_pca"]
         evr = pca_result["explained_variance_ratio"]
         if X_pca.shape[1] >= 2:
@@ -433,14 +520,32 @@ def run_pca_attractor(
                 output_path=out / "phase_portrait_pc2_pc3.png",
             )
 
-        # ── New Test 3: Poincaré Section ──────────────────────────────────────
-        poincare = compute_poincare_section(X_pca, n_traj, T_eff)
+        # ── New Test 2b: Delay-embedding (Takens) phase portrait ─────────────
+        # Delay embedding preserves nonlinear attractor topology while PCA
+        # is a linear projection that can flatten curved manifolds.
+        # We generate BOTH so users can compare.
+        X_delay, tau_used, T_embed = _build_delay_portrait(
+            trajectories, burnin=burnin, m=3,
+        )
+        result["delay_embed_tau"] = int(tau_used)
+        result["delay_embed_T"] = int(T_embed)
+        _try_plot_delay_portrait(
+            X_delay, n_traj=n_traj, steps_per_traj=T_embed, tau=tau_used,
+            output_path=out / "phase_portrait_delay_embed.png",
+        )
+
+        # ── New Test 3: Poincaré Section (delay-embedding coordinates) ───────
+        # Use delay-embedding coordinates instead of PC coordinates so the
+        # section reflects the true attractor geometry (not a linear shadow).
+        poincare = compute_poincare_section(X_delay, n_traj, T_embed)
         result["poincare_n_crossings"] = poincare["n_crossings"]
         result["poincare_interpretation"] = poincare["interpretation"]
         np.save(out / "poincare_points.npy", poincare["points"])
         _try_plot_poincare_section(
             poincare,
             output_path=out / "poincare_section.png",
+            coord_labels=("y(t+tau)", "y(t+2*tau)"),
+            section_label="y(t)=0, y(t+tau)>0",
         )
 
     return result
@@ -629,9 +734,17 @@ def compute_poincare_section(
     }
 
 
-def _try_plot_poincare_section(poincare: Dict, output_path: Path) -> None:
-    """
-    New Test 3 plot: PC2_cross vs PC3_cross at Poincaré section crossings.
+def _try_plot_poincare_section(
+    poincare: Dict,
+    output_path: Path,
+    coord_labels: tuple = ("y(t+tau)", "y(t+2*tau)"),
+    section_label: str = "y(t)=0, y(t+tau)>0",
+) -> None:
+    """Poincaré section scatter plot.
+
+    Accepts delay-embedding coordinate labels so the axes correctly describe
+    what the coordinates represent (delay-embedding by default, or PC labels
+    for legacy callers).
     """
     try:
         import matplotlib
@@ -650,22 +763,22 @@ def _try_plot_poincare_section(poincare: Dict, output_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(6, 6))
 
     if n_cross == 0:
-        ax.text(0.5, 0.5, "No crossings detected\n(section PC1=0, PC2>0)",
+        ax.text(0.5, 0.5, f"No crossings detected\n(section {section_label})",
                 ha="center", va="center", transform=ax.transAxes, fontsize=12)
     else:
-        pc2_c = points[:, 0]
-        pc3_c = points[:, 1]
+        c0 = points[:, 0]
+        c1 = points[:, 1]
         # Colour by crossing order (trajectory time)
         cmap = plt.cm.plasma
-        sc = ax.scatter(pc2_c, pc3_c,
+        sc = ax.scatter(c0, c1,
                         c=np.arange(n_cross), cmap=cmap,
                         s=20, alpha=0.8, edgecolors="k", lw=0.3, zorder=3)
         plt.colorbar(sc, ax=ax, label="Crossing index (time order)")
 
-    ax.set_xlabel("PC2 at crossing")
-    ax.set_ylabel("PC3 at crossing")
+    ax.set_xlabel(coord_labels[0])
+    ax.set_ylabel(coord_labels[1])
     ax.set_title(
-        f"Poincaré Section  (PC1=0, PC2>0)\n"
+        f"Poincaré Section  ({section_label})\n"
         f"n_crossings={n_cross},  interpretation: {interp}\n"
         "cluster→periodic | curve→quasi-periodic | scatter→chaotic"
     )
@@ -673,4 +786,108 @@ def _try_plot_poincare_section(poincare: Dict, output_path: Path) -> None:
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    logger.info("保存 Poincare section: %s", output_path)
+    logger.info("Saved Poincare section: %s", output_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Delay-embedding (Takens) phase portrait
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _try_plot_delay_portrait(
+    X_delay: np.ndarray,
+    n_traj: int,
+    steps_per_traj: int,
+    tau: int,
+    output_path: Path,
+    n_traj_show: int = 5,
+) -> None:
+    """Plot delay-embedding phase portrait: y(t) vs y(t+tau) [vs y(t+2*tau)].
+
+    Uses Takens delay embedding (mean channel observable) so the phase portrait
+    preserves the nonlinear attractor topology that PCA linear projection may
+    flatten or distort.
+
+    If the embedding dimension is ≥ 3, a 3-D trajectory plot is also produced
+    alongside the 2-D panel.
+
+    Args:
+        X_delay:        shape (n_traj * T_embed, m) from _build_delay_portrait.
+        n_traj:         number of trajectories.
+        steps_per_traj: T_embed (delay-adjusted trajectory length).
+        tau:            delay lag used (for axis labels).
+        output_path:    PNG save path.
+        n_traj_show:    max trajectories to overlay.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
+    except ImportError:
+        _write_fallback_png(output_path)
+        return
+
+    m = X_delay.shape[1]
+    if m < 2:
+        _write_fallback_png(output_path)
+        return
+
+    has_3d = m >= 3
+    n_show = min(n_traj_show, n_traj)
+    T = steps_per_traj
+    cmap = plt.cm.viridis
+    colors_t = cmap(np.linspace(0.05, 0.95, T))
+
+    if has_3d:
+        fig = plt.figure(figsize=(12, 6))
+        ax2 = fig.add_subplot(1, 2, 1)
+        ax3 = fig.add_subplot(1, 2, 2, projection="3d")
+    else:
+        fig, ax2 = plt.subplots(figsize=(6, 6))
+
+    for i in range(n_show):
+        start = i * T
+        end = start + T
+        if end > X_delay.shape[0]:
+            break
+        y0 = X_delay[start:end, 0]
+        y1 = X_delay[start:end, 1]
+
+        # 2-D portrait
+        for t in range(T - 1):
+            ax2.plot(y0[t:t+2], y1[t:t+2], color=colors_t[t], lw=0.8, alpha=0.7)
+        ax2.scatter(y0[0], y1[0], color="blue", s=25, zorder=5, marker="o")
+        ax2.scatter(y0[-1], y1[-1], color="red", s=25, zorder=5, marker="x")
+
+        # 3-D portrait
+        if has_3d:
+            y2 = X_delay[start:end, 2]
+            ax3.plot(y0, y1, y2, lw=0.6, alpha=0.6)
+            ax3.scatter(y0[0], y1[0], y2[0], color="blue", s=20)
+            ax3.scatter(y0[-1], y1[-1], y2[-1], color="red", s=20, marker="^")
+
+    # Colorbar for time
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, T))
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax2, label="Time Step")
+
+    ax2.set_xlabel(f"y(t)")
+    ax2.set_ylabel(f"y(t+{tau})")
+    ax2.set_title(
+        f"Phase Portrait: Delay Embedding (tau={tau})\n"
+        f"({n_show} traj, blue=start, redX=end, colour=time)"
+    )
+    ax2.grid(True, alpha=0.2)
+
+    if has_3d:
+        ax3.set_xlabel(f"y(t)")
+        ax3.set_ylabel(f"y(t+{tau})")
+        ax3.set_zlabel(f"y(t+{2*tau})")
+        ax3.set_title(f"3-D Delay Portrait (tau={tau})")
+
+    fig.suptitle("Takens Delay Embedding Phase Portrait", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved delay-embedding phase portrait: %s", output_path)

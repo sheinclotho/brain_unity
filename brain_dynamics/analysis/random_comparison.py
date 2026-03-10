@@ -44,6 +44,56 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _degree_preserving_rewire(
+    W: np.ndarray,
+    n_swaps: int,
+    seed: int = 0,
+) -> np.ndarray:
+    """Maslov-Sneppen degree-preserving rewire with an absolute swap count.
+
+    Identical logic to ``spectral_dynamics.e4_structural_perturbation
+    .degree_preserving_rewire`` but accepts *n_swaps* as an absolute integer
+    (rather than a factor × nnz), so callers can control the randomisation
+    budget directly.
+
+    Args:
+        W:       Square connectivity matrix (N, N).
+        n_swaps: Total number of attempted edge swaps.
+        seed:    Random seed.
+
+    Returns:
+        W_rewired: Same shape as W, edges randomly rewired.
+    """
+    rng = np.random.default_rng(seed)
+    W_out = W.copy().astype(np.float32)
+    rows, cols = np.where(W_out != 0)
+    n_edges = len(rows)
+    if n_edges < 4:
+        logger.warning("Too few edges (%d) for degree-preserving rewire.", n_edges)
+        return W_out
+
+    for _ in range(n_swaps):
+        idx = rng.integers(0, n_edges, size=2)
+        if idx[0] == idx[1]:
+            continue
+        i, j = int(rows[idx[0]]), int(cols[idx[0]])
+        k, l = int(rows[idx[1]]), int(cols[idx[1]])
+        if i == l or k == j:
+            continue
+        if W_out[i, l] != 0 or W_out[k, j] != 0:
+            continue
+        wij = W_out[i, j]
+        wkl = W_out[k, l]
+        W_out[i, j] = 0.0
+        W_out[k, l] = 0.0
+        W_out[i, l] = wij
+        W_out[k, j] = wkl
+        rows[idx[0]], cols[idx[0]] = i, l
+        rows[idx[1]], cols[idx[1]] = k, j
+
+    return W_out
+
+
 def _make_random_dynamics_matrix(
     n_regions: int,
     target_spectral_radius: float = 0.9,

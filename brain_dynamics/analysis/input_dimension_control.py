@@ -96,10 +96,17 @@ def _add_low_dim_drive(
 # ---------------------------------------------------------------------------
 
 def _compute_d2(trajs: np.ndarray) -> float:
+    """Estimate correlation dimension D2.
+
+    Passes the first trajectory as a 2-D array (T × N) to
+    ``correlation_dimension``, which requires a 2-D input.  The old code
+    incorrectly flattened to 1-D and used unsupported keyword arguments.
+    """
     try:
         from analysis.embedding_dimension import correlation_dimension
-        flat = trajs[:, :, 0].reshape(-1)
-        return float(correlation_dimension(flat, max_dim=20, n_points=2000))
+        traj = trajs[0].astype(np.float64)   # (T, N)
+        result = correlation_dimension(traj, max_points=2000)
+        return float(result["D2"])
     except Exception as exc:
         logger.debug("D2 failed: %s", exc)
         return float("nan")
@@ -117,16 +124,24 @@ def _compute_pca_dim(trajs: np.ndarray, var_threshold: float = 0.90) -> int:
 
 
 def _compute_lle(trajs: np.ndarray) -> float:
+    """Estimate LLE using Rosenstein method averaged over all trajectories.
+
+    Calls ``rosenstein_lyapunov`` directly (no simulator required) instead of
+    the old ``run_lyapunov_analysis`` call that failed because it requires a
+    simulator and used wrong keyword argument names.
+    """
     try:
-        from analysis.lyapunov import run_lyapunov_analysis
-        result = run_lyapunov_analysis(
-            trajectories=trajs,
-            method="rosenstein",
-            max_lag=50,
-            min_sep=20,
-            n_segments=1,
-        )
-        return float(result.get("primary_mean", float("nan")))
+        from analysis.lyapunov import rosenstein_lyapunov
+        vals = []
+        for traj in trajs:               # traj: (T, N)
+            lle, _ = rosenstein_lyapunov(
+                traj.astype(np.float64),
+                max_lag=50,
+                min_temporal_sep=20,
+            )
+            if np.isfinite(lle):
+                vals.append(lle)
+        return float(np.mean(vals)) if vals else float("nan")
     except Exception as exc:
         logger.debug("LLE failed: %s", exc)
         return float("nan")
