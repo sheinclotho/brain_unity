@@ -274,18 +274,46 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
         except Exception as e:
             logger.warning("  Spectral analysis failed: %s", e)
 
-    # 2b: Community detection
+    # 2b: Community detection — always uses FC (Pearson correlation) matrix.
+    # Scientific rationale (DeepSeek review / Bullmore & Sporns 2012):
+    #   Louvain maximises modularity Q for *undirected* similarity graphs.
+    #   The response matrix R is asymmetric and causal; Q(R) ≈ 0 is expected
+    #   by construction (incoming and outgoing weights cancel in the Newman–
+    #   Girvan formula), not a substantive finding about brain organisation.
+    #   Functional connectivity (Pearson correlation of free-dynamics
+    #   trajectories) is the appropriate input for brain modularity analysis.
     comm_cfg = ns_cfg.get("community", {})
     if comm_cfg.get("enabled", True):
         try:
             from spectral_dynamics.c_community_structure import run_community_structure
+            if trajs is not None:
+                _stacked_comm = trajs.reshape(-1, trajs.shape[-1])
+                W_comm = np.corrcoef(_stacked_comm.T)
+                W_comm = np.nan_to_num(W_comm, nan=0.0)
+                comm_label = "fc"
+                if connectivity_source == "response_matrix":
+                    logger.info(
+                        "  Community detection: using FC (Pearson correlation from "
+                        "trajectories) instead of response_matrix.  "
+                        "Louvain Q is defined for undirected graphs; the causal "
+                        "response matrix is asymmetric → Q≈0 by construction."
+                    )
+            else:
+                # No trajectories available — fall back to W with an explicit warning
+                W_comm = W
+                comm_label = w_label
+                logger.warning(
+                    "  Community detection: no trajectory data available; "
+                    "falling back to %s.  Q may be uninformative for asymmetric R.",
+                    w_label,
+                )
             comm = run_community_structure(
-                W, k_range=comm_cfg.get("k_range", [3, 4, 5, 6, 7, 8]),
-                label=w_label, output_dir=struct_dir,
+                W_comm, k_range=comm_cfg.get("k_range", [3, 4, 5, 6, 7, 8]),
+                label=comm_label, output_dir=struct_dir,
             )
             results["community"] = comm
             logger.info(
-                "  Community: Q=%.4f, k=%d, method=%s",
+                "  Community (FC): Q=%.4f, k=%d, method=%s",
                 comm["modularity_q"], comm["n_communities"],
                 comm.get("method", "unknown"),
             )
@@ -1355,6 +1383,137 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
             logger.info("  ✓ Surrogate test confirms nonlinear dynamics.")
         else:
             logger.info("  ○ Dynamics may be explainable by linear process.")
+
+    # ── Multi-source LLE consistency audit (addresses reviewer Issue 1) ───────
+    # Collect all LLE values computed by different sub-analyses and methods.
+    # Expected variation across methods/trajectory subsets is normal (different
+    # n_traj, lle_steps, initialisation noise) but large disagreements should
+    # be flagged for the researcher.
+    lle_audit: Dict[str, Any] = {}
+    if mean_lle is not None:
+        lle_audit["rosenstein_main"] = {
+            "value": float(mean_lle),
+            "source": "Phase 3d Rosenstein (primary, all trajectories)",
+        }
+    surr_lle = surr.get("rosenstein_lle") if surr else None
+    if surr_lle is not None:
+        lle_audit["surrogate_test_lle"] = {
+            "value": float(surr_lle),
+            "source": "Phase 4a surrogate test (n_traj subset)",
+        }
+    rc = results.get("random_comparison") or {}
+    brain_gnn_lle = None
+    graph_cmp = results.get("graph_structure_comparison") or {}
+    if graph_cmp:
+        _bg = graph_cmp.get("brain_graph", {})
+        brain_gnn_lle = _bg.get("lle_gnn")
+        brain_tanh_lle = _bg.get("lle")
+        if brain_gnn_lle is not None:
+            lle_audit["graph_comparison_gnn_lle"] = {
+                "value": float(brain_gnn_lle),
+                "source": "Phase 4b graph comparison (GNN, from Phase 1)",
+            }
+        if brain_tanh_lle is not None:
+            lle_audit["graph_comparison_tanh_lle"] = {
+                "value": float(brain_tanh_lle),
+                "source": (
+                    "Phase 4b graph comparison [tanh(W@x) ANALYTICAL SURROGATE — "
+                    "NOT the GNN model; may be 0 when spectral_radius(W)<1]"
+                ),
+                "is_analytical_surrogate": True,
+            }
+    idc = results.get("input_dimension_control") or {}
+    if idc:
+        for cond_name, cond_val in idc.items():
+            if isinstance(cond_val, dict) and "lle" in cond_val:
+                lle_audit[f"input_control_{cond_name}"] = {
+                    "value": float(cond_val["lle"]),
+                    "source": f"Phase 5 input-dim control ({cond_name})",
+                    "is_analytical_surrogate": False,
+                }
+    if lle_audit:
+        # Exclude analytical surrogate entries (tanh(W@x)) from the consistency
+        # range calculation — they measure a different model, not the GNN.
+        finite_lles = [
+            v["value"] for v in lle_audit.values()
+            if isinstance(v, dict)
+            and isinstance(v.get("value"), float)
+            and np.isfinite(v["value"])
+            and not v.get("is_analytical_surrogate", False)
+        ]
+        if len(finite_lles) >= 2:
+            lle_range = max(finite_lles) - min(finite_lles)
+            lle_audit["_range_excl_tanh"] = round(lle_range, 6)
+            if lle_range > 0.02:
+                lle_audit["_range_note"] = (
+                    "LLE estimates vary by >{:.4f} across methods/subsets.  "
+                    "This is expected: Rosenstein LLE depends on n_traj, "
+                    "lle_steps, embedding parameters, and trajectory "
+                    "initialisation.  The Phase 3d estimate (all trajectories, "
+                    "n_segments adjusted for convergence) is the primary value.  "
+                    "Large discrepancies may also reflect transient vs. "
+                    "attractor-phase sampling.".format(lle_range)
+                )
+                logger.warning(
+                    "  ⚠ LLE multi-source range=%.4f (methods disagree). "
+                    "Primary estimate: λ=%.5f (Phase 3d Rosenstein). "
+                    "See pipeline_report.json['lle_audit'] for details.",
+                    lle_range,
+                    mean_lle if mean_lle is not None else float("nan"),
+                )
+            else:
+                lle_audit["_range_note"] = (
+                    f"LLE estimates consistent (range={lle_range:.4f})."
+                )
+                logger.info(
+                    "  ✓ LLE multi-source consistency: range=%.4f across %d sources.",
+                    lle_range, len(finite_lles),
+                )
+    if lle_audit:
+        report["lle_audit"] = lle_audit
+
+    # ── SVD vs PCA variance note (addresses reviewer Issue 3) ─────────────────
+    # The response matrix SVD (Phase 2 spectral) and trajectory PCA (Phase 3g)
+    # may show very different variance concentrations.  This is scientifically
+    # EXPECTED and NOT a contradiction:
+    #   SVD(R):   measures how causal influence is distributed across response
+    #             directions.  High-rank R (energy spread over many singular
+    #             vectors) means causal influence propagates through many
+    #             independent pathways.
+    #   PCA(trajectories): measures how much of the spontaneous state variance
+    #             lies in a few directions.  Low rank means the free dynamics
+    #             are confined to a low-dimensional manifold (H2).
+    # A high-rank causal matrix can produce a low-dimensional spontaneous
+    # manifold through nonlinear constraints and attractor geometry.
+    pca_res = results.get("pca", {})
+    spec_res = results.get("spectral", {})
+    if pca_res and spec_res:
+        n90 = pca_res.get("n_components_90")
+        pr = spec_res.get("participation_ratio")
+        N_reg = spec_res.get("n_regions")
+        if n90 is not None and pr is not None and N_reg is not None and N_reg > 0:
+            N = int(N_reg)
+            report["svd_vs_pca_note"] = {
+                "spectral_PR": round(float(pr), 2),
+                "pca_n90": int(n90),
+                "n_regions": N,
+                "explanation": (
+                    "SVD(response_matrix) PR={pr:.1f}/{N} reflects how causal "
+                    "influence is spread across response directions (high rank "
+                    "= influence propagates via many pathways).  "
+                    "PCA(trajectories) n@90%={n90}/{N} reflects the "
+                    "dimensionality of spontaneous state variance "
+                    "(low rank = dynamics confined to a manifold, H2).  "
+                    "A high-rank causal map can coexist with low-dimensional "
+                    "free dynamics via nonlinear attractor geometry — this is "
+                    "NOT a contradiction.".format(pr=pr, N=N, n90=n90)
+                ),
+            }
+            logger.info(
+                "  SVD(R) PR=%.1f vs PCA n@90%%=%d (of N=%d): expected to "
+                "differ — causal diversity ≠ dynamical dimensionality.",
+                pr, n90, N,
+            )
 
     # ── Hypothesis evaluation ─────────────────────────────────────────────────
     hypotheses = _evaluate_hypotheses(results)
