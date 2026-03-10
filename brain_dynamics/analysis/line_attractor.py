@@ -261,6 +261,150 @@ def _plot_combined_highlight_manifold(
     fig.savefig(output_path, dpi=180, bbox_inches='tight')
     plt.close(fig)
 
+def _plot_pc_timeseries(
+    Z: np.ndarray,
+    output_path: Path,
+    n_show: int = 6
+) -> None:
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+
+    T = Z.shape[1]
+
+    for i in range(min(n_show, Z.shape[0])):
+        ax.plot(Z[i, :, 0], alpha=0.8, lw=1.2, label=f"traj {i}")
+
+    ax.set_xlabel("time")
+    ax.set_ylabel("PC1")
+    ax.set_title("PC1 time series")
+    ax.grid(True, alpha=0.3)
+
+    if n_show <= 6:
+        ax.legend(fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+def _plot_pc2_timeseries(
+    Z: np.ndarray,
+    output_path: Path,
+    n_show: int = 6
+) -> None:
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+
+    for i in range(min(n_show, Z.shape[0])):
+        ax.plot(Z[i, :, 1], alpha=0.8, lw=1.2)
+
+    ax.set_xlabel("time")
+    ax.set_ylabel("PC2")
+    ax.set_title("PC2 time series")
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+def _plot_amplitude_phase(Z: np.ndarray, output_dir: Path, n_show: int = 6) -> None:
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    fig1, ax1 = plt.subplots(figsize=(8,4.5))
+    fig2, ax2 = plt.subplots(figsize=(8,4.5))
+
+    for i in range(min(n_show, Z.shape[0])):
+
+        pc1 = Z[i,:,0]
+        pc2 = Z[i,:,1]
+
+        r = np.sqrt(pc1**2 + pc2**2)
+        theta = np.unwrap(np.arctan2(pc2, pc1))
+
+        ax1.plot(r, lw=1.2, alpha=0.9)
+        ax2.plot(theta, lw=1.2, alpha=0.9)
+
+    ax1.set_title("Amplitude r(t)")
+    ax1.set_xlabel("time")
+    ax1.set_ylabel("r = sqrt(PC1² + PC2²)")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.set_title("Phase θ(t)")
+    ax2.set_xlabel("time")
+    ax2.set_ylabel("θ = atan2(PC2,PC1)")
+    ax2.grid(True, alpha=0.3)
+
+    fig1.tight_layout()
+    fig2.tight_layout()
+
+    fig1.savefig(output_dir / "amplitude_r_timeseries.png", dpi=150)
+    fig2.savefig(output_dir / "phase_theta_timeseries.png", dpi=150)
+
+    plt.close(fig1)
+    plt.close(fig2)
+
+def _plot_limit_cycle_shape(Z: np.ndarray, output_path: Path, n_show: int = 10) -> None:
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6,6))
+
+    for i in range(min(n_show, Z.shape[0])):
+        ax.plot(Z[i,:,0], Z[i,:,1], lw=1.2, alpha=0.8)
+
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_title("Limit Cycle in PC1-PC2 space")
+    ax.grid(True, alpha=0.3)
+
+    ax.set_aspect("equal")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+def _plot_fft_spectrum(Z: np.ndarray, output_dir: Path, n_show: int = 6) -> None:
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    fig1, ax1 = plt.subplots(figsize=(7,4.5))
+    fig2, ax2 = plt.subplots(figsize=(7,4.5))
+
+    for i in range(min(n_show, Z.shape[0])):
+
+        pc1 = Z[i,:,0]
+        pc2 = Z[i,:,1]
+
+        # FFT
+        f1 = np.fft.rfft(pc1 - pc1.mean())
+        f2 = np.fft.rfft(pc2 - pc2.mean())
+
+        freq = np.fft.rfftfreq(len(pc1), d=1)
+
+        ax1.plot(freq, np.abs(f1), lw=1.2, alpha=0.9)
+        ax2.plot(freq, np.abs(f2), lw=1.2, alpha=0.9)
+
+    ax1.set_title("FFT spectrum of PC1")
+    ax1.set_xlabel("frequency")
+    ax1.set_ylabel("amplitude")
+    ax1.set_yscale("log")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.set_title("FFT spectrum of PC2")
+    ax2.set_xlabel("frequency")
+    ax2.set_ylabel("amplitude")
+    ax2.set_yscale("log")
+    ax2.grid(True, alpha=0.3)
+
+    fig1.tight_layout()
+    fig2.tight_layout()
+
+    fig1.savefig(output_dir / "pc1_fft.png", dpi=150)
+    fig2.savefig(output_dir / "pc2_fft.png", dpi=150)
+
+    plt.close(fig1)
+    plt.close(fig2)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main draw function ───────────────────────────────────────────────────────────
@@ -327,6 +471,24 @@ def draw(
         n_show=n_show, n_grid=n_grid
     )
 
+    _plot_pc_timeseries(
+        Z,
+        out / "pc1_timeseries.png"
+    )
+
+    _plot_pc2_timeseries(
+        Z,
+        out / "pc2_timeseries.png"
+    )
+
+    # 极限环几何
+    _plot_limit_cycle_shape(Z, out/"limit_cycle_pc1_pc2.png")
+
+    # 振幅与相位
+    _plot_amplitude_phase(Z, out)
+
+    _plot_fft_spectrum(Z, out)
+    
     # Report
     report = {
         "pca_explained_variance_ratio": evr.tolist(),
