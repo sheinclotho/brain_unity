@@ -116,3 +116,8 @@ htmlcov/
 __pycache__/
 nohup.out
 __pycache__/
+
+# Generated output PNGs (from simple_model*.py runs)
+fig_*.png
+no_energy.png
+with_energy.png
