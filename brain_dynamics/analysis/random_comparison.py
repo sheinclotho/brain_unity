@@ -953,8 +953,9 @@ def run_graph_structure_comparison(
     }
 
     logger.info(
-        "  Brain tanh LLE=%.4f | Degree-preserving LLE=%.4f±%.4f | "
-        "Fully-random LLE=%.4f±%.4f",
+        "  Brain tanh(W@x) LLE=%.4f [analytical surrogate, NOT GNN model; "
+        "see brain_graph['lle_gnn'] for the GNN Rosenstein LLE] | "
+        "Degree-preserving LLE=%.4f±%.4f | Fully-random LLE=%.4f±%.4f",
         brain_tanh["lle"],
         dp_tanh["lle"], dp_tanh["lle_std"],
         fr_tanh["lle"], fr_tanh["lle_std"],

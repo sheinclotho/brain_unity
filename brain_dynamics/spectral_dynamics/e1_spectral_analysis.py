@@ -71,6 +71,15 @@ def compute_spectral_metrics(W: np.ndarray, symmetric: bool = False) -> Dict:
     W = np.asarray(W, dtype=np.float64)
     N = W.shape[0]
 
+    n_bad = (~np.isfinite(W)).sum()
+    if n_bad > 0:
+        logger.warning(
+            "compute_spectral_metrics: %d non-finite value(s) in input matrix "
+            "(NaN/Inf); replacing with 0 to allow spectral computation.",
+            n_bad,
+        )
+        W = np.nan_to_num(W, nan=0.0, posinf=0.0, neginf=0.0)
+
     if symmetric:
         # Real eigenvalues only, sorted ascending
         eigvals_real = np.linalg.eigh(W)[0]

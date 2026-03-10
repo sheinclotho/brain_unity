@@ -172,6 +172,12 @@ def _build_delay_portrait(
     rows = []
     for i in range(n_traj):
         obs = obs_all[i].astype(np.float64)
+        # Centre each trajectory's observable around its mean so that
+        # zero-crossings in compute_poincare_section correspond to crossings
+        # through the trajectory's own mean level (not the global zero).
+        # This is standard practice in Poincaré-section analysis and does not
+        # change the topological structure of the attractor.
+        obs = obs - obs.mean()
         mat = np.stack([obs[j * tau: j * tau + T_embed] for j in range(m)], axis=1)
         rows.append(mat)
 

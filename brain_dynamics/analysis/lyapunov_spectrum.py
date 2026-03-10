@@ -299,7 +299,11 @@ def run_lyapunov_spectrum_analysis(
             json.dump(report, f, indent=2, default=str)
 
         logger.info(
-            "  Lyapunov spectrum: K-Y=%.2f, n_pos=%d, n_neg=%d, strange=%s",
+            "  Lyapunov spectrum (DMD linearised): K-Y_lin=%.2f, n_pos=%d, "
+            "n_neg=%d, strange=%s  "
+            "[NOTE: linearised exponents from DMD; n_pos=0 is expected when "
+            "DMD spectral radius ≤ 1 — does NOT contradict a positive "
+            "Rosenstein LLE (which measures true nonlinear divergence)]",
             result["ky_dimension"], result["n_positive"],
             result["n_negative"], result["strange_attractor"],
         )
