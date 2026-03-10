@@ -2067,20 +2067,20 @@ if __name__ == "__main__":
     # ──────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
     print("Phase 2/5   MODEL B v3.2 'Structured'  (n_steps=2000)")
-    print("  rho=1.18, noise=0.03")
+    print("  rho=1.18, noise=0.05")
     print("  tau=[5,2,3]: C0:C1 = 2.5x ratio (sweet spot slope+chaos)")
     print("  community_w_intra=[3.0,0.8,1.5]: structural energy hierarchy")
     print("    C0 (w=3.0): bistable → high E*~0.63  (fMRI-like)")
     print("    C1 (w=0.8): moderate + energy cap → E*=0.08  (EEG-like)")
     print("  per_community_energy_budgets=[2.0,0.08,2.0]: C1-only cap (E*≈0.08)")
     print("  n_hubs=6, hub_out_scale=8  (response-matrix hub control)")
-    print("  ACHIEVES: slope≈-0.21, E_c0/E_c1≈7.9x (real 7.6x), LLE>0")
+    print("  ACHIEVES: slope≈-0.20, E_c0/E_c1≈7.9x (real 7.6x), LLE>0")
     print("=" * 70)
 
     CFG_B = {
         **BASE_CFG,
         'target_rho'                  : 1.18,
-        'base_noise'                  : 0.03,
+        'base_noise'                  : 0.05,   # slightly higher noise → LLE > 0 consistently
         # tau=[5,2,3]: timescale ratio 2.5x — empirically shown to maximize
         # slope magnitude while keeping LLE > 0 (tau ablation Panel C).
         'community_taus'              : [5, 2, 3],
