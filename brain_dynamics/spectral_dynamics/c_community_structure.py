@@ -51,7 +51,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy import sparse
@@ -370,6 +370,196 @@ def _try_plot_q_vs_k(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Null Q distribution (degree-sequence-preserving random networks)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _degree_preserving_rewire_sym(
+    W_sym: np.ndarray,
+    n_swaps: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Maslov-Sneppen rewiring for a symmetric weighted matrix.
+
+    Performs ``n_swaps`` attempted edge-pair swaps that preserve the
+    strength sequence (row/column sums) while randomising the wiring
+    pattern.  Only the upper triangle is operated on; the result is
+    symmetrised before returning.
+
+    Args:
+        W_sym:   Symmetric (N, N) non-negative weight matrix.
+        n_swaps: Number of swap attempts.
+        rng:     ``np.random.Generator`` instance.
+
+    Returns:
+        Rewired symmetric matrix with the same shape and strength sequence.
+    """
+    # Work on upper triangle only to keep symmetry
+    W_out = W_sym.copy().astype(np.float64)
+    rows, cols = np.where(np.triu(W_out, k=1) != 0)
+    n_edges = len(rows)
+    if n_edges < 4:
+        return W_out
+
+    for _ in range(n_swaps):
+        idx = rng.choice(n_edges, size=2, replace=False)
+        i, j = int(rows[idx[0]]), int(cols[idx[0]])
+        k, l = int(rows[idx[1]]), int(cols[idx[1]])
+        # Proposed new edges: (i, l) and (k, j)
+        # Skip if proposed edge already exists or if swap would create self-loop
+        if i == l or k == j or i == k or j == l:
+            continue
+        if W_out[i, l] != 0 or W_out[k, j] != 0:
+            continue
+        # Swap weights
+        wij = W_out[i, j]
+        wkl = W_out[k, l]
+        W_out[i, j] = 0.0
+        W_out[j, i] = 0.0
+        W_out[k, l] = 0.0
+        W_out[l, k] = 0.0
+        W_out[i, l] = wij
+        W_out[l, i] = wij
+        W_out[k, j] = wkl
+        W_out[j, k] = wkl
+        rows[idx[0]], cols[idx[0]] = i, l
+        rows[idx[1]], cols[idx[1]] = k, j
+
+    return W_out
+
+
+def compute_q_null_distribution(
+    W_sym: np.ndarray,
+    n_null: int = 100,
+    seed: int = 42,
+    louvain_seed: int = 42,
+) -> List[float]:
+    """Generate a null Q distribution via degree-preserving random rewiring.
+
+    For each of ``n_null`` realisations, rewires ``W_sym`` using the
+    Maslov-Sneppen algorithm (preserving the strength/degree sequence),
+    then runs the same community-detection algorithm (Louvain if available,
+    otherwise best spectral-clustering k) and records the resulting Q.
+
+    The null distribution answers: "what Q would we expect if the FC
+    matrix had this degree sequence but random wiring?"
+
+    Args:
+        W_sym:        Symmetric (N, N) FC matrix.
+        n_null:       Number of null networks to generate.
+        seed:         RNG seed for rewiring.
+        louvain_seed: Seed passed to Louvain / spectral clustering.
+
+    Returns:
+        List of Q values from the null networks (length ``n_null``).
+    """
+    rng = np.random.default_rng(seed)
+    N = W_sym.shape[0]
+    # Use 10×|E| swap attempts — standard practice for thorough rewiring
+    n_edges = int(np.sum(np.triu(W_sym, k=1) != 0))
+    n_swaps = max(n_edges * 10, 100)
+
+    null_qs: List[float] = []
+    for i in range(n_null):
+        W_rand = _degree_preserving_rewire_sym(W_sym, n_swaps, rng)
+        louvain_result = _try_louvain(W_rand, seed=louvain_seed)
+        if louvain_result is not None:
+            _, q_rand = louvain_result
+        else:
+            # Spectral clustering fallback: sweep k ∈ [3, 4, 5, 6, 7, 8]
+            k_range = [k for k in _DEFAULT_K_RANGE if 2 <= k < N]
+            q_rand = -np.inf
+            for k in k_range:
+                lbl = spectral_community_detection(W_rand, k=k, seed=louvain_seed)
+                q = compute_modularity_q(W_rand, lbl)
+                if q > q_rand:
+                    q_rand = q
+        null_qs.append(float(q_rand))
+        if (i + 1) % 10 == 0:
+            logger.debug("  Q null %d/%d: q_rand=%.4f", i + 1, n_null, q_rand)
+
+    return null_qs
+
+
+def q_significance_test(
+    observed_q: float,
+    null_qs: List[float],
+) -> Dict:
+    """Compute z-score and p-value of the observed Q against a null distribution.
+
+    Args:
+        observed_q: Q from the real network.
+        null_qs:    List of Q values from null (rewired) networks.
+
+    Returns:
+        dict with keys:
+            null_mean   float  — mean of null distribution
+            null_std    float  — std  of null distribution
+            z_score     float  — (observed_q - null_mean) / null_std
+            p_value     float  — fraction of null Qs ≥ observed_q (one-sided)
+            significant bool   — True when z_score > 1.96  (p < 0.05, approx.)
+            n_null      int    — number of null realisations
+    """
+    arr = np.array(null_qs, dtype=np.float64)
+    null_mean = float(np.mean(arr))
+    null_std = float(np.std(arr))
+    if null_std < 1e-12:
+        z_score = 0.0
+    else:
+        z_score = (observed_q - null_mean) / null_std
+    # One-sided empirical p-value: P(Q_null ≥ Q_observed)
+    p_value = float(np.mean(arr >= observed_q))
+    return {
+        "null_mean": round(null_mean, 5),
+        "null_std": round(null_std, 5),
+        "z_score": round(z_score, 4),
+        "p_value": round(p_value, 4),
+        "significant": bool(z_score > 1.96),
+        "n_null": len(null_qs),
+    }
+
+
+def _try_plot_q_null_distribution(
+    null_qs: List[float],
+    observed_q: float,
+    sig: Dict,
+    output_path: Path,
+    label: str,
+) -> None:
+    """Histogram of null Q distribution with observed Q marked."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
+    except ImportError:
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(null_qs, bins=20, color="steelblue", alpha=0.75, edgecolor="k",
+            lw=0.5, label=f"Null Q (n={len(null_qs)})")
+    ax.axvline(observed_q, color="red", lw=2,
+               label=f"Observed Q={observed_q:.4f}")
+    ax.axvline(sig.get("null_mean", float("nan")), color="gray",
+               lw=1, ls="--", label=f"Null mean={sig.get('null_mean', 0):.4f}")
+
+    z = sig.get("z_score", 0)
+    p = sig.get("p_value", 1)
+    sig_txt = "p<0.05 (significant)" if sig.get("significant") else "p>=0.05 (not significant)"
+    ax.set_xlabel("Modularity Q")
+    ax.set_ylabel("Count")
+    ax.set_title(
+        f"Q Null Distribution (degree-preserving rewiring)  [{label}]\n"
+        f"z={z:.2f}, p={p:.4f} — {sig_txt}"
+    )
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("保存: %s", output_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -379,15 +569,19 @@ def run_community_structure(
     output_dir: Optional[Path] = None,
     label: str = "matrix",
     seed: int = 42,
+    n_null: int = 100,
 ) -> Dict:
     """
-    运行模块 C：社区结构分析。
+    运行模块 C：社区结构分析（含 Q 显著性检验）。
 
     步骤：
     1. 尝试 Louvain（若 networkx/community 可用）
     2. 否则：谱聚类搜索最优 k（模块度最大化）
     3. 计算模块度 Q
-    4. 生成社区规模直方图和 Q vs k 曲线
+    4. 若 n_null > 0：生成度序列保持的随机网络（配置模型，Maslov-Sneppen），
+       对每个随机网络运行相同社区检测，得到 Q 零分布，计算 z-score / p 值。
+    5. 生成社区规模直方图和 Q vs k 曲线；若运行了显著性检验，
+       额外保存 Q 零分布直方图。
 
     Args:
         W:          连接矩阵 (N, N)。
@@ -395,22 +589,30 @@ def run_community_structure(
         output_dir: 输出目录。
         label:      文件名标签。
         seed:       随机种子。
+        n_null:     生成的随机网络数量（默认 100）。设为 0 跳过显著性检验。
 
     Returns:
         dict 包含:
           method:              "louvain" 或 "spectral_clustering"
           n_communities:       最终社区数量
-          community_labels:    np.ndarray (N,)，社区归属
+          community_labels:    list (N,)，社区归属
           modularity_q:        Q 值
           community_sizes:     list，各社区节点数
           q_interpretation:    "strong" / "moderate" / "weak"
           k_q_pairs:           list of (k, Q) 供绘图
+          q_significance:      dict（仅当 n_null > 0）
+            null_mean, null_std, z_score, p_value, significant, n_null
     """
     N = W.shape[0]
     logger.info("C 社区检测: N=%d", N)
 
+    # ── Symmetrise for community detection (FC is already symmetric, but
+    #    guard against floating-point asymmetry) ──────────────────────────────
+    W_abs = np.abs(W)
+    W_sym = (W_abs + W_abs.T) / 2.0
+
     # Try Louvain first
-    louvain_result = _try_louvain(W, seed=seed)
+    louvain_result = _try_louvain(W_sym, seed=seed)
     if louvain_result is not None:
         labels, Q = louvain_result
         method = "louvain"
@@ -427,8 +629,8 @@ def run_community_structure(
         k_q_pairs = []
         best_k, labels, Q = -1, None, -np.inf
         for k in k_range:
-            lbl = spectral_community_detection(W, k=k, seed=seed)
-            q = compute_modularity_q(W, lbl)
+            lbl = spectral_community_detection(W_sym, k=k, seed=seed)
+            q = compute_modularity_q(W_sym, lbl)
             k_q_pairs.append((k, q))
             if q > Q:
                 Q = q
@@ -454,6 +656,22 @@ def run_community_structure(
         "k_q_pairs": k_q_pairs,
     }
 
+    # ── Q significance test (null distribution via degree-preserving rewiring) ─
+    null_qs: Optional[List[float]] = None
+    if n_null > 0:
+        logger.info(
+            "  Q 显著性检验: 生成 %d 个度序列保持随机网络（Maslov-Sneppen）…", n_null
+        )
+        null_qs = compute_q_null_distribution(W_sym, n_null=n_null, seed=seed)
+        sig = q_significance_test(float(Q), null_qs)
+        result["q_significance"] = sig
+        sig_str = "显著 ✓" if sig["significant"] else "不显著"
+        logger.info(
+            "  Q 显著性: Q=%.4f, null mean=%.4f±%.4f, z=%.2f, p=%.4f (%s)",
+            Q, sig["null_mean"], sig["null_std"],
+            sig["z_score"], sig["p_value"], sig_str,
+        )
+
     if output_dir is not None:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
@@ -478,6 +696,13 @@ def run_community_structure(
             _try_plot_q_vs_k(
                 k_q_pairs,
                 out / f"community_q_vs_k_{label}.png",
+                label,
+            )
+        if null_qs is not None:
+            _try_plot_q_null_distribution(
+                null_qs, float(Q),
+                result.get("q_significance", {}),
+                out / f"community_q_null_distribution_{label}.png",
                 label,
             )
 

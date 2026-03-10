@@ -60,6 +60,8 @@ network_structure:
   community:
     enabled: true               # Louvain/spectral community detection
     k_range: [3, 4, 5, 6, 7, 8]
+    n_null: 100                 # Null networks for Q significance test (0 = skip)
+                                # Uses degree-preserving rewiring (Maslov-Sneppen)
   hierarchy:
     enabled: false              # Hierarchical clustering dendrogram
   modal_energy:

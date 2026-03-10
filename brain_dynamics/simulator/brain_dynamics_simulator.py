@@ -378,6 +378,38 @@ class BrainDynamicsSimulator:
             self._eeg_mean  = _eeg_x.mean(dim=1).cpu().numpy().astype(np.float32)
             self._eeg_std   = _eeg_x.std(dim=1).cpu().numpy().astype(np.float32) + _STD_GUARD
 
+            # ── Global scale alignment ────────────────────────────────────────
+            # After per-channel z-scoring, the two modalities may still have
+            # different *global* standard deviations if the model's predictions
+            # systematically differ in magnitude between fMRI and EEG.  This
+            # causes one modality to dominate distance-based metrics (Lyapunov,
+            # FNN, convergence) in the joint state vector.
+            #
+            # We compute a single scalar scale factor per modality from the
+            # training-data global std (across all channels × time steps).
+            # For properly z-scored V5 data both global stds ≈ 1.0, so these
+            # scale factors are ≈ 1.0 (no-op).  For data where the two
+            # modalities have different spreads, the scales bring both to a
+            # unit global std, guaranteeing equal contribution to Euclidean
+            # distances in the joint state.
+            _fmri_global_std = float(_fmri_x.std().item()) + _STD_GUARD
+            _eeg_global_std  = float(_eeg_x.std().item())  + _STD_GUARD
+            self._joint_scale_fmri: float = 1.0 / _fmri_global_std
+            self._joint_scale_eeg:  float = 1.0 / _eeg_global_std
+            _scale_ratio = max(_fmri_global_std, _eeg_global_std) / min(
+                _fmri_global_std, _eeg_global_std
+            )
+            if _scale_ratio > 1.2:
+                logger.warning(
+                    "joint mode: fMRI global std=%.3f vs EEG global std=%.3f "
+                    "(ratio=%.2fx). Applying per-modality global scaling in "
+                    "_z_normalise_joint to equalise contributions to distance "
+                    "metrics (Lyapunov, convergence, FNN). Results may be "
+                    "scale-sensitive if the model's predictions deviate from "
+                    "the training distribution.",
+                    _fmri_global_std, _eeg_global_std, _scale_ratio,
+                )
+
         elif modality == "eeg":
             self.n_regions = int(base_graph["eeg"].x.shape[0])
             _eeg_sr = getattr(base_graph["eeg"], "sampling_rate", None)
@@ -600,8 +632,15 @@ class BrainDynamicsSimulator:
         """
         fmri_np = fmri_pred.squeeze(-1).detach().cpu().numpy().T  # [T, N_fmri]
         eeg_np  = eeg_pred.squeeze(-1).detach().cpu().numpy().T   # [T, N_eeg]
+        # Step 1: per-channel z-score (≈ no-op for V5 z-scored data where mean≈0, std≈1)
         fmri_z  = (fmri_np - self._fmri_mean) / self._fmri_std
         eeg_z   = (eeg_np  - self._eeg_mean)  / self._eeg_std
+        # Step 2: global scale alignment — ensures fMRI and EEG contribute equally
+        # to Euclidean distance metrics in the joint state vector.
+        # For V5 z-scored data: _joint_scale_fmri ≈ _joint_scale_eeg ≈ 1 (no-op).
+        # For unbalanced modalities: rescales the lower-variance modality upward.
+        fmri_z *= self._joint_scale_fmri
+        eeg_z  *= self._joint_scale_eeg
         return np.concatenate([fmri_z, eeg_z], axis=1)
 
     def _wolf_predict(
@@ -1364,7 +1403,13 @@ class BrainDynamicsSimulator:
         使用随机 step_idx (step_idx=None, from_data=True)：保留空间相关性但
         引入时间错位，效果优于均值+噪声，但不如上下文对齐。
 
-        **joint 模式**：fMRI/EEG 时间轴可能不对齐，暂退化为噪声采样。
+        **joint 模式**：分别从 fMRI 和 EEG 时序中采样对应时间步（``step_idx``
+        同时用于两种模态，保持近似时间对齐），返回 per-channel z-score 拼接向量
+        ``[z_fmri | z_eeg]``，值域与真实记录数据一致（≈ ±0.5–3）。
+
+        注意：joint 模式输出的 x0 格式与 ``_z_normalise_joint`` 生成的轨迹不同：
+        x0 仅做 per-channel z-score（不含全局缩放 ``_joint_scale_*``），因为
+        ``_inject_x0_into_context`` 只需逆 per-channel z-score 即可写入原始上下文。
 
         检测方式：``base_graph[modality].x.min() < -0.1`` → z-scored；不裁剪。
 
@@ -1382,16 +1427,53 @@ class BrainDynamicsSimulator:
             rng = np.random.default_rng(self.seed)
 
         if self.modality == "joint":
-            # Joint mode: use noise-based sampling (fMRI/EEG time axes may differ).
-            # When from_data is requested, fall back gracefully.
-            _ns = noise_scale if not from_data else _DATA_SAMPLE_NOISE_SCALE
-            fmri_noise = rng.normal(0.0, _ns, self.n_fmri_regions).astype(np.float32)
-            fmri_x0_z = fmri_noise  # z-score ≈ mean_z + noise (mean_z ≈ 0)
+            if from_data:
+                # ── Joint data-sample mode ────────────────────────────────────
+                # Sample a real brain state from the recording for BOTH modalities.
+                # This gives realistic initial states (z-score ≈ ±0.5–3) that
+                # match the context history, replacing the old fallback that used
+                # tiny noise (≈ ±0.05) and caused a large transient at step 0.
+                #
+                # x0 is returned as per-channel z-scores concatenated:
+                #   [z_fmri | z_eeg],  z_mod = (raw - mean) / std
+                # This is the format that _inject_x0_into_context expects —
+                # it inverts the z-score to write raw values into the context.
+                #
+                # Note: _z_normalise_joint (used for OUTPUT trajectories) applies
+                # an additional global scale factor (_joint_scale_fmri/_eeg).
+                # That global scale is NOT applied here because _inject_x0_into_
+                # context reverses only the per-channel normalisation.
+                T_fmri = int(self.base_graph["fmri"].x.shape[1])
+                T_eeg  = int(self.base_graph["eeg"].x.shape[1])
+                fmri_data = self.base_graph["fmri"].x.squeeze(-1).cpu().numpy()  # [N_fmri, T]
+                eeg_data  = self.base_graph["eeg"].x.squeeze(-1).cpu().numpy()   # [N_eeg,  T]
 
-            eeg_noise = rng.normal(0.0, _ns, self.n_eeg_regions).astype(np.float32)
-            eeg_x0_z = eeg_noise
+                t_fmri = (int(step_idx) % T_fmri) if step_idx is not None \
+                    else int(rng.integers(0, T_fmri))
+                # Keep approximate temporal alignment by mapping the same
+                # fractional position into EEG's (possibly different) T.
+                t_eeg = (int(step_idx) % T_eeg) if step_idx is not None \
+                    else t_fmri % T_eeg
 
-            return np.concatenate([fmri_x0_z, eeg_x0_z])
+                fmri_raw = fmri_data[:, t_fmri].astype(np.float32)
+                eeg_raw  = eeg_data[:,  t_eeg ].astype(np.float32)
+
+                # Convert to per-channel z-score space.
+                fmri_z = (fmri_raw - self._fmri_mean) / self._fmri_std
+                eeg_z  = (eeg_raw  - self._eeg_mean)  / self._eeg_std
+
+                # Micro-perturbation for trajectory diversity.
+                _ns = noise_scale if noise_scale != _INITIAL_STATE_NOISE_SCALE \
+                    else _DATA_SAMPLE_NOISE_SCALE
+                noise = rng.normal(0.0, _ns, self.n_regions).astype(np.float32)
+                return (np.concatenate([fmri_z, eeg_z]) + noise).astype(np.float32)
+            else:
+                # ── Joint noise-based mode ────────────────────────────────────
+                # Pure noise around zero (per-channel z-score space).
+                _ns = noise_scale
+                fmri_noise = rng.normal(0.0, _ns, self.n_fmri_regions).astype(np.float32)
+                eeg_noise  = rng.normal(0.0, _ns, self.n_eeg_regions ).astype(np.float32)
+                return np.concatenate([fmri_noise, eeg_noise])
 
         x_data = self.base_graph[self.modality].x  # [N, T, 1]
         data_np = x_data.squeeze(-1).cpu().numpy()   # [N, T]

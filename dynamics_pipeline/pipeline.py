@@ -307,16 +307,29 @@ def run_phase2_structure(cfg: dict, results: Dict[str, Any],
                     "falling back to %s.  Q may be uninformative for asymmetric R.",
                     w_label,
                 )
+            n_null = comm_cfg.get("n_null", 100)
             comm = run_community_structure(
                 W_comm, k_range=comm_cfg.get("k_range", [3, 4, 5, 6, 7, 8]),
                 label=comm_label, output_dir=struct_dir,
+                n_null=n_null,
             )
             results["community"] = comm
-            logger.info(
-                "  Community (FC): Q=%.4f, k=%d, method=%s",
-                comm["modularity_q"], comm["n_communities"],
-                comm.get("method", "unknown"),
-            )
+            sig_info = comm.get("q_significance")
+            if sig_info:
+                logger.info(
+                    "  Community (FC): Q=%.4f, k=%d, method=%s | "
+                    "null z=%.2f, p=%.4f (%s)",
+                    comm["modularity_q"], comm["n_communities"],
+                    comm.get("method", "unknown"),
+                    sig_info["z_score"], sig_info["p_value"],
+                    "significant" if sig_info["significant"] else "not significant",
+                )
+            else:
+                logger.info(
+                    "  Community (FC): Q=%.4f, k=%d, method=%s",
+                    comm["modularity_q"], comm["n_communities"],
+                    comm.get("method", "unknown"),
+                )
         except Exception as e:
             logger.warning("  Community detection failed: %s", e)
 
@@ -1269,14 +1282,31 @@ def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
 
 
 def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
-                         output_dir: Path) -> None:
-    """Phase 6: Synthesis — consistency checks & hypothesis evaluation."""
+                         output_dir: Path,
+                         modality: Optional[str] = None) -> None:
+    """Phase 6: Synthesis — consistency checks & hypothesis evaluation.
+
+    Args:
+        cfg:        Merged pipeline configuration.
+        results:    Accumulated analysis results from phases 1–5.
+        output_dir: Directory where ``pipeline_report.json`` and
+                    ``analysis_report.md`` are written.
+        modality:   The modality actually being analysed (``"fmri"``,
+                    ``"eeg"``, or ``"joint"``).  When provided, this value
+                    is used in the report metadata instead of
+                    ``cfg["simulator"]["modality"]`` (which is ``"both"``
+                    in ``--modality both`` runs, not the per-modality string).
+    """
     _step(6, "Synthesis & Report")
 
     # ── P2-1: Run metadata ────────────────────────────────────────────────────
     import hashlib
     dg = cfg.get("data_generation", {})
     sim_cfg = cfg.get("simulator", {})
+    # Prefer the caller-supplied modality (correct when running --modality both,
+    # where cfg["simulator"]["modality"] == "both" but each sub-run is "fmri"
+    # or "eeg").  Fall back to cfg value for single-modality / joint runs.
+    actual_modality = modality or sim_cfg.get("modality", "fmri")
     try:
         cfg_hash = hashlib.sha256(
             json.dumps(cfg, sort_keys=True, default=str).encode()
@@ -1290,7 +1320,7 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
             "seed": dg.get("seed", 42),
             "n_init": dg.get("n_init"),
             "steps": dg.get("steps"),
-            "modality": sim_cfg.get("modality", "fmri"),
+            "modality": actual_modality,
             "cfg_hash": cfg_hash,
             "output_dir": str(output_dir),
         },
@@ -1565,7 +1595,393 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
         json.dump(report, f, indent=2, ensure_ascii=False, default=str)
     logger.info("  → Report saved: %s", report_path)
 
+    # Generate clean AI-readable analysis report
+    _generate_ai_report(report, results, output_dir)
+
     results["report"] = report
+
+
+def _generate_ai_report(
+    report: Dict[str, Any],
+    results: Dict[str, Any],
+    output_dir: Path,
+) -> None:
+    """Generate a clean, human/AI-readable Markdown analysis report.
+
+    Synthesises all six pipeline phases into a single ``analysis_report.md``
+    file, structured for direct submission to an LLM.  The report avoids
+    verbose log lines and numerical dumps; instead it presents key metrics,
+    hypothesis verdicts, and evidence in a concise, annotated format.
+
+    Args:
+        report:     Phase-6 report dict (output of run_phase6_synthesis).
+        results:    Full results dict accumulated across all phases.
+        output_dir: Directory where ``analysis_report.md`` will be saved.
+    """
+    lines: List[str] = []
+
+    def _h(n: int, text: str) -> None:
+        lines.append("\n" + "#" * n + " " + text)
+
+    def _row(key: str, val: Any, note: str = "") -> None:
+        val_str = str(val) if val is not None else "N/A"
+        if note:
+            lines.append("- **{}**: {}  *({})* ".format(key, val_str, note))
+        else:
+            lines.append(f"- **{key}**: {val_str}")
+
+    def _na(val: Any, fmt: str = ".4f") -> str:
+        if val is None:
+            return "N/A"
+        try:
+            return format(float(val), fmt)
+        except (TypeError, ValueError):
+            return str(val)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    meta = report.get("metadata", {})
+    ts = report.get("run_timestamp", "unknown")
+    lines.append(f"# Brain Dynamics Analysis Report")
+    lines.append(f"\n**Generated**: {ts}  ")
+    lines.append(f"**Modality**: {meta.get('modality', 'fmri')}  ")
+    lines.append(f"**Config hash**: {meta.get('cfg_hash', 'unknown')}  ")
+    lines.append(f"**n_init**: {meta.get('n_init', 'N/A')}  "
+                 f"**steps**: {meta.get('steps', 'N/A')}  "
+                 f"**seed**: {meta.get('seed', 42)}  ")
+    conn_src = report.get("connectivity_source", "unknown")
+    ev_grade = report.get("evidence_grade", "unknown")
+    lines.append(f"**Connectivity source**: {conn_src}  "
+                 f"**Evidence grade**: {ev_grade}  ")
+    lines.append(
+        "\n> **How to use**: paste this file directly into an LLM prompt. "
+        "All key metrics, hypothesis verdicts, and confidence levels are "
+        "included. Raw arrays and per-step logs are in the JSON outputs."
+    )
+
+    # ── Phase 1: Data Generation ──────────────────────────────────────────────
+    _h(2, "Phase 1 — Data Generation")
+    trajs = results.get("trajectories")
+    if trajs is not None and hasattr(trajs, "shape"):
+        n_traj, steps, n_reg = trajs.shape
+        lines.append(
+            f"Free-dynamics trajectories generated: "
+            f"**{n_traj}** trajectories × **{steps}** steps × **{n_reg}** regions"
+        )
+    else:
+        lines.append("Free-dynamics trajectories: N/A (Phase 1 output not stored in memory)")
+    rm = results.get("response_matrix")
+    if rm is not None and hasattr(rm, "shape"):
+        lines.append(f"Response matrix: **{rm.shape[0]}×{rm.shape[1]}** (causal, asymmetric)")
+    else:
+        lines.append("Response matrix: N/A")
+
+    # ── Phase 2: Network Structure ────────────────────────────────────────────
+    _h(2, "Phase 2 — Network Structure")
+
+    # 2a Spectral
+    spec = results.get("spectral", {})
+    if spec:
+        _h(3, "2a Spectral Decomposition")
+        _row("Spectral radius ρ(W)", _na(spec.get("spectral_radius")),
+             "≈1 → near-critical (H1)")
+        _row("Participation ratio PR/N",
+             _na(spec.get("participation_ratio_norm",
+                          (spec.get("participation_ratio") or 0) /
+                          max(spec.get("n_regions", 1), 1)),
+                 ".3f"),
+             "< 0.3 → low-rank (H1)")
+        _row("Spectral gap ratio", _na(spec.get("spectral_gap_ratio"), ".3f"))
+        _row("n_dominant modes", spec.get("n_dominant", "N/A"))
+
+    # 2b Community
+    comm = results.get("community", {})
+    if comm:
+        _h(3, "2b Community Structure")
+        Q = comm.get("modularity_q")
+        k = comm.get("n_communities")
+        method = comm.get("method", "unknown")
+        interp = comm.get("q_interpretation", "?")
+        lines.append(f"- **Method**: {method}  **k**: {k}  **Q**: {_na(Q)}  "
+                     f"**Interpretation**: {interp}")
+        sig = comm.get("q_significance")
+        if sig:
+            sig_verdict = "significant (p<0.05)" if sig.get("significant") else "not significant (p≥0.05)"
+            lines.append(
+                f"- **Q significance test** (degree-preserving null, n={sig.get('n_null')}):"
+                f"  null mean={_na(sig.get('null_mean'), '.4f')} ± "
+                f"{_na(sig.get('null_std'), '.4f')},"
+                f"  z={_na(sig.get('z_score'), '.2f')},"
+                f"  p={_na(sig.get('p_value'), '.4f')} — **{sig_verdict}**"
+            )
+            if not sig.get("significant"):
+                lines.append(
+                    "  > ⚠ Q is not significantly higher than random networks with the same "
+                    "degree sequence. The detected community structure may not reflect true "
+                    "functional organisation; interpret with caution."
+                )
+        else:
+            lines.append("  *(Q significance test not run — set community.n_null > 0 in config)*")
+
+    # 2c Hierarchy
+    hier = results.get("hierarchy", {})
+    if hier:
+        _h(3, "2c Hierarchical Structure")
+        _row("Hierarchy index", _na(hier.get("hierarchy_index"), ".4f"))
+
+    # 2d Modal energy
+    me = results.get("modal_energy", {})
+    if me:
+        _h(3, "2d Modal Energy")
+        _row("Top-5 modes cumulative energy",
+             f"{_na(me.get('energy_top5_pct'), '.1f')}%",
+             "< 5 modes → 90% energy = low-dimensional (H2)")
+        _row("Modes for 90% energy", me.get("n_modes_90pct", "N/A"))
+
+    # ── Phase 3: Dynamics Characterisation ───────────────────────────────────
+    _h(2, "Phase 3 — Dynamics Characterisation")
+
+    # 3a Stability
+    stab = results.get("stability", {})
+    if stab:
+        _h(3, "3a Stability Classification")
+        _row("Primary regime", stab.get("primary_regime", "N/A"))
+        _row("Classification method C (adaptive)", stab.get("regime_adaptive", "N/A"))
+
+    # 3b Attractor
+    attr = results.get("attractor", {})
+    if attr:
+        _h(3, "3b Attractor Analysis")
+        _row("n_attractors (KMeans)", attr.get("n_clusters", "N/A"))
+
+    # 3c Convergence
+    conv = results.get("convergence", {})
+    if conv:
+        _h(3, "3c Trajectory Convergence")
+        _row("distance_ratio", _na(conv.get("distance_ratio"), ".4f"))
+        _row("label", conv.get("label", "N/A"))
+
+    # 3d Lyapunov (Rosenstein) — primary chaos indicator
+    lya = results.get("lyapunov", {})
+    if lya:
+        _h(3, "3d Lyapunov Exponent (Rosenstein) — PRIMARY CHAOS INDICATOR")
+        mean_lle = lya.get("mean_lyapunov")
+        regime_info = lya.get("chaos_regime", {})
+        regime = regime_info.get("regime", "unknown")
+        lines.append(
+            f"- **λ₁ (Rosenstein LLE)**: {_na(mean_lle, '.5f')}  "
+            f"**Regime**: {regime}"
+        )
+        seg_vals = lya.get("segment_lles")
+        if seg_vals:
+            seg_str = ", ".join(_na(v, ".4f") for v in seg_vals)
+            lines.append(f"- Segment estimates: [{seg_str}]")
+        lines.append(
+            f"  > λ<0 → stable, λ≈0 → edge of chaos (near-critical), "
+            f"λ>0 → chaotic. Near-critical regimes: "
+            f"edge_of_chaos / marginal_stable / weakly_chaotic."
+        )
+
+    # 3e DMD spectrum (linearised — not the chaos indicator)
+    dmd = results.get("dmd_spectrum", {})
+    if dmd:
+        _h(3, "3e Linearised Spectrum (DMD) — complementary, NOT the chaos indicator")
+        _row("DMD spectral radius ρ_DMD", _na(dmd.get("spectral_radius"), ".4f"),
+             "ρ≈1 → near-critical (linearised view)")
+        _row("n_slow modes (|Re(λ)|<0.05)", dmd.get("n_slow", "N/A"))
+        _row("n_Hopf pairs", dmd.get("n_hopf", "N/A"),
+             "oscillatory modes")
+        _row("K-Y dimension (linearised)", _na(dmd.get("ky_dimension"), ".2f"))
+        lines.append(
+            f"  > {report.get('dmd_interpretation_note', '')}"
+        )
+
+    # 3f PSD
+    psd = results.get("psd", {})
+    if psd:
+        _h(3, "3f Power Spectral Density")
+        _row("Dominant frequency", f"{_na(psd.get('dominant_freq_hz'), '.4f')} Hz")
+        _row("Delta power fraction", _na(psd.get("delta_pct"), ".1f"))
+        _row("Theta power fraction", _na(psd.get("theta_pct"), ".1f"))
+
+    # 3g PCA
+    pca_res = results.get("pca", {})
+    if pca_res:
+        _h(3, "3g PCA Dimensionality")
+        _row("n@90% variance (linear embedding dim)", pca_res.get("n_components_90", "N/A"),
+             "upper bound on attractor dim (H2)")
+
+    # 3h Attractor dimension
+    d2_res = results.get("attractor_dimension", {})
+    if d2_res:
+        _h(3, "3h Attractor Dimension (three-way estimate)")
+        _row("D₂ (correlation dimension, nonlinear)", _na(d2_res.get("D2"), ".2f"))
+        _row("K-Y_linear (DMD linearised)", _na(d2_res.get("ky_linear"), ".2f"))
+        _row("PCA n@90% (linear upper bound)", d2_res.get("pca_n90", "N/A"))
+
+    # ── Phase 4: Statistical Validation ──────────────────────────────────────
+    _h(2, "Phase 4 — Statistical Validation")
+
+    # 4a Surrogate test
+    surr = results.get("surrogate_test", {})
+    if surr:
+        _h(3, "4a Surrogate Data Test")
+        _row("real LLE", _na(surr.get("real_lle"), ".5f"))
+        _row("is_nonlinear", surr.get("is_nonlinear", "N/A"))
+        _row("z_score vs phase-randomised", _na(surr.get("z_score"), ".2f"))
+
+    # 4b Random comparison
+    rc = results.get("random_comparison", {})
+    if rc:
+        _h(3, "4b Random Network Comparison")
+        for cond, val in rc.items():
+            if isinstance(val, dict) and "mean_lyapunov" in val:
+                _row(f"  {cond} LLE", _na(val.get("mean_lyapunov"), ".5f"))
+
+    # 4c Embedding dimension
+    emb = results.get("embedding_dimension", {})
+    if emb:
+        _h(3, "4c Embedding Dimension")
+        _row("FNN min sufficient dim", emb.get("fnn", {}).get("min_sufficient_dim", "N/A"))
+        _row("D₂ (correlation dim)", _na(emb.get("corr_dim", {}).get("D2"), ".2f"))
+
+    # 4e Intrinsic dimension (TwoNN)
+    id_res = results.get("intrinsic_dimension", {})
+    if id_res:
+        _h(3, "4e TwoNN Intrinsic Dimension")
+        _row("mean local dim", _na(id_res.get("mean_dim"), ".2f"))
+        _row("median local dim", _na(id_res.get("median_dim"), ".2f"))
+
+    # 4j Graph structure comparison
+    gsc = results.get("graph_structure_comparison", {})
+    if gsc:
+        _h(3, "4j Graph Structure Comparison")
+        bg = gsc.get("brain_graph", {})
+        dp = gsc.get("degree_preserving", {})
+        fr = gsc.get("fully_random", {})
+        lines.append(f"| Network | LLE (tanh) | PCA dim |")
+        lines.append(f"|---------|-----------|---------|")
+        lines.append(f"| Brain graph | {_na(bg.get('lle'), '.4f')} | {bg.get('pca_dim_90pct', 'N/A')} |")
+        lines.append(f"| Degree-preserving | {_na(dp.get('lle_mean'), '.4f')} | {dp.get('pca_dim_90pct', 'N/A')} |")
+        lines.append(f"| Fully random | {_na(fr.get('lle_mean'), '.4f')} | {fr.get('pca_dim_90pct', 'N/A')} |")
+
+    # ── Phase 5: Advanced (optional) ─────────────────────────────────────────
+    adv_keys = [
+        ("virtual_stimulation", "5a Virtual Stimulation"),
+        ("energy_constraint", "5b Energy Constraint"),
+        ("controllability", "5c Controllability"),
+        ("information_flow", "5e Information Flow (TE)"),
+        ("critical_slowing_down", "5f Critical Slowing Down"),
+    ]
+    phase5_present = any(results.get(k) for k, _ in adv_keys)
+    if phase5_present:
+        _h(2, "Phase 5 — Advanced (optional)")
+        for key, title in adv_keys:
+            val = results.get(key)
+            if val and isinstance(val, dict):
+                _h(3, title)
+                for k2, v2 in val.items():
+                    if not isinstance(v2, (dict, list, np.ndarray)) and v2 is not None:
+                        lines.append(f"- **{k2}**: {v2}")
+
+    # ── Phase 6: Synthesis ────────────────────────────────────────────────────
+    _h(2, "Phase 6 — Synthesis")
+
+    # Consistency check
+    cons = report.get("consistency")
+    if cons:
+        _h(3, "Rosenstein LLE vs DMD Consistency")
+        _row("Rosenstein λ₁", _na(cons.get("rosenstein_lle"), ".5f"))
+        _row("DMD ρ (spectral radius)", _na(cons.get("dmd_spectral_radius"), ".4f"))
+        _row("LLE sign", cons.get("lle_sign", "N/A"))
+        _row("DMD regime", cons.get("rho_sign", "N/A"))
+        consistent = cons.get("consistent")
+        _row("Consistent", "✓ Yes" if consistent else "✗ No (see note)")
+        _row("Nonlinearity index Δ", _na(cons.get("nonlinearity_index"), ".4f"),
+             "Δ>1 → strong nonlinearity, DMD is reference only")
+        if cons.get("dmd_note"):
+            lines.append(f"  > ⚠ {cons['dmd_note']}")
+
+    # Hypotheses
+    hypotheses = report.get("hypotheses", {})
+    if hypotheses:
+        _h(3, "Hypothesis Evaluation")
+        lines.append("\n| Hypothesis | Question | Verdict | Evidence |")
+        lines.append("|-----------|---------|---------|---------|")
+        h_questions = {
+            "H1": "Low-rank spectral structure?",
+            "H2": "Low-dimensional dynamics?",
+            "H3": "Near-critical regime?",
+            "H4": "Brain-like oscillations?",
+            "H5": "Energy constraint maintains criticality?",
+        }
+        conf_flags = report.get("confidence_flags", {})
+        for h_id in sorted(hypotheses.keys()):
+            h = hypotheses[h_id]
+            verdict = h.get("verdict", "N/A")
+            summary = h.get("summary", "")
+            conf = conf_flags.get(h_id, "N/A")
+            q_txt = h_questions.get(h_id, "")
+            icon = "✓" if verdict == "SUPPORTED" else ("✗" if verdict == "NOT_SUPPORTED" else "○")
+            lines.append(
+                f"| **{h_id}** ({conf}) | {q_txt} | {icon} {verdict} | {summary} |"
+            )
+
+    # Confidence flags summary
+    if conf_flags:
+        _h(3, "Confidence Flags")
+        for h_id, flag in conf_flags.items():
+            lines.append(f"- **{h_id}**: {flag}")
+
+    # LLE audit
+    lle_audit = report.get("lle_audit", {})
+    if lle_audit:
+        _h(3, "LLE Multi-Source Audit")
+        for src, info in lle_audit.items():
+            if isinstance(info, dict):
+                tag = " *(analytical surrogate)*" if info.get("is_analytical_surrogate") else ""
+                lines.append(
+                    f"- **{src}**: {_na(info.get('value'), '.5f')}"
+                    f"  — {info.get('source', '')}{tag}"
+                )
+            elif src.startswith("_range"):
+                lines.append(f"- {src}: {info}")
+
+    # Validation table
+    vt = report.get("validation_table", [])
+    if vt:
+        _h(3, "9-Question Verification Table")
+        lines.append("\n| Q# | Question | Verdict | Evidence |")
+        lines.append("|---|---------|---------|---------|")
+        for row in vt:
+            qid = row.get("question_id", "?")
+            short = row.get("question_short", "?")
+            verdict = row.get("verdict", "?")
+            ev = str(row.get("evidence", ""))[:80]
+            verified = row.get("verified")
+            icon = "✓" if verified is True else ("○" if verified is None else "✗")
+            lines.append(f"| {icon} Q{qid} | {short} | {verdict} | {ev} |")
+
+    # Regime summary
+    regime = report.get("regime", "unknown")
+    lle_val = report.get("lle")
+    rho_val = report.get("dmd_rho")
+    _h(3, "Overall Summary")
+    lines.append(
+        f"| Metric | Value |"
+        f"\n|--------|-------|"
+        f"\n| Dynamical regime | **{regime}** |"
+        f"\n| Rosenstein LLE | **{_na(lle_val, '.5f')}** |"
+        f"\n| DMD spectral radius | **{_na(rho_val, '.4f')}** |"
+        f"\n| Connectivity source | {conn_src} |"
+        f"\n| Evidence grade | {ev_grade} |"
+    )
+
+    # Write file
+    md_text = "\n".join(lines) + "\n"
+    report_path = output_dir / "analysis_report.md"
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(md_text)
+    logger.info("  → AI analysis report saved: %s", report_path)
 
 
 def _build_validation_table(results: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1961,12 +2377,151 @@ def _run_phases_for_modality(
     run_phase3_dynamics(cfg, results, simulator, output_dir, modality=modality)
     run_phase4_validation(cfg, results, output_dir)
     run_phase5_advanced(cfg, results, simulator, output_dir, modality=modality)
-    run_phase6_synthesis(cfg, results, output_dir)
+    run_phase6_synthesis(cfg, results, output_dir, modality=modality)
 
     if cfg["output"].get("save_plots"):
         _save_summary_plots(results, output_dir, simulator)
 
     return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Both-mode summary helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _write_both_mode_summary(
+    output_dir: Path,
+    modalities: List[str],
+    all_results: Dict[str, Any],
+    elapsed: float,
+) -> None:
+    """Write a root-level summary for ``--modality both`` runs.
+
+    Creates two files in *output_dir*:
+
+    * ``both_mode_summary.json`` — machine-readable index with per-modality
+      paths and key metrics.
+    * ``analysis_report.md`` — human/AI-readable overview that links to each
+      modality's ``analysis_report.md`` and shows a side-by-side comparison
+      of the most important dynamics metrics.
+
+    This prevents confusion when users run ``--modality both`` into the same
+    directory as a previous ``joint`` or single-modality run: they now find
+    a clear index rather than stale per-modality reports.
+    """
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── JSON index ────────────────────────────────────────────────────────────
+    summary: Dict[str, Any] = {
+        "mode": "both",
+        "run_timestamp": ts,
+        "elapsed_seconds": round(elapsed, 1),
+        "modalities_run": modalities,
+        "results_directories": {
+            mod: str(output_dir / mod) for mod in modalities
+        },
+        "per_modality_metrics": {},
+    }
+
+    _KEY_METRICS = [
+        ("lyapunov", "mean_lyapunov"),
+        ("lyapunov", "chaos_regime"),
+        ("convergence", "distance_ratio"),
+        ("convergence", "convergence_label"),
+        ("dmd_spectrum", "spectral_radius"),
+        ("stability", "fraction_converged"),
+        ("stability", "fraction_limit_cycle"),
+        ("stability", "fraction_unstable"),
+    ]
+    for mod in modalities:
+        r = all_results.get(mod, {})
+        if "error" in r:
+            summary["per_modality_metrics"][mod] = {"error": r["error"]}
+            continue
+        m: Dict[str, Any] = {}
+        for section, key in _KEY_METRICS:
+            v = r.get(section)
+            if isinstance(v, dict):
+                raw = v.get(key)
+                if isinstance(raw, dict):
+                    raw = raw.get("regime", raw)  # chaos_regime → string
+                m[f"{section}.{key}"] = raw
+        summary["per_modality_metrics"][mod] = m
+
+    try:
+        with open(output_dir / "both_mode_summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+    except Exception as exc:
+        logger.warning("both-mode summary JSON write failed: %s", exc)
+
+    # ── Markdown overview ─────────────────────────────────────────────────────
+    lines: List[str] = []
+    lines.append("# Brain Dynamics Analysis — Both-Modality Mode\n")
+    lines.append(f"**Generated**: {ts}  ")
+    lines.append(f"**Total runtime**: {elapsed:.1f} s  ")
+    lines.append(f"**Modalities analysed**: {', '.join(modalities)}  \n")
+    lines.append(
+        "> **Note**: Each modality was run independently through the full "
+        "6-phase pipeline. Per-modality detailed reports are in the "
+        "sub-directories listed below. This file provides a comparative "
+        "overview only.\n"
+    )
+
+    lines.append("## Per-Modality Report Locations\n")
+    for mod in modalities:
+        rel = f"{mod}/analysis_report.md"
+        lines.append(f"- **{mod.upper()}**: `{output_dir / mod}/analysis_report.md`")
+    lines.append("")
+
+    lines.append("## Side-by-Side Key Metrics\n")
+    lines.append("| Metric | " + " | ".join(m.upper() for m in modalities) + " |")
+    lines.append("|--------|" + "|".join("-----" for _ in modalities) + "|")
+
+    _DISPLAY = [
+        ("LLE (Rosenstein λ₁)",   "lyapunov.mean_lyapunov"),
+        ("Chaos regime",           "lyapunov.chaos_regime"),
+        ("Convergence ratio",      "convergence.distance_ratio"),
+        ("Convergence label",      "convergence.convergence_label"),
+        ("DMD spectral radius ρ",  "dmd_spectrum.spectral_radius"),
+        ("Frac. converged",        "stability.fraction_converged"),
+        ("Frac. limit-cycle",      "stability.fraction_limit_cycle"),
+        ("Frac. unstable",         "stability.fraction_unstable"),
+    ]
+    for label, key in _DISPLAY:
+        vals = []
+        for mod in modalities:
+            v = summary["per_modality_metrics"].get(mod, {}).get(key)
+            if v is None:
+                vals.append("N/A")
+            elif isinstance(v, float):
+                vals.append(f"{v:.4f}")
+            else:
+                vals.append(str(v))
+        lines.append(f"| {label} | " + " | ".join(vals) + " |")
+
+    lines.append("\n## Interpretation Guide\n")
+    lines.append(
+        "When comparing modalities, expect **fMRI** and **EEG** to show "
+        "different dynamics: fMRI captures slow hemodynamic signals (TR ≈ 2 s) "
+        "and often exhibits convergence toward a limit-cycle attractor. EEG "
+        "captures fast electrical activity and may show higher Lyapunov exponents "
+        "and lower convergence. **This is normal and expected — not a bug.** "
+        "The `--modality both` flag is designed precisely to reveal these "
+        "differences.\n"
+    )
+    lines.append(
+        "> For joint analysis of fMRI + EEG in a single state vector, use "
+        "`--modality joint`.  Note that joint mode results can be scale-sensitive "
+        "(see `pipeline_report.json → metadata → modality` in each sub-directory)."
+    )
+
+    md_text = "\n".join(lines)
+    try:
+        with open(output_dir / "analysis_report.md", "w", encoding="utf-8") as f:
+            f.write(md_text)
+        logger.info("  both-mode summary: %s", output_dir / "analysis_report.md")
+    except Exception as exc:
+        logger.warning("both-mode summary Markdown write failed: %s", exc)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2151,6 +2706,10 @@ def run_pipeline(cfg: dict) -> Dict[str, Any]:
         "✓ Both-modality pipeline complete in %.1f s. Results in: %s/{%s}",
         elapsed, output_dir.resolve(), ",".join(modalities_to_run),
     )
+
+    # ── Write a root-level summary so users always find the right files ────────
+    _write_both_mode_summary(output_dir, modalities_to_run, all_results, elapsed)
+
     return all_results
 
 
