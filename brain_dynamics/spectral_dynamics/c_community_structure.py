@@ -385,6 +385,13 @@ def _degree_preserving_rewire_sym(
     pattern.  Only the upper triangle is operated on; the result is
     symmetrised before returning.
 
+    **Important**: this algorithm is designed for *sparse* binary/weighted
+    networks.  For dense matrices (most/all pairs have non-zero weights) the
+    "skip if proposed edge already exists" guard will reject virtually every
+    swap attempt, leaving the matrix unchanged and producing a null
+    distribution identical to the observed Q (z=0, p=1).  Use
+    :func:`_weight_permutation_null` instead for dense matrices.
+
     Args:
         W_sym:   Symmetric (N, N) non-negative weight matrix.
         n_swaps: Number of swap attempts.
@@ -427,41 +434,126 @@ def _degree_preserving_rewire_sym(
     return W_out
 
 
+def _weight_permutation_null(
+    W_sym: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Weight-permutation null model for *dense* symmetric matrices.
+
+    Randomly permutes all off-diagonal weights while preserving the diagonal
+    and the overall weight distribution.  This tests: "what Q would we expect
+    if the same set of edge weights were assigned randomly?"
+
+    Unlike Maslov-Sneppen rewiring, weight permutation does NOT preserve the
+    strength (degree) sequence.  However, for fully-connected FC matrices
+    (where every pair has a non-zero weight) Maslov-Sneppen cannot rewire at
+    all — so weight permutation is the only practical alternative.
+
+    Scientific rationale: for dense FC matrices derived from Pearson
+    correlations, nearly all off-diagonal entries are non-zero.  The
+    Maslov-Sneppen "skip if edge exists" guard rejects every proposed swap,
+    leaving the null matrix identical to the input → null Q = observed Q,
+    z = 0, p = 1 (degenerate result).  Weight permutation breaks the
+    community wiring pattern while keeping the magnitude distribution intact,
+    producing a meaningful null baseline.  See Watts & Strogatz (1998) and
+    Fornito et al. (2016, *Fundamentals of Brain Network Analysis*), §6.4.
+
+    Args:
+        W_sym:   Symmetric (N, N) non-negative weight matrix.
+        rng:     ``np.random.Generator`` instance.
+
+    Returns:
+        Permuted symmetric matrix with the same diagonal and weight
+        distribution as *W_sym*.
+    """
+    N = W_sym.shape[0]
+    W_out = W_sym.copy().astype(np.float64)
+    # Extract all upper-triangle indices (off-diagonal weights)
+    iu = np.triu_indices(N, k=1)
+    weights = W_out[iu].copy()
+    rng.shuffle(weights)
+    W_out[iu] = weights
+    # Reflect to lower triangle to maintain symmetry
+    W_out[(iu[1], iu[0])] = weights
+    return W_out
+
+
+# Fraction of upper-triangle non-zero entries above which a matrix is
+# considered "dense" and weight-permutation replaces Maslov-Sneppen rewiring.
+_DENSE_THRESHOLD = 0.50
+
+
 def compute_q_null_distribution(
     W_sym: np.ndarray,
     n_null: int = 100,
     seed: int = 42,
     louvain_seed: int = 42,
-) -> List[float]:
-    """Generate a null Q distribution via degree-preserving random rewiring.
+) -> Tuple[List[float], str]:
+    """Generate a null Q distribution for modularity significance testing.
 
-    For each of ``n_null`` realisations, rewires ``W_sym`` using the
-    Maslov-Sneppen algorithm (preserving the strength/degree sequence),
-    then runs the same community-detection algorithm (Louvain if available,
-    otherwise best spectral-clustering k) and records the resulting Q.
+    Selects the appropriate null-model strategy based on matrix density:
 
-    The null distribution answers: "what Q would we expect if the FC
-    matrix had this degree sequence but random wiring?"
+    * **Sparse** matrices (≤50 % non-zero upper-triangle entries):
+      Maslov-Sneppen degree-preserving rewiring (Maslov & Sneppen, 2002).
+      Preserves the strength sequence.  Answers: "what Q if FC had the same
+      degree sequence but random wiring?"
+
+    * **Dense** matrices (>50 % non-zero, typical for brain FC):
+      Weight-permutation null model.  Preserves the weight magnitude
+      distribution but randomises which node-pairs carry which weights.
+      Answers: "what Q if the same weights were randomly reassigned?"
+
+    For each of ``n_null`` realisations the same community-detection algorithm
+    used on the real network (Louvain if available, otherwise best spectral-
+    clustering k) is run and the resulting Q is recorded.
 
     Args:
-        W_sym:        Symmetric (N, N) FC matrix.
+        W_sym:        Symmetric (N, N) FC matrix (non-negative weights).
         n_null:       Number of null networks to generate.
-        seed:         RNG seed for rewiring.
+        seed:         RNG seed for rewiring / permutation.
         louvain_seed: Seed passed to Louvain / spectral clustering.
 
     Returns:
-        List of Q values from the null networks (length ``n_null``).
+        Tuple ``(null_qs, null_model_type)`` where *null_qs* is a list of
+        Q values (length ``n_null``) and *null_model_type* is either
+        ``"maslov_sneppen"`` or ``"weight_permutation"``.
     """
     rng = np.random.default_rng(seed)
     N = W_sym.shape[0]
-    # Use 10×|E| swap attempts — standard practice for thorough rewiring
-    n_edges = int(np.sum(np.triu(W_sym, k=1) != 0))
-    n_swaps = max(n_edges * 10, 100)
+
+    # Determine null-model strategy from matrix density
+    n_upper = N * (N - 1) // 2
+    n_nonzero = int(np.sum(np.triu(W_sym, k=1) != 0))
+    density = n_nonzero / max(n_upper, 1)
+
+    if density > _DENSE_THRESHOLD:
+        null_model_type = "weight_permutation"
+        logger.info(
+            "  Null model: weight permutation (density=%.1f%% > %.0f%% threshold). "
+            "Maslov-Sneppen rewiring is inapplicable for dense FC matrices — "
+            "virtually all swap attempts are rejected because every pair already "
+            "has a non-zero weight. Weight permutation randomises the wiring "
+            "while preserving the overall weight distribution.",
+            density * 100, _DENSE_THRESHOLD * 100,
+        )
+    else:
+        null_model_type = "maslov_sneppen"
+        # Use 10×|E| swap attempts — standard practice for thorough rewiring
+        n_swaps = max(n_nonzero * 10, 100)
+        logger.info(
+            "  Null model: Maslov-Sneppen rewiring (density=%.1f%% ≤ %.0f%% threshold, "
+            "n_swaps=%d).",
+            density * 100, _DENSE_THRESHOLD * 100, n_swaps,
+        )
 
     null_qs: List[float] = []
     for i in range(n_null):
-        W_rand = _degree_preserving_rewire_sym(W_sym, n_swaps, rng)
-        louvain_result = _try_louvain(W_rand, seed=louvain_seed)
+        if null_model_type == "weight_permutation":
+            W_rand = _weight_permutation_null(W_sym, rng)
+        else:
+            W_rand = _degree_preserving_rewire_sym(W_sym, n_swaps, rng)  # type: ignore[arg-type]
+
+        louvain_result = _try_louvain(W_rand, seed=louvain_seed + i)
         if louvain_result is not None:
             _, q_rand = louvain_result
         else:
@@ -469,7 +561,7 @@ def compute_q_null_distribution(
             k_range = [k for k in _DEFAULT_K_RANGE if 2 <= k < N]
             q_rand = -np.inf
             for k in k_range:
-                lbl = spectral_community_detection(W_rand, k=k, seed=louvain_seed)
+                lbl = spectral_community_detection(W_rand, k=k, seed=louvain_seed + i)
                 q = compute_modularity_q(W_rand, lbl)
                 if q > q_rand:
                     q_rand = q
@@ -477,7 +569,7 @@ def compute_q_null_distribution(
         if (i + 1) % 10 == 0:
             logger.debug("  Q null %d/%d: q_rand=%.4f", i + 1, n_null, q_rand)
 
-    return null_qs
+    return null_qs, null_model_type
 
 
 def q_significance_test(
@@ -524,6 +616,7 @@ def _try_plot_q_null_distribution(
     sig: Dict,
     output_path: Path,
     label: str,
+    null_model_type: str = "unknown",
 ) -> None:
     """Histogram of null Q distribution with observed Q marked."""
     try:
@@ -549,7 +642,7 @@ def _try_plot_q_null_distribution(
     ax.set_xlabel("Modularity Q")
     ax.set_ylabel("Count")
     ax.set_title(
-        f"Q Null Distribution (degree-preserving rewiring)  [{label}]\n"
+        f"Q Null Distribution ({null_model_type})  [{label}]\n"
         f"z={z:.2f}, p={p:.4f} — {sig_txt}"
     )
     ax.legend(fontsize=8)
@@ -656,18 +749,21 @@ def run_community_structure(
         "k_q_pairs": k_q_pairs,
     }
 
-    # ── Q significance test (null distribution via degree-preserving rewiring) ─
+    # ── Q significance test (null distribution) ──────────────────────────────
     null_qs: Optional[List[float]] = None
+    null_model_type: Optional[str] = None
     if n_null > 0:
         logger.info(
-            "  Q 显著性检验: 生成 %d 个度序列保持随机网络（Maslov-Sneppen）…", n_null
+            "  Q 显著性检验: 生成 %d 个随机网络零分布…", n_null
         )
-        null_qs = compute_q_null_distribution(W_sym, n_null=n_null, seed=seed)
+        null_qs, null_model_type = compute_q_null_distribution(W_sym, n_null=n_null, seed=seed)
         sig = q_significance_test(float(Q), null_qs)
+        sig["null_model"] = null_model_type
         result["q_significance"] = sig
         sig_str = "显著 ✓" if sig["significant"] else "不显著"
         logger.info(
-            "  Q 显著性: Q=%.4f, null mean=%.4f±%.4f, z=%.2f, p=%.4f (%s)",
+            "  Q 显著性 [%s]: Q=%.4f, null mean=%.4f±%.4f, z=%.2f, p=%.4f (%s)",
+            null_model_type,
             Q, sig["null_mean"], sig["null_std"],
             sig["z_score"], sig["p_value"], sig_str,
         )
@@ -704,6 +800,7 @@ def run_community_structure(
                 result.get("q_significance", {}),
                 out / f"community_q_null_distribution_{label}.png",
                 label,
+                null_model_type=null_model_type or "unknown",
             )
 
     return result
