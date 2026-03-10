@@ -814,8 +814,8 @@ def run_phase4_validation(cfg: dict, results: Dict[str, Any],
             results["embedding_dimension"] = emb
             logger.info(
                 "  Embedding: FNN_dim=%s, D₂=%.2f",
-                emb.get("fnn_min_dim", "?"),
-                emb.get("correlation_dimension", float("nan")),
+                emb.get("fnn", {}).get("min_sufficient_dim", "?"),
+                emb.get("corr_dim", {}).get("D2", float("nan")),
             )
         except Exception as e:
             logger.warning("  Embedding dimension failed: %s", e)
