@@ -96,12 +96,21 @@ def _add_low_dim_drive(
 # ---------------------------------------------------------------------------
 
 def _compute_d2(trajs: np.ndarray) -> float:
+    """Estimate correlation dimension D2.
+
+    Passes the first trajectory as a 2-D array (T × N) to
+    ``correlation_dimension``, which requires a 2-D input.
+    """
     try:
         from analysis.embedding_dimension import correlation_dimension
-        flat = trajs[:, :, 0].reshape(-1)
-        return float(correlation_dimension(flat, max_dim=20, n_points=2000))
-    except Exception as exc:
+        traj = trajs[0].astype(np.float64)   # (T, N)
+        result = correlation_dimension(traj, max_points=2000)
+        return float(result["D2"])
+    except (ImportError, KeyError, ValueError) as exc:
         logger.debug("D2 failed: %s", exc)
+        return float("nan")
+    except Exception as exc:
+        logger.debug("D2 unexpected error: %s", exc)
         return float("nan")
 
 
@@ -117,21 +126,12 @@ def _compute_pca_dim(trajs: np.ndarray, var_threshold: float = 0.90) -> int:
 
 
 def _compute_lle(trajs: np.ndarray) -> float:
-    try:
-        from analysis.lyapunov import run_lyapunov_analysis
-        result = run_lyapunov_analysis(
-            trajectories=trajs,
-            method="rosenstein",
-            max_lag=50,
-            min_sep=20,
-            n_segments=1,
-        )
-        return float(result.get("primary_mean", float("nan")))
-    except Exception as exc:
-        logger.debug("LLE failed: %s", exc)
-        return float("nan")
-
-
+    """Estimate LLE using shared Rosenstein helper from random_comparison."""
+    from analysis.random_comparison import avg_rosenstein_lle
+    lle = avg_rosenstein_lle(trajs)
+    if np.isnan(lle):
+        logger.debug("LLE returned NaN for this condition.")
+    return lle
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------

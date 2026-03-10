@@ -65,23 +65,24 @@ _STD_GUARD = 1e-8
 # ---------------------------------------------------------------------------
 
 def _lle(trajs: np.ndarray) -> float:
-    try:
-        from analysis.lyapunov import run_lyapunov_analysis
-        r = run_lyapunov_analysis(
-            trajectories=trajs, method="rosenstein",
-            max_lag=50, min_sep=20, n_segments=1,
-        )
-        return float(r.get("primary_mean", float("nan")))
-    except Exception:
-        return float("nan")
+    """Estimate LLE using Rosenstein method averaged over all trajectories."""
+    from analysis.random_comparison import avg_rosenstein_lle
+    return avg_rosenstein_lle(trajs)
 
 
 def _d2(trajs: np.ndarray) -> float:
+    """Estimate correlation dimension D2 on the first trajectory (T × N).
+
+    Uses the first trajectory as a 2-D array so ``correlation_dimension``
+    receives its expected 2-D input.
+    """
     try:
         from analysis.embedding_dimension import correlation_dimension
-        flat = trajs[:, :, 0].reshape(-1)
-        return float(correlation_dimension(flat, max_dim=20, n_points=1000))
-    except Exception:
+        traj = trajs[0].astype(np.float64)   # (T, N)
+        result = correlation_dimension(traj, max_points=1000)
+        return float(result["D2"])
+    except Exception as exc:
+        logger.debug("_d2 failed: %s", exc)
         return float("nan")
 
 

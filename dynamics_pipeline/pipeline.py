@@ -102,6 +102,12 @@ def _get_square_connectivity(
       3. Functional connectivity (Pearson) derived from free-dynamics
          trajectories — always N×N.
 
+    **NOTE for E5 (phase diagram)**: FC should be avoided for spectral-radius
+    analysis because its Marchenko-Pastur bulk makes ρ(FC) >> 1 even for stable
+    dynamics.  The DMD operator is preferred when the response matrix is
+    non-square, because it represents the best linear approximation of the
+    GNN Jacobian at the attractor.
+
     Returns None when no square matrix can be constructed.
     """
     R = results.get("response_matrix")
@@ -111,8 +117,7 @@ def _get_square_connectivity(
     # Non-square response matrix (n_nodes × N_regions): prefer DMD operator.
     if R is not None and R.ndim == 2 and R.shape[0] != R.shape[1]:
         logger.info(
-            "  Response matrix is non-square (%s); falling back to "
-            "square connectivity for Phase 5 analyses.",
+            "  Response matrix is non-square (%s); trying DMD operator next.",
             "×".join(str(d) for d in R.shape),
         )
 
@@ -123,12 +128,18 @@ def _get_square_connectivity(
         logger.info("  Using DMD operator (N=%d) as square connectivity.", dmd_A.shape[0])
         return dmd_A
 
-    # Fall back to FC from trajectories
+    # Fall back to FC from trajectories — NOTE: ρ(FC) is typically >> 1 due to
+    # Marchenko-Pastur bulk; E5 spectral-radius conclusions will be unreliable.
     if trajs is not None:
         stacked = trajs.reshape(-1, trajs.shape[-1])
         W_fc = np.corrcoef(stacked.T)
         W_fc = np.nan_to_num(W_fc, nan=0.0)
-        logger.info("  Using FC from trajectories (N=%d) as square connectivity.", W_fc.shape[0])
+        logger.warning(
+            "  _get_square_connectivity: falling back to FC (N=%d). "
+            "ρ(FC) >> 1 — E5 phase-diagram results will be unreliable. "
+            "Enable dmd_spectrum in config for a better linearisation.",
+            W_fc.shape[0],
+        )
         return W_fc
 
     return None

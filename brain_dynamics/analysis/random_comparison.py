@@ -44,6 +44,102 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared trajectory-metric helpers (imported by node_ablation,
+# input_dimension_control, and this module)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def avg_rosenstein_lle(
+    trajs: np.ndarray,
+    max_lag: int = 50,
+    min_temporal_sep: int = 20,
+) -> float:
+    """Estimate LLE by averaging Rosenstein estimates across all trajectories.
+
+    Calls ``rosenstein_lyapunov`` directly (no simulator required) on each
+    trajectory (shape T × N) and returns the mean of finite values.
+
+    Args:
+        trajs:             shape (n_traj, T, N).
+        max_lag:           Rosenstein maximum tracking lag.
+        min_temporal_sep:  Minimum temporal separation for nearest-neighbour.
+
+    Returns:
+        Mean LLE (float); NaN when no finite estimate could be obtained.
+    """
+    try:
+        from analysis.lyapunov import rosenstein_lyapunov
+        vals = []
+        for traj in trajs:   # traj: (T, N)
+            lle, _ = rosenstein_lyapunov(
+                traj.astype(np.float64),
+                max_lag=max_lag,
+                min_temporal_sep=min_temporal_sep,
+            )
+            if np.isfinite(lle):
+                vals.append(lle)
+        if not vals:
+            logger.warning(
+                "avg_rosenstein_lle: all %d trajectories returned NaN. "
+                "Check that T >> max_lag (%d) and N is reasonable.",
+                len(trajs), max_lag,
+            )
+            return float("nan")
+        return float(np.mean(vals))
+    except Exception as exc:
+        logger.debug("avg_rosenstein_lle failed: %s", exc)
+        return float("nan")
+
+
+def _degree_preserving_rewire(
+    W: np.ndarray,
+    n_swaps: int,
+    seed: int = 0,
+) -> np.ndarray:
+    """Maslov-Sneppen degree-preserving rewire with an absolute swap count.
+
+    Identical logic to ``spectral_dynamics.e4_structural_perturbation
+    .degree_preserving_rewire`` but accepts *n_swaps* as an absolute integer
+    (rather than a factor × nnz), so callers can control the randomisation
+    budget directly.
+
+    Args:
+        W:       Square connectivity matrix (N, N).
+        n_swaps: Total number of attempted edge swaps.
+        seed:    Random seed.
+
+    Returns:
+        W_rewired: Same shape as W, edges randomly rewired.
+    """
+    rng = np.random.default_rng(seed)
+    W_out = W.copy().astype(np.float32)
+    rows, cols = np.where(W_out != 0)
+    n_edges = len(rows)
+    if n_edges < 4:
+        logger.warning("Too few edges (%d) for degree-preserving rewire.", n_edges)
+        return W_out
+
+    for _ in range(n_swaps):
+        # Use replace=False to guarantee two distinct indices in one call
+        idx = rng.choice(n_edges, size=2, replace=False)
+        i, j = int(rows[idx[0]]), int(cols[idx[0]])
+        k, l = int(rows[idx[1]]), int(cols[idx[1]])
+        if i == l or k == j:
+            continue
+        if W_out[i, l] != 0 or W_out[k, j] != 0:
+            continue
+        wij = W_out[i, j]
+        wkl = W_out[k, l]
+        W_out[i, j] = 0.0
+        W_out[k, l] = 0.0
+        W_out[i, l] = wij
+        W_out[k, j] = wkl
+        rows[idx[0]], cols[idx[0]] = i, l
+        rows[idx[1]], cols[idx[1]] = k, j
+
+    return W_out
+
+
 def _make_random_dynamics_matrix(
     n_regions: int,
     target_spectral_radius: float = 0.9,
