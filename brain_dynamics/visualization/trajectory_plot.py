@@ -95,6 +95,9 @@ def plot_pca_trajectories(
         trajectories:   shape (n_init, steps, n_regions)。
         max_show:       2D/3D 子图最多显示的轨迹数（避免遮挡，默认 50）。
         burnin:         跳过每条轨迹前几步（消除瞬态，默认 0）。
+                        PCA 主成分方向从全部 post-burnin 步中拟合（统计稳定）。
+                        但相图绘制仅使用每条轨迹 post-burnin 后的 **后 50%** 步，
+                        以避免早期向吸引子的过渡动力学污染相图几何。
         train_fraction: PCA 拟合时使用的参考轨迹比例（默认 70%）。
                         仅在参考（训练）轨迹上拟合 PCA，其余轨迹投影到
                         该子空间，避免测试集信息泄漏到主成分方向。
@@ -117,11 +120,23 @@ def plot_pca_trajectories(
     # subspace.  This matches the recommendation from check_pca_leakage().
     # When n_traj < 2 (single trajectory), n_ref == n_traj and the split is
     # effectively bypassed — PCA is fitted on the only available trajectory.
-    traj_use = trajectories[:, burnin:, :]            # (n_traj, T, N)
-    T = traj_use.shape[1]
+    traj_use = trajectories[:, burnin:, :]            # (n_traj, T_full, N)
+    T_full = traj_use.shape[1]
     n_ref = max(1, int(n_traj * train_fraction))
-    ref_states = traj_use[:n_ref].reshape(-1, n_regions)   # training set only
-    all_states = traj_use.reshape(-1, n_regions)            # used for density plot
+    ref_states = traj_use[:n_ref].reshape(-1, n_regions)   # training set only — FULL data
+
+    # ── Phase portrait: last 50% only ────────────────────────────────────────
+    # The first half of each trajectory may still contain transient dynamics
+    # (especially from the initial x0 injection and the first few prediction
+    # chunks).  Phase portrait panels show only the last half of post-burnin
+    # steps so the visualisation reflects the settled attractor geometry rather
+    # than the approach transient.
+    # PCA direction is still determined from the FULL post-burnin data above
+    # (ref_states) for statistical robustness; only the projection+plot is limited.
+    T_half = T_full // 2
+    traj_plot = traj_use[:, T_half:, :]               # (n_traj, T, N) — last 50%
+    T = traj_plot.shape[1]
+    all_states = traj_plot.reshape(-1, n_regions)      # used for density plot
 
     n_components = min(3, n_regions, len(ref_states) - 1)
     pca = PCA(n_components=n_components, random_state=42)
@@ -140,10 +155,10 @@ def plot_pca_trajectories(
     # Evenly sample across trajectory indices for diversity
     idx_show = np.linspace(0, n_traj - 1, show_n, dtype=int)
 
-    # ── Project all shown trajectories ────────────────────────────────────────
+    # ── Project the LAST-50% portion of each shown trajectory ─────────────────
     # proj2d: list of (T, 2), proj3d: list of (T, 3)
-    proj2d = [pca.transform(traj_use[i])[:, :2] for i in idx_show]
-    proj3d = ([pca.transform(traj_use[i])[:, :3] for i in idx_show]
+    proj2d = [pca.transform(traj_plot[i])[:, :2] for i in idx_show]
+    proj3d = ([pca.transform(traj_plot[i])[:, :3] for i in idx_show]
               if n_components >= 3 else None)
 
     # ── Build time-gradient colormap segments ─────────────────────────────────
@@ -198,15 +213,14 @@ def plot_pca_trajectories(
     cb.set_label("Time step", fontsize=8)
     ax_2d.set_xlabel(pc1_lbl, fontsize=9)
     ax_2d.set_ylabel(pc2_lbl, fontsize=9)
-    ax_2d.set_title("PCA Trajectories\n(blue=start → red=end)", fontsize=10)
+    ax_2d.set_title("PCA Trajectories (last 50%)\n(blue=start → red=end)", fontsize=10)
     ax_2d.grid(True, alpha=0.25)
 
     # ── Panel 2: Density heatmap of all visited states ────────────────────────
-    # Use ALL post-burnin steps: this captures BOTH the early context-guided
-    # oscillatory phase (where trajectories orbit the attractor) and the later
-    # free-run phase.  The combination produces the expected ring-like density
-    # (orbit path) converging toward a bright spot (free-run attractor), which
-    # correctly reflects near-critical bounded-chaos dynamics.
+    # Use the last-50% post-burnin steps: avoids contamination from the early
+    # transient (approach to attractor) that biases the density toward the
+    # trajectory start region.  The last half represents the settled
+    # attractor geometry / invariant measure.
     all_2d = np.vstack(proj2d)               # (show_n*T, 2)
     # 2D histogram as density proxy
     x_range = (all_2d[:, 0].min(), all_2d[:, 0].max())

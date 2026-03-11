@@ -722,10 +722,34 @@ def run_pca_attractor(
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
 
-        # Save first 20 PCs
+        # Save first 20 PCs  (full post-burnin data for downstream analysis)
         np.save(
             out / f"pca_projections_{label}.npy",
             pca_result["X_pca"][:, :min(20, pca_result["n_components"])]
+        )
+
+        # ── Phase portrait visualisation: last 50% of each trajectory ────────
+        # PCA statistics (pca_result) are computed on ALL post-burnin steps
+        # (T_eff per trajectory) for statistical robustness.
+        # Visual plots use only the LAST 50% (T_eff_plot steps per trajectory)
+        # to avoid contamination from the initial transient approach to the
+        # attractor.  When T_eff is very short (< 4 steps), fall back to using
+        # all available steps.
+        n_pcs = pca_result["n_components"]
+        T_eff_skip = T_eff // 2
+        T_eff_plot = T_eff - T_eff_skip
+        if T_eff_plot >= 4 and n_pcs >= 1:
+            X_pca_plot = (
+                pca_result["X_pca"]
+                .reshape(n_traj, T_eff, n_pcs)[:, T_eff_skip:, :]
+                .reshape(-1, n_pcs)
+            )
+        else:
+            T_eff_plot = T_eff
+            X_pca_plot = pca_result["X_pca"]
+        logger.info(
+            "  Phase portrait: showing last %d of %d steps per traj (%.0f%%)",
+            T_eff_plot, T_eff, 100.0 * T_eff_plot / max(T_eff, 1),
         )
 
         _try_plot_variance_curve(
@@ -737,38 +761,37 @@ def run_pca_attractor(
         )
 
         _try_plot_attractor_2d(
-            pca_result["X_pca"],
+            X_pca_plot,
             n_traj=n_traj,
-            steps_per_traj=T_eff,
+            steps_per_traj=T_eff_plot,
             output_path=out / f"attractor_projection_2d_{label}.png",
             label=label,
         )
 
         _try_plot_attractor_3d(
-            pca_result["X_pca"],
+            X_pca_plot,
             n_traj=n_traj,
-            steps_per_traj=T_eff,
+            steps_per_traj=T_eff_plot,
             output_path=out / f"attractor_projection_3d_{label}.png",
             label=label,
         )
 
         # ── New Test 2a: Phase Portrait (pair-wise PC projections) ──────────
-        X_pca = pca_result["X_pca"]
         evr = pca_result["explained_variance_ratio"]
-        if X_pca.shape[1] >= 2:
+        if X_pca_plot.shape[1] >= 2:
             _try_plot_phase_portrait_pair(
-                X_pca, n_traj, T_eff, evr,
+                X_pca_plot, n_traj, T_eff_plot, evr,
                 pc_a=0, pc_b=1,
                 output_path=out / "phase_portrait_pc1_pc2.png",
             )
-        if X_pca.shape[1] >= 3:
+        if X_pca_plot.shape[1] >= 3:
             _try_plot_phase_portrait_pair(
-                X_pca, n_traj, T_eff, evr,
+                X_pca_plot, n_traj, T_eff_plot, evr,
                 pc_a=0, pc_b=2,
                 output_path=out / "phase_portrait_pc1_pc3.png",
             )
             _try_plot_phase_portrait_pair(
-                X_pca, n_traj, T_eff, evr,
+                X_pca_plot, n_traj, T_eff_plot, evr,
                 pc_a=1, pc_b=2,
                 output_path=out / "phase_portrait_pc2_pc3.png",
             )
@@ -794,8 +817,22 @@ def run_pca_attractor(
         result["delay_embed_obs_method"] = obs_method
         result["delay_embed_corr"] = round(float(tau_corr), 4) if np.isfinite(tau_corr) else None
         if T_embed > 0:
+            # Crop delay portrait to last 50% for visual plots (same rationale as PCA).
+            m_delay = X_delay.shape[1]
+            T_embed_skip = T_embed // 2
+            T_embed_plot = T_embed - T_embed_skip
+            if T_embed_plot >= 4 and m_delay >= 1:
+                X_delay_plot = (
+                    X_delay
+                    .reshape(n_traj, T_embed, m_delay)[:, T_embed_skip:, :]
+                    .reshape(-1, m_delay)
+                )
+            else:
+                T_embed_plot = T_embed
+                X_delay_plot = X_delay
+
             _try_plot_delay_portrait(
-                X_delay, n_traj=n_traj, steps_per_traj=T_embed, tau=tau_used,
+                X_delay_plot, n_traj=n_traj, steps_per_traj=T_embed_plot, tau=tau_used,
                 obs_method=obs_method, tau_corr=tau_corr,
                 output_path=out / "phase_portrait_delay_embed.png",
             )
@@ -803,8 +840,8 @@ def run_pca_attractor(
             # ── Combined manifold portrait (primary output) ───────────────────
             # 4-panel figure: PCA linear + Takens nonlinear, density + trajectories
             _try_plot_manifold_portrait(
-                pca_result["X_pca"], X_delay,
-                n_traj=n_traj, T_eff=T_eff, T_embed=T_embed,
+                X_pca_plot, X_delay_plot,
+                n_traj=n_traj, T_eff=T_eff_plot, T_embed=T_embed_plot,
                 tau=tau_used, evr=pca_result["explained_variance_ratio"],
                 obs_method=obs_method, tau_corr=tau_corr,
                 output_path=out / "manifold_portrait.png",
@@ -815,8 +852,8 @@ def run_pca_attractor(
             # This is guaranteed to reveal attractor structure even for convergent
             # or drift-dominated trajectories where the position portrait is diagonal.
             _try_plot_velocity_portrait(
-                pca_result["X_pca"],
-                n_traj=n_traj, T_eff=T_eff,
+                X_pca_plot,
+                n_traj=n_traj, T_eff=T_eff_plot,
                 evr=pca_result["explained_variance_ratio"],
                 output_path=out / "velocity_portrait.png",
             )
@@ -824,7 +861,9 @@ def run_pca_attractor(
             # ── New Test 3: Poincaré Section (delay-embedding coordinates) ────
             # Use delay-embedding coordinates instead of PC coordinates so the
             # section reflects the true attractor geometry (not a linear shadow).
-            poincare = compute_poincare_section(X_delay, n_traj, T_embed)
+            # Use the last-50% delay data so the Poincaré section is not
+            # contaminated by transient zero-crossings.
+            poincare = compute_poincare_section(X_delay_plot, n_traj, T_embed_plot)
             result["poincare_n_crossings"] = poincare["n_crossings"]
             result["poincare_interpretation"] = poincare["interpretation"]
             np.save(out / "poincare_points.npy", poincare["points"])
