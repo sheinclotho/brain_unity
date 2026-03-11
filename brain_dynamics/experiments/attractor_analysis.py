@@ -136,11 +136,37 @@ def run_attractor_analysis(
     logger.info("  KMeans 最优 K=%d, silhouette=%.4f", best_k, best_sil or -1.0)
     _report_basin(basin)
 
+    # ── Continuous / ring attractor detection ─────────────────────────────────
+    # When all K clusters are nearly equal-sized AND the silhouette score is very
+    # high, this is the canonical signature of K-means cutting through a
+    # ring / continuous attractor rather than identifying discrete basins.
+    # On a ring, K-means always produces K ≈ equal slices with tightly packed
+    # intra-cluster distances → high silhouette, but the "attractors" are not
+    # discrete: they are locations along a single continuous manifold.
+    ca_suspect, ca_reason = _uniform_cluster_check(
+        basin=basin, silhouette=best_sil, dbscan_k=0  # DBSCAN checked below
+    )
+
     # ── DBSCAN (alternative / validation) ─────────────────────────────────────
     db = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples)
     db_labels = db.fit_predict(final_states)
     db_n_clusters = len(set(db_labels)) - (1 if -1 in db_labels else 0)
     logger.info("  DBSCAN 检测到 %d 个吸引子（噪声点排除后）", db_n_clusters)
+
+    # DBSCAN=1 + KMeans=4 with high silhouette is an additional ring-attractor flag
+    if db_n_clusters <= 1 and best_k >= 3 and (best_sil or 0) > 0.90:
+        ca_suspect = True
+        ca_reason = (
+            f"DBSCAN=1 cluster + KMeans={best_k} (silhouette={best_sil:.4f}) — "
+            "K-means may be segmenting a single continuous manifold"
+        )
+    if ca_suspect:
+        logger.warning(
+            "  ⚠ CONTINUOUS ATTRACTOR SUSPECT: %s. "
+            "The %d clusters may reflect positions on a ring/line attractor, "
+            "not separate discrete basins. Interpret 'n_attractors' with caution.",
+            ca_reason, best_k,
+        )
 
     results = {
         "final_states": final_states,
@@ -151,6 +177,8 @@ def run_attractor_analysis(
         "silhouette_score": best_sil,
         "dbscan_labels": db_labels,
         "dbscan_n_clusters": db_n_clusters,
+        "continuous_attractor_suspect": ca_suspect,
+        "continuous_attractor_reason": ca_reason if ca_suspect else None,
     }
 
     if output_dir is not None:
@@ -182,3 +210,46 @@ def _report_basin(basin: Dict[int, float]) -> None:
     for cid, frac in sorted(basin.items()):
         label = labels[cid] if cid < len(labels) else str(cid)
         logger.info("  Attractor %s : %.1f%%", label, frac * 100)
+
+
+def _uniform_cluster_check(
+    basin: Dict[int, float],
+    silhouette: Optional[float],
+    dbscan_k: int = 0,
+    uniform_tol: float = 0.08,
+    high_sil_thresh: float = 0.90,
+) -> tuple:
+    """Check whether the KMeans result looks like a ring/continuous attractor.
+
+    A ring attractor cut by KMeans(K) produces:
+      - All cluster fractions ≈ 1/K  (within ``uniform_tol``)
+      - Silhouette score > ``high_sil_thresh`` (tightly packed intra-cluster
+        distances due to locality on the ring)
+
+    Parameters
+    ----------
+    basin         : {cluster_id: fraction} from KMeans
+    silhouette    : KMeans silhouette score (None = unknown)
+    dbscan_k      : DBSCAN cluster count (unused here, checked by caller)
+    uniform_tol   : max allowed absolute deviation from 1/K per cluster
+    high_sil_thresh : silhouette must exceed this to trigger the flag
+
+    Returns
+    -------
+    (suspect: bool, reason: str)
+    """
+    K = len(basin)
+    if K < 2:
+        return False, ""
+    expected = 1.0 / K
+    fracs = list(basin.values())
+    max_dev = max(abs(f - expected) for f in fracs)
+    is_uniform = max_dev <= uniform_tol
+    is_high_sil = (silhouette is not None) and (silhouette > high_sil_thresh)
+    if is_uniform and is_high_sil:
+        return True, (
+            f"all {K} clusters are nearly equal-sized "
+            f"(max deviation from 1/{K} = {max_dev:.3f} ≤ {uniform_tol}), "
+            f"silhouette={silhouette:.4f} > {high_sil_thresh}"
+        )
+    return False, ""
