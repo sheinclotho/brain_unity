@@ -109,10 +109,13 @@ _ACF_MIN_LAG: int = 5                 # skip near-zero lags in secondary-peak se
 # Between-trajectory consistency threshold for attractor warning
 _BETWEEN_TRAJ_CV_ATTRACTOR: float = 0.05  # delta_ratio CV < this → single global attractor
 
-# Threshold for complex_oscillation: delta_ratio > meta but ACF too weak for LC.
-# This covers edge-of-chaos systems with many competing Hopf modes (e.g. joint mode
-# where n_Hopf=88 and ACF secondary peaks are present but not dominant).
-_ADAPTIVE_COMPLEX_OSC_ACF: float = 0.20  # acf_score > this + dr > meta → complex_oscillation
+# ACF score threshold for complex_oscillation (C6 branch in classify_dynamics_adaptive).
+# Applies when delta_ratio > metastable threshold but ACF secondary-peak score is too
+# weak for a clear limit_cycle (acf_score < _ADAPTIVE_LC_ACF_STRONG = 0.35).
+# acf_score in [0.20, 0.35] indicates broadband oscillatory structure without a
+# single dominant period — typical of edge-of-chaos systems with many competing
+# Hopf modes (e.g. DMD n_Hopf >> 1).  Label: "complex_oscillation".
+_ADAPTIVE_COMPLEX_OSC_ACF: float = 0.20
 
 # ── Empty classification count template (shared by run_stability_analysis) ───
 _EMPTY_CLASS_COUNTS: Dict[str, int] = {

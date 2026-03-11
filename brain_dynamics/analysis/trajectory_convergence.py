@@ -31,6 +31,14 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# ── Convergence label thresholds ──────────────────────────────────────────────
+# final_dist / initial_dist ratio thresholds for trajectory convergence labels.
+# Based on Kantz & Schreiber (1997) §7: ratio < 0.70 indicates clear attractor
+# basin structure; 0.70–0.90 indicates soft basin or ring attractor.
+_CONVERGING_THRESH: float = 0.70
+_WEAKLY_CONVERGING_THRESH: float = 0.90
+_DIVERGING_THRESH: float = 1.30
+
 
 def compute_pairwise_distances(
     trajectories: np.ndarray,
@@ -103,11 +111,11 @@ def _convergence_label(ratio: float) -> str:
         ratio > 1.30 → ``"diverging"``     (Lyapunov-driven separation)
         otherwise   → ``"no_structure"``   (no clear tendency)
     """
-    if ratio < 0.70:
+    if ratio < _CONVERGING_THRESH:
         return "converging"
-    if ratio < 0.90:
+    if ratio < _WEAKLY_CONVERGING_THRESH:
         return "weakly_converging"
-    if ratio > 1.30:
+    if ratio > _DIVERGING_THRESH:
         return "diverging"
     return "no_structure"
 

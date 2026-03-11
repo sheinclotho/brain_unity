@@ -3094,9 +3094,14 @@ def _compute_cross_modal_q9(
     # ── 2. LLE ratio ─────────────────────────────────────────────────────────
     lle1 = fmri_r.get("lyapunov", {}).get("mean_lyapunov")
     lle2 = eeg_r.get("lyapunov", {}).get("mean_lyapunov")
-    if lle1 is not None and lle2 is not None and abs(lle1) + abs(lle2) > 1e-12:
-        lle_ratio = lle1 / (lle2 + 1e-12)
-        lle_close = 0.2 <= lle_ratio <= 5.0  # within ~5× of each other
+    # Use abs() in the denominator guard so that sign of lle2 does not flip the
+    # ratio unexpectedly when lle2 is a small negative number near zero.
+    if lle1 is not None and lle2 is not None and abs(lle1) + abs(lle2) > 1e-10:
+        lle_ratio = lle1 / (abs(lle2) + 1e-12) if abs(lle2) > 1e-10 else float("nan")
+        lle_close = (
+            not (lle_ratio != lle_ratio) and  # not NaN
+            0.2 <= abs(lle_ratio) <= 5.0  # within ~5× of each other
+        )
         q9["lle_ratio"] = {
             "fmri_lle": float(lle1), "eeg_lle": float(lle2),
             "ratio": float(lle_ratio), "within_5x": lle_close,
