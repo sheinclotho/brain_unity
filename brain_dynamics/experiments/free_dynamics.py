@@ -200,14 +200,24 @@ def _swap_base_graph_x(
 
     Returns a dict of the original tensors so the caller can restore them.
     Only node types present in both *new_x_data* and ``base_graph`` are swapped.
+
+    The replacement tensor is moved to the **same device** as the original so
+    that downstream code (``_clone_hetero_graph``, model forward pass) never
+    sees a mixed-device HeteroData.  Pool data is loaded on CPU by
+    ``_load_graph_x_only``; moving it to the original device here (rather than
+    relying on ``data.to(device)`` deep inside ``predict_future``) eliminates
+    the root cause of CUDA index-assertion errors that arise when GPU edge
+    indices are paired with CPU node features during intermediate tensor ops.
     """
     saved: Dict[str, torch.Tensor] = {}
     for nt, new_x in new_x_data.items():
         if nt in simulator.base_graph.node_types and hasattr(
             simulator.base_graph[nt], "x"
         ):
-            saved[nt] = simulator.base_graph[nt].x
-            simulator.base_graph[nt].x = new_x
+            orig_x = simulator.base_graph[nt].x
+            saved[nt] = orig_x
+            # Ensure pool data lands on the same device as the original tensor.
+            simulator.base_graph[nt].x = new_x.to(orig_x.device)
     return saved
 
 
