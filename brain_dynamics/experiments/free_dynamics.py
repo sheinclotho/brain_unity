@@ -137,7 +137,7 @@ def run_free_dynamics(
     # "prediction_steps fallback" introduced by using shorter and shorter
     # contexts for higher window indices.
     #
-    # n_valid_starts = max(1, T_primary - ctx_len + 1):
+    # max_context_start = max(1, T_primary - ctx_len + 1):
     #   T >= ctx_len  →  uniform draw from [0, T - ctx_len]
     #                    (multiple distinct full-length windows possible)
     #   T < ctx_len   →  always start=0; diversity comes from x0 noise alone
@@ -148,18 +148,21 @@ def run_free_dynamics(
     # correction transient in the encoder output.
     if T_primary > 0:
         eff_ctx = min(ctx_len, T_primary)
-        n_valid_starts = max(1, T_primary - eff_ctx + 1)
+        # Exclusive upper bound for rng.integers (i.e. the number of valid
+        # start positions is `max_context_start`, ranging from 0 to
+        # max_context_start-1 inclusive).
+        max_context_start = max(1, T_primary - eff_ctx + 1)
     else:
         eff_ctx = ctx_len
-        n_valid_starts = 1
+        max_context_start = 1
 
-    if n_valid_starts > 1:
+    if max_context_start > 1:
         logger.info(
             "  初始化策略: 随机等长上下文窗口"
             "（%d 条轨迹各自随机截取 %d 步历史，"
             "起始位置 ∈ [0, %d]，全部等长，无偏差）。\n"
             "  x0 = 上下文窗口末步对应的数据值（时序连续）。",
-            n_init, eff_ctx, n_valid_starts - 1,
+            n_init, eff_ctx, max_context_start - 1,
         )
     else:
         logger.info(
@@ -183,17 +186,18 @@ def run_free_dynamics(
 
     for i in range(n_init):
         # Random context start position — equal length for all trajectories
-        context_start = int(rng.integers(0, n_valid_starts))
+        context_start = int(rng.integers(0, max_context_start))
         # x0 aligned to the last step of the selected context window:
         #   context covers [context_start : context_start + eff_ctx]
         #   → last step = context_start + eff_ctx - 1
         # Clamped to [0, T_primary-1] so we never request an out-of-range step.
         if T_primary > 0:
             natural_x0_step = context_start + eff_ctx - 1
-            x0_step: Optional[int] = min(natural_x0_step, T_primary - 1)
+            x0_step: int = min(natural_x0_step, T_primary - 1)
+            x0 = simulator.sample_random_state(rng, from_data=True, step_idx=x0_step)
         else:
-            x0_step = None  # no data; sample_random_state uses noise only
-        x0 = simulator.sample_random_state(rng, from_data=True, step_idx=x0_step)
+            # No data available — sample_random_state uses noise only (step_idx=None)
+            x0 = simulator.sample_random_state(rng, from_data=True, step_idx=None)
         traj, _ = simulator.rollout(
             x0=x0, steps=steps, stimulus=None,
             context_start=context_start,

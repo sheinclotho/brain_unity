@@ -16,6 +16,13 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Minimum post-burnin steps required per trajectory before the last-50% crop
+# for a phase portrait to contain enough points.  Below this threshold, all
+# post-burnin steps are used without cropping.  Rationale: a 2D hexbin density
+# needs at least a handful of distinct points; fewer than 4 steps produces a
+# degenerate or empty plot.
+_MIN_PHASE_PORTRAIT_STEPS = 4
+
 try:
     import matplotlib
     matplotlib.use("Agg")   # non-interactive backend
@@ -134,7 +141,12 @@ def plot_pca_trajectories(
     # PCA direction is still determined from the FULL post-burnin data above
     # (ref_states) for statistical robustness; only the projection+plot is limited.
     T_half = T_full // 2
-    traj_plot = traj_use[:, T_half:, :]               # (n_traj, T, N) — last 50%
+    T_plot = T_full - T_half   # steps to show (last 50%)
+    if T_plot >= _MIN_PHASE_PORTRAIT_STEPS:
+        traj_plot = traj_use[:, T_half:, :]   # (n_traj, T, N) — last 50%
+    else:
+        # Too few post-burnin steps — skip the 50% crop to avoid an empty plot.
+        traj_plot = traj_use
     T = traj_plot.shape[1]
     all_states = traj_plot.reshape(-1, n_regions)      # used for density plot
 

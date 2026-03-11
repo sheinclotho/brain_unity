@@ -955,7 +955,11 @@ def _score_hypotheses(
         # (distinguishes SM from pure LC where sev < 0.15)
         if sev > 0.25:
             scores["SM"] += 1.0
-            scores["LC"] -= 0.5   # large amplitude modulation is inconsistent with LC
+            # Limit cycle is characterised by constant amplitude; slow amplitude
+            # modulation (sev > 0.25) is inconsistent with that assumption.
+            # Weight -0.5 (half the SM reward) so a single signal does not
+            # dominate the comparison.
+            scores["LC"] -= 0.5
             evidence_notes["SM"].append(
                 f"slow amplitude modulation (sev={sev:.3f}>0.25) → slow drift on manifold"
             )

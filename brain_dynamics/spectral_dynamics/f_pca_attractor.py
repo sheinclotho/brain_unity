@@ -70,6 +70,12 @@ _POINCARE_PERIODIC_THRESH: float = 1e-6  # range < this → trivially periodic (
 _POINCARE_TIGHT_RATIO: float = 0.15      # std/range < this → clustered (periodic)
 _POINCARE_QUASI_RATIO: float = 0.50      # std/range < this → smooth manifold (quasi-periodic)
 
+# Minimum steps per trajectory required after the last-50% crop for a phase
+# portrait to contain enough distinct points for a meaningful visualisation.
+# Below this threshold the crop is skipped and all available steps are shown.
+# 4 is the minimum for a non-degenerate hexbin (needs at least a 2×2 region).
+_MIN_PHASE_PORTRAIT_STEPS: int = 4
+
 # Delay-embedding quality constants
 # If |corr(y(t), y(t+tau))| exceeds this after ACF-based tau selection, we
 # apply linear detrending to the observable and recompute tau.  A good tau
@@ -738,7 +744,7 @@ def run_pca_attractor(
         n_pcs = pca_result["n_components"]
         T_eff_skip = T_eff // 2
         T_eff_plot = T_eff - T_eff_skip
-        if T_eff_plot >= 4 and n_pcs >= 1:
+        if T_eff_plot >= _MIN_PHASE_PORTRAIT_STEPS and n_pcs >= 1:
             X_pca_plot = (
                 pca_result["X_pca"]
                 .reshape(n_traj, T_eff, n_pcs)[:, T_eff_skip:, :]
@@ -821,7 +827,7 @@ def run_pca_attractor(
             m_delay = X_delay.shape[1]
             T_embed_skip = T_embed // 2
             T_embed_plot = T_embed - T_embed_skip
-            if T_embed_plot >= 4 and m_delay >= 1:
+            if T_embed_plot >= _MIN_PHASE_PORTRAIT_STEPS and m_delay >= 1:
                 X_delay_plot = (
                     X_delay
                     .reshape(n_traj, T_embed, m_delay)[:, T_embed_skip:, :]

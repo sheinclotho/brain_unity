@@ -887,6 +887,10 @@ class BrainDynamicsSimulator:
             if context_start is not None:
                 # ── Direct mode: caller supplies exact start position ──────────
                 start = int(context_start)
+                if start < 0:
+                    raise ValueError(
+                        f"context_start must be non-negative, got {start}"
+                    )
                 end = start + ctx_len
                 if start >= T:
                     logger.warning(
@@ -916,6 +920,12 @@ class BrainDynamicsSimulator:
             # Final clamp to valid data range
             start = max(0, min(start, T))
             end   = max(start, min(end, T))
+            if end <= start:
+                raise ValueError(
+                    f"_get_context_for_window: context window [{start}:{end}] is empty "
+                    f"for node type '{nt}' (T={T}, ctx_len={ctx_len}).  "
+                    "This indicates the graph has zero temporal steps after slicing."
+                )
             context[nt].x = nt_x[:, start:end, :]
 
         return context
