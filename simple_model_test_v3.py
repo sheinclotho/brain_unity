@@ -1390,9 +1390,9 @@ def plot_slope_analysis(
     _tau_ablation_plot(ax_C, model, N)
 
     # ═══════════════════════════════════════════════════════════════
-    # PANEL D: Metric comparison (Model B vs Real Brain target bands)
+    # PANEL D: Metric comparison (This model vs Real Brain target bands)
     # ═══════════════════════════════════════════════════════════════
-    _metric_comparison_plot(ax_D, model, traj_trans, slp_a)
+    _metric_comparison_plot(ax_D, model, traj_trans, slp_a, model_name=model_name)
 
     fig.suptitle(
         f'Line-Attractor Slope Analysis  —  {model_name}\n'
@@ -1405,14 +1405,18 @@ def plot_slope_analysis(
 def _tau_ablation_plot(ax, base_model: MinimalModelV3, N: int) -> None:
     """
     Panel C helper: scan tau_C0/tau_C1 ratio and measure PC2 slope magnitude.
-    Fixed tau_C1=2; vary tau_C0 from 1 to 40.
+    tau_C1 is taken from base_model (C1 tau); vary tau_C0 from 1 to 25.
     Uses same rho/noise/community_w_intra as base_model.
     """
     np.random.seed(123)
     tau_ratios, slopes, lles = [], [], []
-    tau_c1 = 2
-    tau_c2 = max(3, getattr(base_model, '_tau_arr',
-                             np.ones(N))[base_model.nodes_per_community * 2])
+    # Read tau_c1 and tau_c2 from the base model (fix: _tau_arr may be None)
+    _tau_safe = base_model._tau_arr if base_model._tau_arr is not None else np.ones(N)
+    npc = base_model.nodes_per_community
+    tau_c1 = max(1, int(float(_tau_safe[npc])
+                        if base_model.n_communities > 1 and len(_tau_safe) > npc else 2))
+    tau_c2 = max(3, int(float(_tau_safe[npc * 2])
+                        if base_model.n_communities > 2 and len(_tau_safe) > npc * 2 else 3))
 
     # Determine base_model hyper-params
     rho   = float(np.linalg.norm(base_model.W, ord=2))   # approx spectral radius
@@ -1485,14 +1489,14 @@ def _tau_ablation_plot(ax, base_model: MinimalModelV3, N: int) -> None:
     # Mark LLE=0 transition
     ax2.axhline(0, color='gray', lw=0.8, ls='-', alpha=0.5)
 
-    # Mark current model's tau ratio
-    cur_tau = getattr(base_model, '_tau_arr', np.ones(N))
-    cur_tau_c0 = float(cur_tau[0]) if base_model.n_communities > 0 else 20
-    cur_tau_c1 = float(cur_tau[base_model.nodes_per_community]) \
+    # Mark current model's tau ratio (fix: _tau_arr may be None)
+    _cur_tau_safe = base_model._tau_arr if base_model._tau_arr is not None else np.ones(N)
+    cur_tau_c0 = float(_cur_tau_safe[0]) if base_model.n_communities > 0 else 20
+    cur_tau_c1 = float(_cur_tau_safe[base_model.nodes_per_community]) \
         if base_model.n_communities > 1 else 2
     cur_ratio = cur_tau_c0 / max(cur_tau_c1, 1e-9)
     ax.axvline(cur_ratio, color='lime', ls='--', lw=1.5, alpha=0.7,
-               label=f'Model B: ratio={cur_ratio:.0f}x')
+               label=f'This model: ratio={cur_ratio:.1f}x')
 
     ax.set_xlabel(r'$\tau_{C0} / \tau_{C1}$ (timescale ratio)', fontsize=10)
     ax.set_ylabel('|PC2 slope|  (line-attractor strength)', color=color_slope,
@@ -1511,10 +1515,11 @@ def _tau_ablation_plot(ax, base_model: MinimalModelV3, N: int) -> None:
 
 def _metric_comparison_plot(ax, model: MinimalModelV3,
                              traj_trans: np.ndarray,
-                             att_slope: float) -> None:
+                             att_slope: float,
+                             model_name: str = "This model") -> None:
     """
-    Panel D helper: bar chart comparing Model B metrics to real brain targets.
-    Green band = ±2× of target; yellow = 2-5×; red = >5×.
+    Panel D helper: bar chart comparing model metrics to real brain targets.
+    Green band = ±50% of target; yellow = 50-100%; red = >100%.
     """
     eng = MinimalModelV3.compute_community_energy(
         model.simulate(n_steps=600, n_init=15, burnin=300), model)
@@ -1557,7 +1562,7 @@ def _metric_comparison_plot(ax, model: MinimalModelV3,
         else:              bar_colors.append('#F44336')   # red: >100% off
 
     bars = ax.bar(xs, model_vals_norm, color=bar_colors,
-                  alpha=0.85, width=0.4, label='Model B')
+                  alpha=0.85, width=0.4, label=model_name)
     # Real brain as horizontal tick marks
     for i, rv in enumerate(real_vals_norm):
         ax.plot([i - 0.3, i + 0.3], [rv, rv], 'k-', lw=3)
@@ -1570,8 +1575,8 @@ def _metric_comparison_plot(ax, model: MinimalModelV3,
 
     ax.set_xticks(xs)
     ax.set_xticklabels([m[0] for m in metrics], fontsize=8.5)
-    ax.set_ylabel('Value (bars=Model B, h-lines=Real Brain)', fontsize=9)
-    ax.set_title('D: Metric Comparison — Model B vs Real Brain\n'
+    ax.set_ylabel(f'Value (bars={model_name}, h-lines=Real Brain)', fontsize=9)
+    ax.set_title(f'D: Metric Comparison — {model_name} vs Real Brain\n'
                  '(green \u2264 50% error | yellow \u2264 100% | red > 100%)',
                  fontsize=10)
 
@@ -1936,53 +1941,79 @@ if __name__ == "__main__":
         n_communities       = 3,
         nodes_per_community = 20,
         w_intra             = 2.0,
+        # v3.2 Model-A optimization: mild community asymmetry
+        # C0 (w_intra=2.2) slightly stronger → slow manifold for PC1
+        # C1 (w_intra=1.8) slightly weaker → fast axis that contracts in PC2
+        # This mild asymmetry gives negative PC2 slope while preserving D2≈2.5-3
+        # (Strong asymmetry, e.g. [3.0,1.5,2.0], creates bistable C0 → D2↓)
+        community_w_intra   = [2.2, 1.8, 2.0],
         w_inter_base        = 0.4,
         inter_prob          = 0.3,
+        # Timescale separation tau_C0/tau_C1 = 5/2 = 2.5×
+        # → transient trajectories contract toward C0 manifold along PC2
+        # → negative PC2 slope  (same ratio as Model B)
+        community_taus      = [5, 2, 3],
         seed                = 42,
     )
 
     # ──────────────────────────────────────────────────────────────
     # Phase 0 — Parameter scan (rho × noise)
     # Transient trajectories are used for PC2 slope measurement.
+    # With community_w_intra=[2.2,1.8,2.0] and community_taus=[5,2,3],
+    # the sweet spot for high D2 is near rho=1.01-1.02.
     # ──────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
-    print("Phase 0/5   Parameter Scan  (rho x noise, LLE + PC2 slope)")
+    print("Phase 0/5   Parameter Scan  (rho x noise, LLE + D2 + PC2 slope)")
     print("=" * 70)
 
-    RHO_SCAN   = [1.01, 1.02, 1.03, 1.04, 1.05]
-    NOISE_SCAN = [0.01, 0.02, 0.03, 0.05]
+    RHO_SCAN   = [1.01, 1.02, 1.03, 1.04, 1.05]   # rho=1.01 sweet spot: D2≈2.8 + neg slope
+    NOISE_SCAN = [0.02, 0.03, 0.05]
     scan_results = []
 
     for rho in RHO_SCAN:
         for noise in NOISE_SCAN:
             cfg = {**BASE_CFG, 'target_rho': rho, 'base_noise': noise}
             mdl = MinimalModelV3(**cfg)
-            # Settled traj for LLE + PCA dim
+            # Settled traj for LLE + PCA dim + D2
             tr   = mdl.simulate(n_steps=800, n_init=30, burnin=200)
             lle  = MinimalModelV3.estimate_lyapunov(tr, max_time=350,
                                                     fit_range=(20, 100))
             pst  = MinimalModelV3.compute_pca_stats(tr)
+            d2s  = MinimalModelV3.compute_correlation_dimension(tr, max_samples=500)
             # Transient traj for PC2 slope
             trt  = mdl.simulate_transient(n_init=15, n_steps=200)
             slp, r2 = MinimalModelV3.compute_pc2_contraction(
-                trt, skip_steps=3, fit_end=25)
-            rec = dict(rho=rho, noise=noise, lle=lle,
+                trt, skip_steps=3, fit_end=40)
+            rec = dict(rho=rho, noise=noise, lle=lle, d2=d2s,
                        dim_95=pst['dim_95'], pc2_slope=slp, pc2_r2=r2)
             scan_results.append(rec)
+            d2str = f"{d2s:.2f}" if np.isfinite(d2s) else " NaN"
             print(f"  rho={rho:.2f}  noise={noise:.3f}  "
-                  f"LLE={lle:+.5f}  dim={pst['dim_95']}  "
+                  f"LLE={lle:+.5f}  D2={d2str}  dim={pst['dim_95']}  "
                   f"PC2_slope={slp:+.4f}  R2={r2:.3f}")
 
     plot_parameter_scan(scan_results)
 
+    # Score-function constants (named for clarity)
+    _D2_MISSING_PENALTY    = 0.3   # penalty weight when D2 is not computable (NaN)
+    _PC2_SLOPE_THRESHOLD   = -0.01  # boundary between correct (≤) and wrong-direction (>) slope
+    _WRONG_DIRECTION_PENALTY = 2.5  # strong weight: wrong-direction slope means no line attractor
+
     def _score(r):
         if np.isnan(r['lle']) or np.isnan(r['pc2_slope']):
             return 1e9
-        return abs(r['lle'] - REAL_LLE) + 0.3 * abs(r['pc2_slope'] - REAL_PC2_SLOPE)
+        lle_err   = abs(r['lle']        - REAL_LLE)        / max(REAL_LLE, 1e-8)
+        slope_err = abs(r['pc2_slope']  - REAL_PC2_SLOPE)  / max(abs(REAL_PC2_SLOPE), 1e-8)
+        d2_err    = abs(r.get('d2', REAL_D2) - REAL_D2)    / max(REAL_D2, 1e-8) \
+                    if np.isfinite(r.get('d2', float('nan'))) else _D2_MISSING_PENALTY
+        # Strong penalty for wrong-direction PC2 slope (positive means no line attractor)
+        direction_penalty = _WRONG_DIRECTION_PENALTY if r['pc2_slope'] > _PC2_SLOPE_THRESHOLD else 0.0
+        return lle_err + 0.35 * slope_err + 0.25 * d2_err + direction_penalty
 
     best = min(scan_results, key=_score)
     print(f"\n  Best: rho={best['rho']:.2f}  noise={best['noise']:.3f}"
-          f"  LLE={best['lle']:+.5f}  PC2_slope={best['pc2_slope']:+.4f}")
+          f"  LLE={best['lle']:+.5f}  PC2_slope={best['pc2_slope']:+.4f}"
+          f"  D2={best.get('d2', float('nan')):.3f}")
 
     # ──────────────────────────────────────────────────────────────
     # Phase 1 — MODEL A "EdgeChaos"  deep analysis
