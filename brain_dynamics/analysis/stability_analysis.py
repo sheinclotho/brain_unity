@@ -109,9 +109,18 @@ _ACF_MIN_LAG: int = 5                 # skip near-zero lags in secondary-peak se
 # Between-trajectory consistency threshold for attractor warning
 _BETWEEN_TRAJ_CV_ATTRACTOR: float = 0.05  # delta_ratio CV < this → single global attractor
 
+# ACF score threshold for complex_oscillation (C6 branch in classify_dynamics_adaptive).
+# Applies when delta_ratio > metastable threshold but ACF secondary-peak score is too
+# weak for a clear limit_cycle (acf_score < _ADAPTIVE_LC_ACF_STRONG = 0.35).
+# acf_score in [0.20, 0.35] indicates broadband oscillatory structure without a
+# single dominant period — typical of edge-of-chaos systems with many competing
+# Hopf modes (e.g. DMD n_Hopf >> 1).  Label: "complex_oscillation".
+_ADAPTIVE_COMPLEX_OSC_ACF: float = 0.20
+
 # ── Empty classification count template (shared by run_stability_analysis) ───
 _EMPTY_CLASS_COUNTS: Dict[str, int] = {
-    "fixed_point": 0, "limit_cycle": 0, "metastable": 0, "unstable": 0,
+    "fixed_point": 0, "limit_cycle": 0, "metastable": 0,
+    "complex_oscillation": 0, "unstable": 0,
 }
 
 
@@ -325,6 +334,13 @@ def classify_dynamics_delay(
     else:
         if delta_mean < metastable_tol:
             return "metastable"
+
+    # Complex oscillation: large-amplitude broadband oscillatory motion.
+    # Consistent with Method C (C6): acf_score in the 0.20–0.35 range indicates
+    # oscillatory structure without a single dominant period.
+    if acf_score > _ADAPTIVE_COMPLEX_OSC_ACF:
+        return "complex_oscillation"
+
     return "unstable"
 
 
@@ -465,7 +481,18 @@ def classify_dynamics_adaptive(
         meta_ratio:    亚稳态的相对运动阈值（默认 0.15）。
 
     Returns:
-        classification: "fixed_point" | "limit_cycle" | "metastable" | "unstable"
+        classification: "fixed_point" | "limit_cycle" | "complex_oscillation"
+                        | "metastable" | "unstable"
+
+    Note on ``complex_oscillation``:
+        Systems near the edge of chaos with many competing Hopf modes (e.g.
+        DMD n_Hopf ≫ 1) often produce trajectories with large delta_ratio AND
+        moderate ACF secondary peaks (0.20–0.35).  These pass the metastable
+        threshold (delta_ratio > 0.15) but fall short of the LC ACF threshold
+        (0.35).  Labelling them "unstable" is misleading because the system IS
+        oscillating — just without a single dominant period.  "complex_oscillation"
+        correctly conveys: large-amplitude, broadband oscillatory dynamics that
+        are NOT pathological instability.
     """
     dr = features["delta_ratio"]
     cv = features["cv_delta"]
@@ -496,6 +523,13 @@ def classify_dynamics_adaptive(
     # (C5) Metastable: moderate motion without clear periodicity
     if dr < meta_ratio:
         return "metastable"
+
+    # (C6) Complex oscillation: large-amplitude motion with moderate ACF evidence.
+    # Covers edge-of-chaos systems with many competing Hopf modes where no single
+    # period dominates (ACF secondary peak 0.20–0.35, below the LC strong threshold).
+    # This is NOT pathological instability; it is broadband oscillation near criticality.
+    if acf_score > _ADAPTIVE_COMPLEX_OSC_ACF:
+        return "complex_oscillation"
 
     return "unstable"
 
@@ -601,7 +635,14 @@ def classify_dynamics(
         if mean_delta < 0.05 and std_delta < mean_delta:
             return "metastable"
 
-    # 5. Unstable / chaotic: large or growing deltas
+    # 5. Complex oscillation: large-amplitude broadband oscillatory motion.
+    # Consistent with Method B/C: acf_score in the 0.20–0.35 range indicates
+    # oscillatory structure without a single dominant period (edge-of-chaos systems
+    # with many competing Hopf modes).
+    if acf_score > _ADAPTIVE_COMPLEX_OSC_ACF:
+        return "complex_oscillation"
+
+    # 6. Unstable / chaotic: large or growing deltas with no oscillatory signature
     return "unstable"
 
 
@@ -719,6 +760,7 @@ def run_stability_analysis(
             "fraction_converged": float,
             "fraction_limit_cycle": float,
             "fraction_metastable": float,
+            "fraction_complex_oscillation": float,  # 大幅宽带振荡（近临界，非病理不稳定）
             "fraction_unstable": float,
             "delta_ratio_stats": Dict,            # 新增：相对运动强度分布
         }
@@ -809,35 +851,46 @@ def run_stability_analysis(
         "fraction_converged": class_counts["fixed_point"] / n_traj,
         "fraction_limit_cycle": class_counts["limit_cycle"] / n_traj,
         "fraction_metastable": class_counts["metastable"] / n_traj,
+        "fraction_complex_oscillation": class_counts.get("complex_oscillation", 0) / n_traj,
         "fraction_unstable": class_counts["unstable"] / n_traj,
         "delta_ratio_stats": delta_ratio_stats,
         "acf_score_stats": acf_score_stats,
     }
 
     logger.info(
-        "  [方法C-自适应] 不动点: %.1f%%  极限环: %.1f%%  亚稳态: %.1f%%  不稳定: %.1f%%",
+        "  [方法C-自适应] 不动点: %.1f%%  极限环: %.1f%%  复杂振荡: %.1f%%  "
+        "亚稳态: %.1f%%  不稳定: %.1f%%",
         summary["fraction_converged"] * 100,
         summary["fraction_limit_cycle"] * 100,
+        summary["fraction_complex_oscillation"] * 100,
         summary["fraction_metastable"] * 100,
         summary["fraction_unstable"] * 100,
     )
     logger.info(
-        "  [方法B-延迟距离] 不动点: %.1f%%  极限环: %.1f%%  亚稳态: %.1f%%  不稳定: %.1f%%",
+        "  [方法B-延迟距离] 不动点: %.1f%%  极限环: %.1f%%  复杂振荡: %.1f%%  "
+        "亚稳态: %.1f%%  不稳定: %.1f%%",
         class_counts_v2["fixed_point"] / n_traj * 100,
         class_counts_v2["limit_cycle"] / n_traj * 100,
+        class_counts_v2.get("complex_oscillation", 0) / n_traj * 100,
         class_counts_v2["metastable"] / n_traj * 100,
         class_counts_v2["unstable"] / n_traj * 100,
     )
     logger.info(
-        "  [方法A-邻接差分] 不动点: %.1f%%  极限环: %.1f%%  亚稳态: %.1f%%  不稳定: %.1f%%",
+        "  [方法A-邻接差分] 不动点: %.1f%%  极限环: %.1f%%  复杂振荡: %.1f%%  "
+        "亚稳态: %.1f%%  不稳定: %.1f%%",
         class_counts_v1["fixed_point"] / n_traj * 100,
         class_counts_v1["limit_cycle"] / n_traj * 100,
+        class_counts_v1.get("complex_oscillation", 0) / n_traj * 100,
         class_counts_v1["metastable"] / n_traj * 100,
         class_counts_v1["unstable"] / n_traj * 100,
     )
 
     # ── Cross-method consistency diagnostic ──────────────────────────────────
     # When methods disagree, log an explanation so users are not confused.
+    # Count LC + complex_oscillation as "oscillatory" for this comparison.
+    c_osc_frac = (class_counts["limit_cycle"] + class_counts.get("complex_oscillation", 0)) / n_traj
+    b_osc_frac = (class_counts_v2["limit_cycle"] + class_counts_v2.get("complex_oscillation", 0)) / n_traj
+    a_osc_frac = (class_counts_v1["limit_cycle"] + class_counts_v1.get("complex_oscillation", 0)) / n_traj
     c_lc_frac = class_counts["limit_cycle"] / n_traj
     b_lc_frac = class_counts_v2["limit_cycle"] / n_traj
     a_lc_frac = class_counts_v1["limit_cycle"] / n_traj

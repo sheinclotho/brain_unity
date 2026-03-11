@@ -441,6 +441,18 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
                 primary_c,
                 vc.get(primary_c, 0) / n_traj * 100,
             )
+            # Contextual note for large complex_oscillation fraction:
+            # In near-critical systems with many Hopf modes, 'complex_oscillation'
+            # means broadband oscillatory dynamics — not pathological instability.
+            fco = stab.get("fraction_complex_oscillation", 0.0)
+            if fco > 0.30:
+                logger.info(
+                    "  ⓘ %.0f%% of trajectories classified as 'complex_oscillation': "
+                    "large-amplitude broadband oscillations consistent with many "
+                    "competing Hopf modes (n_Hopf >> 1) near the edge of chaos. "
+                    "This is NOT pathological instability.",
+                    fco * 100,
+                )
         except Exception as e:
             logger.warning("  Stability analysis failed: %s", e)
 
@@ -456,11 +468,34 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
                 output_dir=dyn_dir,
             )
             results["attractor"] = att
+            ca_suspect = att.get("continuous_attractor_suspect", False)
+            sil = att.get("silhouette_score")
+            log_msg = (
+                "  Attractor: k=%d, basins=%s, silhouette=%s%s"
+            )
+            ca_note = (
+                " ⚠ CONTINUOUS/RING ATTRACTOR SUSPECT (uniform clusters + high silhouette)"
+                if ca_suspect else ""
+            )
             logger.info(
-                "  Attractor: k=%d, basins=%s",
+                log_msg,
                 att.get("kmeans_k", 0),
                 att.get("basin_distribution", {}),
+                f"{sil:.4f}" if sil is not None else "N/A",
+                ca_note,
             )
+            if ca_suspect:
+                logger.warning(
+                    "  Phase 3b WARNING: Nearly-uniform KMeans cluster sizes with "
+                    "silhouette=%.4f detected. "
+                    "This pattern is the canonical signature of K-means cutting "
+                    "through a ring/continuous attractor rather than identifying "
+                    "discrete basins. The reported 'n_attractors=%d' should be "
+                    "interpreted with caution. See attractor_topology (Phase 3l) "
+                    "for hypothesis-testing analysis.",
+                    sil or 0.0,
+                    att.get("kmeans_k", 0),
+                )
         except Exception as e:
             logger.warning("  Attractor analysis failed: %s", e)
 
@@ -478,7 +513,7 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
             logger.info(
                 "  Convergence: ratio=%.4f, label=%s",
                 conv.get("distance_ratio", float("nan")),
-                conv.get("label", "unknown"),
+                conv.get("convergence_label", "unknown"),
             )
         except Exception as e:
             logger.warning("  Trajectory convergence failed: %s", e)
@@ -711,6 +746,25 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
                             fail_rate * 100,
                         )
                         dim_results["D2_h2_reliable"] = False
+                        # Check whether high fail rate is expected (near-fixed-point system).
+                        # When delta_ratio < 0.02, trajectories barely move; the correlation
+                        # dimension calculation has too few distinct distance scales → fails.
+                        # In this case, the effective attractor dimension is ≈ 0, consistent
+                        # with a near-fixed-point or very strongly damped system.
+                        stab_check = results.get("stability", {})
+                        dr_mean = stab_check.get("delta_ratio_stats", {}).get("mean", 1.0)
+                        fp_frac = stab_check.get("fraction_converged", 0.0)
+                        if dr_mean < 0.02 or fp_frac > 0.50:
+                            logger.info(
+                                "  ⓘ High D₂ fail rate is expected for near-fixed-point "
+                                "systems (delta_ratio=%.4f, FP fraction=%.0f%%). "
+                                "Trajectories barely move, making correlation dimension "
+                                "estimation ill-conditioned. "
+                                "Use PCA n@90%% and K-Y_linear as primary dimensionality "
+                                "estimates; effective dynamical dimension ≈ 0–1 in this limit.",
+                                dr_mean, fp_frac * 100,
+                            )
+                            dim_results["D2_high_fail_reason"] = "near_fixed_point"
                     else:
                         dim_results["D2_h2_reliable"] = True
                 else:
@@ -844,6 +898,9 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
                 _lle = results.get("lyapunov", {}).get("mean_lyapunov")
                 _n90 = results.get("pca", {}).get("n_components_90pct")
                 _burnin_at = _pca_burnin(trajs.shape[1])
+                # Pass continuous-attractor suspect flag from Phase 3b
+                _att = results.get("attractor", {})
+                _ca_suspect = bool(_att.get("continuous_attractor_suspect", False))
                 at = run_attractor_topology(
                     trajectories=trajs,
                     output_dir=dyn_dir / "attractor_topology",
@@ -854,18 +911,22 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
                     n_pca_90=_n90,
                     seed=cfg["data_generation"].get("seed", 42),
                     rqa_max_T=at_cfg.get("rqa_max_T", 500),
+                    kmeans_uniform_suspect=_ca_suspect,
                 )
                 if "error" not in at:
                     results["attractor_topology"] = at
+                    ps = at.get("period_stability", {})
                     logger.info(
                         "  Attractor topology: top=%s (%s confidence), "
-                        "freq=%s, DET=%.3f, local_dim=%.2f",
+                        "freq=%s, DET=%.3f, local_dim=%.2f, "
+                        "period_stability=%s",
                         at.get("top_hypothesis_name", "?"),
                         at.get("confidence", "?"),
                         at.get("spectral", {}).get("freq_classification", "?"),
                         at.get("recurrence", {}).get("DET", float("nan")),
                         at.get("local_dimensionality", {}).get("local_dim_mean",
                                                                float("nan")),
+                        ps.get("stability_class", "N/A"),
                     )
         except Exception as e:
             logger.warning("  Attractor topology analysis failed: %s", e)
@@ -1369,6 +1430,311 @@ def run_phase5_advanced(cfg: dict, results: Dict[str, Any],
             logger.warning("  Granger causality failed: %s", e)
 
 
+def _build_manifold_collapse_narrative(
+    results: Dict[str, Any],
+    modality: str,
+) -> Dict[str, Any]:
+    """Build the core scientific narrative: high-D collapse → low-D manifold + criticality.
+
+    Scientific question
+    -------------------
+    How does a high-dimensional brain system (190 fMRI regions / 32-64 EEG channels)
+    collapse onto a low-dimensional dynamical manifold, and does the resulting
+    low-D dynamics exhibit critical steady-state behaviour?
+
+    This is the PRIMARY scientific story of TwinBrain dynamics analysis:
+
+      1. Dimensionality collapse  —  N-D → d-D  (d ≪ N)
+      2. Near-criticality         —  edge-of-chaos: λ ≈ 0, ρ ≈ 1
+      3. Attractor structure      —  what the low-D dynamics look like on the manifold
+      4. Coherence assessment     —  is the collapse robust across trajectories?
+
+    Returns
+    -------
+    dict with keys:
+      manifold_dim         — estimated intrinsic dimension of the manifold
+      N_input              — input dimensionality (number of nodes/channels)
+      collapse_ratio       — manifold_dim / N_input  (0 = full collapse, 1 = no collapse)
+      criticality_verdict  — "at_criticality" | "near_criticality" | "subcritical" | "supercritical"
+      attractor_class      — best-guess attractor type from multi-evidence synthesis
+      narrative_text       — human-readable summary paragraph
+      evidence             — list of evidence items
+      confidence           — "high" | "moderate" | "low"
+    """
+    evidence: List[str] = []
+    warnings: List[str] = []
+
+    # ── 1. Input dimensionality ────────────────────────────────────────────────
+    spec = results.get("spectral", {})
+    N_input = spec.get("n_regions")
+
+    # ── 2. Manifold dimensionality (three-way estimate) ────────────────────────
+    pca = results.get("pca", {})
+    n90 = pca.get("n_components_90pct")
+    pc1_var = pca.get("variance_top5_pct")  # top-5 cumulative, or just PC1
+
+    ad = results.get("attractor_dimension", {})
+    d2 = ad.get("D2_mean", ad.get("D2"))
+    d2_std = ad.get("D2_std")
+    ky_lin = ad.get("KY_linearised")
+
+    # Best single estimate: prefer D₂ (nonlinear), fallback to n@90%
+    if d2 is not None and np.isfinite(float(d2)):
+        manifold_dim = float(d2)
+        dim_method = f"D₂ (Grassberger-Procaccia correlation dimension)"
+        if d2_std is not None:
+            evidence.append(f"D₂={d2:.2f}±{d2_std:.2f} (nonlinear manifold dimension)")
+        else:
+            evidence.append(f"D₂={d2:.2f} (nonlinear manifold dimension)")
+    elif n90 is not None:
+        manifold_dim = float(n90)
+        dim_method = "PCA n@90% (linear upper bound)"
+        evidence.append(f"PCA n@90%={n90} (linear upper bound on manifold dim)")
+    else:
+        manifold_dim = float("nan")
+        dim_method = "unknown"
+
+    if n90 is not None:
+        evidence.append(f"PCA n@90%={n90} — top-{n90} PCs explain ≥90% of variance")
+    if ky_lin is not None:
+        evidence.append(f"K-Y_lin={ky_lin:.2f} (linearised, from DMD)")
+    if pc1_var is not None:
+        evidence.append(f"PC1 cumulative variance ≈ {pc1_var:.1f}% — strong manifold concentration")
+
+    if N_input and np.isfinite(manifold_dim):
+        collapse_ratio = manifold_dim / N_input
+        evidence.append(
+            f"Collapse ratio d/N = {manifold_dim:.1f}/{N_input} = {collapse_ratio:.4f} "
+            f"— dynamics occupy {collapse_ratio*100:.1f}% of input space"
+        )
+    else:
+        collapse_ratio = float("nan")
+
+    # ── 3. Criticality assessment ──────────────────────────────────────────────
+    lya = results.get("lyapunov", {})
+    lle = lya.get("mean_lyapunov")
+    regime = lya.get("chaos_regime", {}).get("regime", "unknown")
+
+    dmd = results.get("dmd_spectrum", {})
+    rho = dmd.get("spectral_radius")
+
+    if lle is not None and np.isfinite(lle):
+        if regime in ("edge_of_chaos",):
+            criticality_verdict = "at_criticality"
+            evidence.append(
+                f"Rosenstein LLE={lle:.5f} ({regime}) — system sits AT the "
+                "edge-of-chaos boundary (λ ≈ 0)"
+            )
+        elif regime in ("marginal_stable", "weakly_chaotic"):
+            criticality_verdict = "near_criticality"
+            evidence.append(
+                f"Rosenstein LLE={lle:.5f} ({regime}) — system is NEAR criticality"
+            )
+        elif regime in ("stable",):
+            criticality_verdict = "subcritical"
+            evidence.append(
+                f"Rosenstein LLE={lle:.5f} ({regime}) — system is subcritical "
+                "(stable, not at the edge)"
+            )
+        else:
+            criticality_verdict = "undetermined"
+            evidence.append(f"Rosenstein LLE={lle:.5f}, regime={regime}")
+    else:
+        criticality_verdict = "undetermined"
+
+    if rho is not None and np.isfinite(rho):
+        if 0.98 <= rho <= 1.02:
+            evidence.append(
+                f"DMD spectral radius ρ={rho:.4f} ≈ 1.0 — linearised dynamics "
+                "also confirm near-criticality"
+            )
+        elif rho > 1.02:
+            evidence.append(f"DMD ρ={rho:.4f} > 1 (supercritical, linearised)")
+        else:
+            evidence.append(f"DMD ρ={rho:.4f} < 1 (subcritical, linearised)")
+
+    # CSD (critical slowing down) as independent criticality evidence
+    csd = results.get("critical_slowing_down", {})
+    if csd:
+        csd_agg = csd.get("aggregate", {})
+        ac1_tau = csd_agg.get("ac1_tau_mean")
+        var_tau = csd_agg.get("var_tau_mean")
+        if ac1_tau is not None and var_tau is not None:
+            if ac1_tau > 0 and var_tau > 0:
+                evidence.append(
+                    f"CSD: AC1_τ={ac1_tau:.2f}>0, Var_τ={var_tau:.2f}>0 — "
+                    "rising autocorrelation and variance consistent with approach "
+                    "to a critical point (independent of LLE)"
+                )
+            elif ac1_tau < 0 and var_tau < 0:
+                # Anti-CSD: autocorrelation and variance DECREASE over time.
+                # This means trajectories are converging TOWARD an attractor,
+                # not approaching a bifurcation point. It is physically consistent
+                # with a damped fixed-point or convergent limit-cycle system where
+                # memory of initial conditions fades over time.
+                evidence.append(
+                    f"ANTI-CSD: AC1_τ={ac1_tau:.2f}<0, Var_τ={var_tau:.2f}<0 — "
+                    "decreasing autocorrelation and variance indicate trajectories "
+                    "converge toward the attractor (NOT consistent with critical "
+                    "slowing down or approach to bifurcation)"
+                )
+            else:
+                evidence.append(
+                    f"CSD mixed: AC1_τ={ac1_tau:.2f}, Var_τ={var_tau:.2f} "
+                    "(inconsistent signs — no clear CSD signal)"
+                )
+
+    # ── 4. Attractor structure ────────────────────────────────────────────────
+    at = results.get("attractor_topology", {})
+    top_hyp_name = at.get("top_hypothesis_name", "unknown")
+    top_hyp_conf = at.get("confidence", "low")
+    ps = at.get("period_stability", {})
+    ps_class = ps.get("stability_class", "unknown") if ps else "unknown"
+
+    # Attractor class from multi-evidence (prefer topology over raw KMeans)
+    att_raw = results.get("attractor", {})
+    ca_suspect = att_raw.get("continuous_attractor_suspect", False)
+
+    attractor_class = top_hyp_name
+    if ca_suspect and top_hyp_conf in ("low", "unknown"):
+        # KMeans uniform pattern is stronger evidence than low-confidence topology
+        attractor_class = "ring/continuous attractor (suspected)"
+        evidence.append(
+            "⚠ KMeans uniform cluster distribution — consistent with ring/CA "
+            "rather than discrete basins"
+        )
+    else:
+        if top_hyp_name not in ("unknown", "N/A"):
+            evidence.append(
+                f"Attractor topology (multi-evidence): {top_hyp_name} "
+                f"({top_hyp_conf} confidence)"
+            )
+        if ps_class not in ("unknown", "insufficient_crossings"):
+            evidence.append(f"Period stability (Hilbert): {ps_class}")
+
+    # ── 5. Coherence (convergence) ────────────────────────────────────────────
+    conv = results.get("convergence", {})
+    dist_ratio = conv.get("distance_ratio")
+    conv_label = conv.get("convergence_label", "unknown")
+    if dist_ratio is not None:
+        if dist_ratio < 0.1:
+            evidence.append(
+                f"Convergence: distance_ratio={dist_ratio:.4f} — trajectories "
+                "converge strongly (single coherent attractor)"
+            )
+        elif dist_ratio < 0.5:
+            evidence.append(
+                f"Convergence: distance_ratio={dist_ratio:.4f} — moderate "
+                f"convergence ({conv_label})"
+            )
+        else:
+            evidence.append(
+                f"Convergence: distance_ratio={dist_ratio:.4f} — weak "
+                "convergence, possible multiple basins"
+            )
+
+    # ── 6. Narrative text ────────────────────────────────────────────────────
+    dim_str = (
+        f"dimension ≈ {manifold_dim:.1f}"
+        if np.isfinite(manifold_dim) else "dimension unknown"
+    )
+    ratio_str = (
+        f"{collapse_ratio*100:.1f}% of input space"
+        if np.isfinite(collapse_ratio) else ""
+    )
+    N_str = f"{int(N_input)}-dimensional" if N_input else "high-dimensional"
+
+    narrative_parts = []
+
+    # Collapse statement
+    if np.isfinite(manifold_dim) and N_input:
+        narrative_parts.append(
+            f"The {N_str} {modality.upper()} brain system collapses onto a "
+            f"low-dimensional manifold of {dim_str} "
+            + (f"(only {ratio_str}). " if ratio_str else ". ")
+        )
+    else:
+        narrative_parts.append(
+            f"The {N_str} {modality.upper()} system exhibits low-dimensional "
+            "dynamics. "
+        )
+
+    # Criticality statement
+    if criticality_verdict == "at_criticality":
+        narrative_parts.append(
+            "The dynamics on this manifold are AT the edge of chaos "
+            f"(Rosenstein λ={lle:.5f}, DMD ρ={rho:.4f} ≈ 1). "
+            "This is consistent with the brain criticality hypothesis: "
+            "operating at the phase boundary between order and disorder "
+            "maximises information processing capacity and dynamic range. "
+        )
+    elif criticality_verdict == "near_criticality":
+        narrative_parts.append(
+            f"The manifold dynamics are NEAR criticality "
+            f"(λ={lle:.5f}, regime={regime}). "
+        )
+    elif criticality_verdict == "subcritical":
+        narrative_parts.append(
+            f"The manifold dynamics are SUBCRITICAL "
+            f"(λ={lle:.5f} < 0, system is stable but not at the critical edge). "
+        )
+
+    # Attractor statement
+    if attractor_class not in ("unknown", "N/A"):
+        if attractor_class == "Limit Cycle" or attractor_class == "LC":
+            narrative_parts.append(
+                "The attractor geometry is consistent with a limit cycle: "
+                "stable periodic oscillation on the low-dimensional manifold. "
+            )
+        elif "continuous" in attractor_class.lower() or attractor_class == "CA":
+            narrative_parts.append(
+                "The attractor may be a continuous/ring attractor: a neutral "
+                "direction along the manifold permits drift between states, "
+                "consistent with working-memory models of persistent activity. "
+            )
+        elif attractor_class == "Fixed Point" or attractor_class == "FP":
+            narrative_parts.append(
+                "The dynamics converge to a near-fixed-point (static attractor) "
+                "on the manifold. "
+            )
+        elif ps_class == "slow_manifold_oscillation":
+            narrative_parts.append(
+                "The dynamics exhibit oscillation on a slow manifold — "
+                "two-timescale dynamics with fast oscillation superimposed on "
+                "slow drift. "
+            )
+
+    narrative_text = "".join(narrative_parts).strip()
+
+    # ── 7. Overall confidence ──────────────────────────────────────────────────
+    n_evidence = len(evidence)
+    if n_evidence >= 5 and top_hyp_conf in ("high", "moderate"):
+        confidence = "high"
+    elif n_evidence >= 3:
+        confidence = "moderate"
+    else:
+        confidence = "low"
+
+    return {
+        "N_input": int(N_input) if N_input else None,
+        "manifold_dim": round(manifold_dim, 3) if np.isfinite(manifold_dim) else None,
+        "manifold_dim_method": dim_method,
+        "n_pca_90": n90,
+        "ky_linear": float(ky_lin) if ky_lin is not None else None,
+        "collapse_ratio": round(collapse_ratio, 5) if np.isfinite(collapse_ratio) else None,
+        "criticality_verdict": criticality_verdict,
+        "rosenstein_lle": float(lle) if lle is not None else None,
+        "dmd_spectral_radius": float(rho) if rho is not None else None,
+        "attractor_class": attractor_class,
+        "attractor_conf": top_hyp_conf,
+        "period_stability_class": ps_class,
+        "narrative_text": narrative_text,
+        "evidence": evidence,
+        "warnings": warnings,
+        "confidence": confidence,
+    }
+
+
 def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
                          output_dir: Path,
                          modality: Optional[str] = None) -> None:
@@ -1387,6 +1753,24 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
     """
     _step(6, "Synthesis & Report")
 
+    # ── Core narrative: manifold collapse & criticality ────────────────────────
+    # Compute first, so the narrative can influence downstream verdicts and
+    # can be embedded at the TOP of the report for immediate readability.
+    actual_modality_early = modality or cfg.get("simulator", {}).get("modality", "fmri")
+    try:
+        mcn = _build_manifold_collapse_narrative(results, actual_modality_early)
+    except Exception as _e:
+        logger.warning("  Manifold collapse narrative failed: %s", _e)
+        mcn = {"narrative_text": "", "evidence": [], "confidence": "low"}
+
+    logger.info("")
+    logger.info("  ╔══ CORE SCIENTIFIC NARRATIVE ══════════════════════════════════")
+    logger.info("  ║ %s", mcn.get("narrative_text", ""))
+    for _ev in mcn.get("evidence", []):
+        logger.info("  ║  • %s", _ev)
+    logger.info("  ╚════════════════════════════════════════════════════════════════")
+    logger.info("")
+
     # ── P2-1: Run metadata ────────────────────────────────────────────────────
     import hashlib
     dg = cfg.get("data_generation", {})
@@ -1394,7 +1778,7 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
     # Prefer the caller-supplied modality (correct when running --modality both,
     # where cfg["simulator"]["modality"] == "both" but each sub-run is "fmri"
     # or "eeg").  Fall back to cfg value for single-modality / joint runs.
-    actual_modality = modality or sim_cfg.get("modality", "fmri")
+    actual_modality = actual_modality_early
     try:
         cfg_hash = hashlib.sha256(
             json.dumps(cfg, sort_keys=True, default=str).encode()
@@ -1404,6 +1788,7 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
 
     report: Dict[str, Any] = {
         "run_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "manifold_collapse_narrative": mcn,  # PRIMARY SCIENTIFIC RESULT
         "metadata": {
             "seed": dg.get("seed", 42),
             "n_init": dg.get("n_init"),
@@ -1758,6 +2143,59 @@ def _generate_ai_report(
         "included. Raw arrays and per-step logs are in the JSON outputs."
     )
 
+    # ── Core Scientific Narrative (FIRST SECTION) ─────────────────────────────
+    mcn = report.get("manifold_collapse_narrative", {})
+    if mcn and mcn.get("narrative_text"):
+        _h(2, "Core Finding: Manifold Collapse & Criticality")
+        lines.append("\n" + mcn["narrative_text"])
+        lines.append("")
+        lines.append("**Key evidence:**")
+        for ev_item in mcn.get("evidence", []):
+            lines.append(f"- {ev_item}")
+        if mcn.get("warnings"):
+            lines.append("")
+            for w in mcn["warnings"]:
+                lines.append(f"> ⚠ {w}")
+        lines.append("")
+        # Summary table
+        lines.append("| Metric | Value |")
+        lines.append("|--------|-------|")
+        lines.append(f"| Input dimensionality | {mcn.get('N_input', 'N/A')} |")
+        lines.append(
+            f"| Manifold dimension | "
+            f"{_na(mcn.get('manifold_dim'), '.2f')} "
+            f"({mcn.get('manifold_dim_method', '')}) |"
+        )
+        lines.append(
+            f"| Collapse ratio (d/N) | "
+            f"{_na(mcn.get('collapse_ratio'), '.4f')} |"
+        )
+        lines.append(
+            f"| Criticality verdict | "
+            f"**{mcn.get('criticality_verdict', 'undetermined')}** |"
+        )
+        lines.append(
+            f"| Rosenstein LLE | "
+            f"{_na(mcn.get('rosenstein_lle'), '.5f')} |"
+        )
+        lines.append(
+            f"| DMD spectral radius (ρ) | "
+            f"{_na(mcn.get('dmd_spectral_radius'), '.4f')} |"
+        )
+        lines.append(
+            f"| Attractor class | "
+            f"{mcn.get('attractor_class', 'unknown')} "
+            f"({mcn.get('attractor_conf', '?')} conf) |"
+        )
+        lines.append(
+            f"| Period stability | "
+            f"{mcn.get('period_stability_class', 'N/A')} |"
+        )
+        lines.append(
+            f"| Overall confidence | "
+            f"**{mcn.get('confidence', 'low')}** |"
+        )
+
     # ── Phase 1: Data Generation ──────────────────────────────────────────────
     _h(2, "Phase 1 — Data Generation")
     trajs = results.get("trajectories")
@@ -1883,7 +2321,7 @@ def _generate_ai_report(
     if conv:
         _h(3, "3c Trajectory Convergence")
         _row("distance_ratio", _na(conv.get("distance_ratio"), ".4f"))
-        _row("label", conv.get("label", "N/A"))
+        _row("label", conv.get("convergence_label", "N/A"))
 
     # 3d Lyapunov (Rosenstein) — primary chaos indicator
     lya = results.get("lyapunov", {})
@@ -1992,6 +2430,18 @@ def _generate_ai_report(
         ld_r = at_res.get("local_dimensionality", {})
         _row("Local dim (E4)", _na(ld_r.get("local_dim_mean"), ".2f"),
              "≈1→line, ≈2→cycle, ≈3→torus")
+        ps_r = at_res.get("period_stability", {})
+        if ps_r and "error" not in ps_r:
+            _row("Period stability (E6)", ps_r.get("stability_class", "N/A"),
+                 f"period_cv={_na(ps_r.get('period_cv'), '.3f')}, "
+                 f"envelope_var={_na(ps_r.get('slow_envelope_variation'), '.3f')}")
+        att_res2 = results.get("attractor", {})
+        if att_res2.get("continuous_attractor_suspect"):
+            lines.append(
+                "\n> ⚠ **KMeans uniform-cluster warning**: all clusters have ≈equal size "
+                "with high silhouette — consistent with a ring/continuous attractor. "
+                "This is NOT evidence for multiple discrete attractor basins."
+            )
 
     # 4a Surrogate test
     surr = results.get("surrogate_test", {})
@@ -2200,6 +2650,29 @@ def _build_validation_table(results: Dict[str, Any]) -> List[Dict[str, Any]]:
             f"K-Y={lsp.get('ky_dimension', '?'):.2f}, n_pos={lsp.get('n_positive', '?')}"
             if isinstance(lsp.get("ky_dimension"), float) else "see lyapunov_spectrum_report.json"
         )
+        # Override with attractor_topology top hypothesis if available —
+        # the multi-evidence topology test is more reliable than the DMD linearised
+        # lyapunov_spectrum classification for ambiguous edge-of-chaos cases.
+        at_res = results.get("attractor_topology", {})
+        top_hyp = at_res.get("top_hypothesis")
+        at_conf = at_res.get("confidence", "low")
+        if top_hyp is not None and at_conf in ("high", "moderate"):
+            if top_hyp in ("LC", "CA", "FP"):
+                # Topology says NOT a strange attractor → downgrade if necessary
+                if verified_q1:
+                    verdict_q1 = (
+                        f"{verdict_q1} (topology overridden: "
+                        f"attractor_topology top={top_hyp}, conf={at_conf})"
+                    )
+                    ev_q1_str = (
+                        f"Lyapunov: {ev_q1_str[:80]}; "
+                        f"⚠ attractor_topology={at_res.get('top_hypothesis_name','?')} "
+                        f"({at_conf} confidence) contradicts strange-attractor verdict"
+                    )
+                    verified_q1 = False  # topology overrides
+            elif top_hyp == "SA":
+                # Both agree: strange attractor
+                ev_q1_str += f"; attractor_topology confirms SA ({at_conf} conf)"
     else:
         verified_q1 = None
         verdict_q1 = "not_tested (Phase 3e DMD disabled or failed)"
@@ -2464,14 +2937,26 @@ def _evaluate_hypotheses(results: Dict[str, Any]) -> Dict[str, Dict]:
                 "var_tau_mean": var_tau,
                 "ews_score_mean": ews_score,
             }
-            # Rising AR1 and variance → consistent with approach to critical transition
+            # Classify CSD direction:
+            #   positive τ → rising AC1/Var → consistent with critical slowing down
+            #   negative τ → falling AC1/Var → anti-CSD (trajectories converging to attractor)
+            #   mixed      → no clear signal
             csd_consistent = (
                 ac1_tau is not None and ac1_tau > 0 and
                 var_tau is not None and var_tau > 0
             )
+            csd_anti = (
+                ac1_tau is not None and ac1_tau < 0 and
+                var_tau is not None and var_tau < 0
+            )
             h3_entry["csd_consistent_with_criticality"] = csd_consistent
+            h3_entry["csd_anti_critical"] = csd_anti
             if csd_consistent:
                 summary_parts.append("CSD_consistent=True")
+            elif csd_anti:
+                summary_parts.append(
+                    "ANTI-CSD (τ<0 → converging to attractor, not approaching bifurcation)"
+                )
         else:
             summary_parts.append("CSD: not available")
 
@@ -2565,6 +3050,137 @@ def _run_phases_for_modality(
 #  Both-mode summary helper
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+def _compute_cross_modal_q9(
+    modalities: List[str],
+    all_results: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Q9: Do modalities share a dynamical core?
+
+    Computes cross-modality agreement on five key indicators:
+      1. Chaos regime agreement (same regime string → shared dynamical class)
+      2. LLE ratio (fMRI λ / EEG λ; ratio near 1.0 → shared criticality level)
+      3. Dimensionality agreement (D₂ / PCA n@90% within 2× of each other)
+      4. Hub-node overlap (same nodes appear in both modalities' top ablation list)
+      5. Granger driver overlap (same nodes appear as top drivers in both)
+
+    Returns a dict with per-indicator verdicts and an overall ``shared_core``
+    boolean.  Safe to call even if some experiments were skipped (uses None
+    gracefully).
+    """
+    if len(modalities) < 2:
+        return {"note": "Only one modality available; Q9 not applicable."}
+
+    fmri_r = all_results.get("fmri", {})
+    eeg_r = all_results.get("eeg", {})
+    if not fmri_r or not eeg_r:
+        # Try arbitrary pair of modalities
+        keys = [k for k in modalities if k in all_results and "error" not in all_results[k]]
+        if len(keys) < 2:
+            return {"note": "Insufficient modality results for Q9 comparison."}
+        fmri_r, eeg_r = all_results[keys[0]], all_results[keys[1]]
+
+    q9: Dict[str, Any] = {}
+
+    # ── 1. Chaos regime ──────────────────────────────────────────────────────
+    fmri_regime = fmri_r.get("lyapunov", {}).get("chaos_regime", {})
+    eeg_regime  = eeg_r.get("lyapunov", {}).get("chaos_regime", {})
+    r1 = fmri_regime.get("regime") if isinstance(fmri_regime, dict) else None
+    r2 = eeg_regime.get("regime")  if isinstance(eeg_regime,  dict) else None
+    regime_match = (r1 is not None and r1 == r2)
+    q9["regime"] = {"fmri": r1, "eeg": r2, "match": regime_match}
+
+    # ── 2. LLE ratio ─────────────────────────────────────────────────────────
+    lle1 = fmri_r.get("lyapunov", {}).get("mean_lyapunov")
+    lle2 = eeg_r.get("lyapunov", {}).get("mean_lyapunov")
+    # Use abs() in the denominator guard so that sign of lle2 does not flip the
+    # ratio unexpectedly when lle2 is a small negative number near zero.
+    if lle1 is not None and lle2 is not None and abs(lle1) + abs(lle2) > 1e-10:
+        lle_ratio = lle1 / (abs(lle2) + 1e-12) if abs(lle2) > 1e-10 else float("nan")
+        lle_close = (
+            not (lle_ratio != lle_ratio) and  # not NaN
+            0.2 <= abs(lle_ratio) <= 5.0  # within ~5× of each other
+        )
+        q9["lle_ratio"] = {
+            "fmri_lle": float(lle1), "eeg_lle": float(lle2),
+            "ratio": float(lle_ratio), "within_5x": lle_close,
+        }
+    else:
+        q9["lle_ratio"] = {"note": "LLE not available for one or both modalities."}
+
+    # ── 3. Dimensionality ────────────────────────────────────────────────────
+    fmri_d2 = fmri_r.get("attractor_dimension", {}).get("D2")
+    eeg_d2  = eeg_r.get("attractor_dimension", {}).get("D2")
+    fmri_n90 = fmri_r.get("attractor_dimension", {}).get("PCA_n90")
+    eeg_n90  = eeg_r.get("attractor_dimension", {}).get("PCA_n90")
+    if fmri_d2 is not None and eeg_d2 is not None:
+        d2_ratio = max(fmri_d2, eeg_d2) / (min(fmri_d2, eeg_d2) + 1e-6)
+        dim_agree = d2_ratio < 2.5  # within 2.5× → both are "low-dim"
+        q9["dimensionality"] = {
+            "fmri_D2": float(fmri_d2), "eeg_D2": float(eeg_d2),
+            "fmri_n90": fmri_n90, "eeg_n90": eeg_n90,
+            "D2_ratio": float(d2_ratio), "within_2.5x": dim_agree,
+        }
+    else:
+        q9["dimensionality"] = {
+            "fmri_n90": fmri_n90, "eeg_n90": eeg_n90,
+            "note": "D2 not available for one or both; using n@90% only.",
+        }
+
+    # ── 4. Hub-node overlap ──────────────────────────────────────────────────
+    fmri_hubs = set(fmri_r.get("hub_perturbation", {}).get("top_hub_nodes", []))
+    eeg_hubs  = set(eeg_r.get("hub_perturbation", {}).get("top_hub_nodes", []))
+    if fmri_hubs and eeg_hubs:
+        overlap = fmri_hubs & eeg_hubs
+        jaccard = len(overlap) / len(fmri_hubs | eeg_hubs)
+        q9["hub_overlap"] = {
+            "fmri_hubs": sorted(fmri_hubs), "eeg_hubs": sorted(eeg_hubs),
+            "overlap": sorted(overlap), "jaccard": float(jaccard),
+        }
+    else:
+        q9["hub_overlap"] = {"note": "Hub perturbation not available for one or both modalities."}
+
+    # ── 5. Granger-driver overlap ────────────────────────────────────────────
+    fmri_drivers = list(fmri_r.get("granger_causality", {}).get("top_drivers", []))[:5]
+    eeg_drivers  = list(eeg_r.get("granger_causality", {}).get("top_drivers", []))[:5]
+    if fmri_drivers and eeg_drivers:
+        driver_overlap = set(fmri_drivers) & set(eeg_drivers)
+        q9["granger_driver_overlap"] = {
+            "fmri_top5": fmri_drivers, "eeg_top5": eeg_drivers,
+            "overlap": sorted(driver_overlap),
+            "overlap_count": len(driver_overlap),
+        }
+    else:
+        q9["granger_driver_overlap"] = {"note": "Granger causality not available."}
+
+    # ── Overall verdict ──────────────────────────────────────────────────────
+    agree_points = []
+    if q9.get("regime", {}).get("match"):
+        agree_points.append(f"same regime ({r1})")
+    if q9.get("lle_ratio", {}).get("within_5x"):
+        agree_points.append("similar LLE magnitude")
+    if q9.get("dimensionality", {}).get("within_2.5x"):
+        agree_points.append("similar D₂")
+    n_agree = len(agree_points)
+    shared_core = n_agree >= 2
+
+    q9["verdict"] = {
+        "shared_core": shared_core,
+        "n_agreement_points": n_agree,
+        "agreement_summary": agree_points,
+        "conclusion": (
+            f"Q9 SUPPORTED: fMRI and EEG share a common dynamical core ({', '.join(agree_points)})."
+            if shared_core else
+            f"Q9 NOT_SUPPORTED: modalities differ on {3 - n_agree} of 3 core indicators. "
+            "Different temporal scales (TR=2s vs EEG sub-ms) may produce genuinely "
+            "different dynamical regimes even if they originate from the same neural system."
+        ),
+    }
+
+    return q9
+
+
 def _write_both_mode_summary(
     output_dir: Path,
     modalities: List[str],
@@ -2607,7 +3223,11 @@ def _write_both_mode_summary(
         ("dmd_spectrum", "spectral_radius"),
         ("stability", "fraction_converged"),
         ("stability", "fraction_limit_cycle"),
+        ("stability", "fraction_complex_oscillation"),
         ("stability", "fraction_unstable"),
+        ("attractor_dimension", "D2"),
+        ("attractor_dimension", "KY_linearised"),
+        ("attractor_dimension", "PCA_n90"),
     ]
     for mod in modalities:
         r = all_results.get(mod, {})
@@ -2623,6 +3243,11 @@ def _write_both_mode_summary(
                     raw = raw.get("regime", raw)  # chaos_regime → string
                 m[f"{section}.{key}"] = raw
         summary["per_modality_metrics"][mod] = m
+
+    # Q9: Do modalities share a dynamical core?
+    # Compare the key indicators across modalities and compute agreement scores.
+    q9 = _compute_cross_modal_q9(modalities, all_results)
+    summary["q9_cross_modal_comparison"] = q9
 
     try:
         with open(output_dir / "both_mode_summary.json", "w", encoding="utf-8") as f:
@@ -2654,14 +3279,18 @@ def _write_both_mode_summary(
     lines.append("|--------|" + "|".join("-----" for _ in modalities) + "|")
 
     _DISPLAY = [
-        ("LLE (Rosenstein λ₁)",   "lyapunov.mean_lyapunov"),
-        ("Chaos regime",           "lyapunov.chaos_regime"),
-        ("Convergence ratio",      "convergence.distance_ratio"),
-        ("Convergence label",      "convergence.convergence_label"),
-        ("DMD spectral radius ρ",  "dmd_spectrum.spectral_radius"),
-        ("Frac. converged",        "stability.fraction_converged"),
-        ("Frac. limit-cycle",      "stability.fraction_limit_cycle"),
-        ("Frac. unstable",         "stability.fraction_unstable"),
+        ("LLE (Rosenstein λ₁)",    "lyapunov.mean_lyapunov"),
+        ("Chaos regime",            "lyapunov.chaos_regime"),
+        ("Convergence ratio",       "convergence.distance_ratio"),
+        ("Convergence label",       "convergence.convergence_label"),
+        ("DMD spectral radius ρ",   "dmd_spectrum.spectral_radius"),
+        ("Frac. fixed-point",       "stability.fraction_converged"),
+        ("Frac. limit-cycle",       "stability.fraction_limit_cycle"),
+        ("Frac. complex-osc.",      "stability.fraction_complex_oscillation"),
+        ("Frac. unstable",          "stability.fraction_unstable"),
+        ("D₂ (corr. dim.)",         "attractor_dimension.D2"),
+        ("K-Y linear dim.",         "attractor_dimension.KY_linearised"),
+        ("PCA n@90%",               "attractor_dimension.PCA_n90"),
     ]
     for label, key in _DISPLAY:
         vals = []
@@ -2688,8 +3317,63 @@ def _write_both_mode_summary(
     lines.append(
         "> For joint analysis of fMRI + EEG in a single state vector, use "
         "`--modality joint`.  Note that joint mode results can be scale-sensitive "
-        "(see `pipeline_report.json → metadata → modality` in each sub-directory)."
+        "(see `pipeline_report.json → metadata → modality` in each sub-directory).\n"
     )
+
+    # ── Q9 cross-modal section ────────────────────────────────────────────────
+    lines.append("## Q9: Do Modalities Share a Dynamical Core?\n")
+    q9_verdict = q9.get("verdict", {})
+    lines.append(f"**Conclusion**: {q9_verdict.get('conclusion', 'N/A')}  \n")
+
+    # Regime agreement
+    regime_q9 = q9.get("regime", {})
+    lines.append(
+        f"- **Chaos regime**: fMRI=`{regime_q9.get('fmri', 'N/A')}` | "
+        f"EEG=`{regime_q9.get('eeg', 'N/A')}` | "
+        f"match={regime_q9.get('match', False)}"
+    )
+
+    # LLE comparison
+    lle_q9 = q9.get("lle_ratio", {})
+    if "note" not in lle_q9:
+        lines.append(
+            f"- **Lyapunov exponent**: fMRI λ={lle_q9.get('fmri_lle', float('nan')):.5f} | "
+            f"EEG λ={lle_q9.get('eeg_lle', float('nan')):.5f} | "
+            f"ratio={lle_q9.get('ratio', float('nan')):.2f}× "
+            f"(within 5×: {lle_q9.get('within_5x', False)})"
+        )
+
+    # Dimensionality
+    dim_q9 = q9.get("dimensionality", {})
+    if "D2_ratio" in dim_q9:
+        lines.append(
+            f"- **Attractor D₂**: fMRI={dim_q9.get('fmri_D2', float('nan')):.2f} | "
+            f"EEG={dim_q9.get('eeg_D2', float('nan')):.2f} | "
+            f"ratio={dim_q9.get('D2_ratio', float('nan')):.2f}× "
+            f"(within 2.5×: {dim_q9.get('within_2.5x', False)})"
+        )
+    else:
+        lines.append(
+            f"- **PCA n@90%**: fMRI={dim_q9.get('fmri_n90', 'N/A')} | "
+            f"EEG={dim_q9.get('eeg_n90', 'N/A')}"
+        )
+
+    # Hub overlap
+    hub_q9 = q9.get("hub_overlap", {})
+    if "overlap" in hub_q9:
+        lines.append(
+            f"- **Hub node overlap**: Jaccard={hub_q9.get('jaccard', 0):.2f} | "
+            f"shared nodes={hub_q9.get('overlap', [])}"
+        )
+
+    # Granger driver overlap
+    gc_q9 = q9.get("granger_driver_overlap", {})
+    if "overlap" in gc_q9:
+        lines.append(
+            f"- **Granger driver overlap**: {gc_q9.get('overlap_count', 0)}/5 top drivers shared | "
+            f"shared={gc_q9.get('overlap', [])}"
+        )
+    lines.append("")
 
     md_text = "\n".join(lines)
     try:

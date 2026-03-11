@@ -31,6 +31,14 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# ── Convergence label thresholds ──────────────────────────────────────────────
+# final_dist / initial_dist ratio thresholds for trajectory convergence labels.
+# Based on Kantz & Schreiber (1997) §7: ratio < 0.70 indicates clear attractor
+# basin structure; 0.70–0.90 indicates soft basin or ring attractor.
+_CONVERGING_THRESH: float = 0.70
+_WEAKLY_CONVERGING_THRESH: float = 0.90
+_DIVERGING_THRESH: float = 1.30
+
 
 def compute_pairwise_distances(
     trajectories: np.ndarray,
@@ -90,16 +98,24 @@ def compute_pairwise_distances(
     return distances.mean(axis=0).astype(np.float32)
 
 
-def _convergence_label(mean_distances: np.ndarray) -> str:
-    """Return a human-readable convergence classification."""
-    if len(mean_distances) < 2:
-        return "insufficient_data"
-    early = float(mean_distances[: len(mean_distances) // 4].mean())
-    late = float(mean_distances[-len(mean_distances) // 4 :].mean())
-    ratio = late / (early + 1e-12)
-    if ratio < 0.7:
+def _convergence_label(ratio: float) -> str:
+    """Return a convergence classification from a pre-computed final/initial ratio.
+
+    Args:
+        ratio: final_mean_distance / initial_mean_distance.  Values below 1
+               indicate trajectories are converging; above 1, diverging.
+
+    Thresholds (Kantz & Schreiber 1997, Chapter 7):
+        ratio < 0.70 → ``"converging"``    (strong attractor basin structure)
+        ratio < 0.90 → ``"weakly_converging"`` (soft basin, possible ring attractor)
+        ratio > 1.30 → ``"diverging"``     (Lyapunov-driven separation)
+        otherwise   → ``"no_structure"``   (no clear tendency)
+    """
+    if ratio < _CONVERGING_THRESH:
         return "converging"
-    if ratio > 1.3:
+    if ratio < _WEAKLY_CONVERGING_THRESH:
+        return "weakly_converging"
+    if ratio > _DIVERGING_THRESH:
         return "diverging"
     return "no_structure"
 
@@ -125,7 +141,7 @@ def run_trajectory_convergence(
             "initial_mean_distance":  float                 起始均值距离
             "final_mean_distance":    float                 终止均值距离
             "distance_ratio":         float                 final/initial
-            "convergence_label":      str                   "converging" / "diverging" / "no_structure"
+            "convergence_label":      str                   "converging" / "weakly_converging" / "diverging" / "no_structure"
         }
     """
     n_init, steps, n_regions = trajectories.shape
@@ -141,7 +157,7 @@ def run_trajectory_convergence(
     initial_d = float(mean_dist[:max(1, steps // 10)].mean())
     final_d = float(mean_dist[-max(1, steps // 10) :].mean())
     ratio = final_d / (initial_d + 1e-12)
-    label = _convergence_label(mean_dist)
+    label = _convergence_label(ratio)   # uses same ratio as logged value
 
     logger.info(
         "  初始距离=%.4f  终止距离=%.4f  比率=%.3f  → %s",
@@ -151,7 +167,9 @@ def run_trajectory_convergence(
         label,
     )
     if label == "converging":
-        logger.info("  → 检测到吸引子结构（轨迹收敛）")
+        logger.info("  → 检测到吸引子结构（轨迹强收敛）")
+    elif label == "weakly_converging":
+        logger.info("  → 轨迹弱收敛（软盆地或环形吸引子结构）")
     elif label == "diverging":
         logger.info("  → 轨迹发散（可能混沌）")
     else:

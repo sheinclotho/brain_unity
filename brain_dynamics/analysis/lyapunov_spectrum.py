@@ -49,10 +49,16 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Thresholds for strange attractor classification
-_POSITIVE_THRESH = 0.001   # λ₁ > this → positive (chaotic)
+# Thresholds for strange attractor classification.
+# _POSITIVE_THRESH is aligned with the `edge_of_chaos` boundary in lyapunov.py
+# (_THRESH_EDGE_CHAOS = 0.01).  Systems with 0 < Rosenstein LLE < 0.01 are
+# classified "edge_of_chaos", not truly chaotic — raising the threshold prevents
+# them from incorrectly triggering "strange_attractor=likely".
+_POSITIVE_THRESH = 0.01    # λ₁ > this → positive (chaotic); aligns with lyapunov.py edge_of_chaos
 _NEUTRAL_THRESH  = 0.005   # |λ₂| < this → neutral direction
 _NEGATIVE_THRESH = -0.005  # λ₃ < this → contracting
+# Strange attractors require D_KY > 1.5; 1-D linearised attractors are limit cycles.
+_SA_MIN_KY_DIM   = 1.5     # K-Y_lin ≤ this → override verdict to "unlikely"
 
 
 def _kaplan_yorke_dimension(spectrum: np.ndarray) -> float:
@@ -168,6 +174,11 @@ def assess_strange_attractor(
         )
 
     # Overall verdict
+    # Rule 1: must be chaotic (Rosenstein-anchored) + dissipative + more
+    #         negative exponents than positive.
+    # Rule 2: K-Y_lin ≤ _SA_MIN_KY_DIM (≤ 1.5) overrides to "unlikely" — a
+    #         1-D linearised attractor is a limit cycle, not a strange attractor,
+    #         even if Rosenstein LLE is slightly above the edge-of-chaos boundary.
     if is_chaotic and is_dissipative and n_negative > n_positive:
         verdict = "likely"
     elif is_chaotic and is_dissipative:
@@ -176,6 +187,17 @@ def assess_strange_attractor(
         verdict = "possible (non-dissipative chaos)"
     else:
         verdict = "unlikely"
+
+    # Low-dimensional attractor override: K-Y_lin ≤ 1.5 means the linearised
+    # attractor is at most 1-D — cannot be a strange attractor regardless of LLE.
+    if verdict in ("likely", "possible") and ky_dim <= _SA_MIN_KY_DIM:
+        original_verdict = verdict
+        verdict = "unlikely"
+        evidence.append(
+            f"⚠ K-Y_lin={ky_dim:.2f} ≤ {_SA_MIN_KY_DIM} → 1-D linearised attractor "
+            f"(override from '{original_verdict}' to 'unlikely'); "
+            "this is consistent with a limit cycle or marginal oscillation, not chaos"
+        )
 
     return {
         "is_chaotic": bool(is_chaotic),

@@ -561,6 +561,134 @@ def _local_dimensionality(
     }
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E6: Period stability & phase drift analysis (Hilbert transform)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _period_stability_analysis(Z: np.ndarray, dt: float = 1.0) -> Dict:
+    """Measure period stability and phase drift of the dominant oscillation.
+
+    Uses the Hilbert transform of PC1 to extract instantaneous amplitude and
+    phase.  Three metrics are reported:
+
+    phase_drift_rate  (float)
+        Linear phase drift per step estimated by OLS.  ≈ 0 → no secular drift
+        (strict limit cycle); nonzero → slow-manifold oscillation or drift.
+
+    period_cv  (float)
+        Coefficient of variation of inter-crossing periods (std/mean).
+        < 0.05 → very stable (limit cycle); > 0.20 → irregular / drifting.
+
+    phase_variance  (float)
+        Variance of the detrended (residual) instantaneous phase.  Small →
+        regular orbit; large → stochastic / irregular phase noise.
+
+    slow_envelope_variation  (float)
+        Std / mean of the Hilbert envelope (|analytic signal|) over the
+        trajectory.  < 0.10 → constant amplitude (limit cycle); > 0.30 →
+        slow modulation (slow-manifold / inhomogeneous oscillation).
+
+    Parameters
+    ----------
+    Z   : shape (n_traj, T_eff, n_pcs) — PCA projections
+    dt  : time step (for frequency axis labelling, not used numerically here)
+    """
+    n_traj, T_eff, n_pcs = Z.shape
+    if T_eff < 20:
+        return {"error": "trajectory_too_short"}
+
+    # Use PC1 concatenated across all trajectories (or a subset if many)
+    n_use = min(n_traj, 10)
+    pc1_all = Z[:n_use, :, 0].reshape(-1)  # (n_use * T_eff,)
+
+    # --- Hilbert transform ---
+    try:
+        from scipy.signal import hilbert as scipy_hilbert
+        analytic = scipy_hilbert(pc1_all)
+    except ImportError:
+        # Pure NumPy fallback: construct analytic signal via two-sided FFT.
+        # H(ω) = 2 for ω>0, 1 for ω=0 and ω=Nyquist, 0 for ω<0.
+        N = len(pc1_all)
+        F = np.fft.fft(pc1_all)
+        H = np.zeros(N, dtype=complex)
+        if N % 2 == 0:
+            H[0] = 1.0
+            H[1: N // 2] = 2.0
+            H[N // 2] = 1.0
+        else:
+            H[0] = 1.0
+            H[1: (N + 1) // 2] = 2.0
+        analytic = np.fft.ifft(F * H)
+
+    envelope = np.abs(analytic)
+    inst_phase = np.unwrap(np.angle(analytic))
+
+    # --- Phase drift (linear trend in phase) ---
+    t = np.arange(len(inst_phase), dtype=float)
+    # OLS: phase ≈ ω*t + φ₀ + residual
+    A = np.column_stack([t, np.ones_like(t)])
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(A, inst_phase, rcond=None)
+        omega_est = float(coeffs[0])    # rad/step (mean angular frequency)
+        phase_residual = inst_phase - (omega_est * t + float(coeffs[1]))
+    except Exception:
+        omega_est = 0.0
+        phase_residual = inst_phase.copy()
+
+    # Drift rate as fraction of mean angular frequency (dimensionless)
+    # Positive phase drift means the phase is accelerating (slower return = drifting)
+    phase_variance = float(np.var(phase_residual))
+
+    # --- Inter-crossing period variance (upward zero-crossings of PC1) ---
+    pc1 = pc1_all
+    cross_mask = (pc1[:-1] < 0) & (pc1[1:] >= 0)
+    crossing_times = np.where(cross_mask)[0].astype(float)
+    # Refine crossing time by linear interpolation
+    for i, ct in enumerate(crossing_times):
+        ct_i = int(ct)
+        dpc = float(pc1[ct_i + 1]) - float(pc1[ct_i])
+        if abs(dpc) > 1e-15:
+            crossing_times[i] = ct_i - float(pc1[ct_i]) / dpc
+
+    if len(crossing_times) >= 3:
+        periods = np.diff(crossing_times)
+        period_mean = float(periods.mean())
+        period_std  = float(periods.std())
+        period_cv   = period_std / (period_mean + 1e-15)
+    else:
+        period_mean = float("nan")
+        period_std  = float("nan")
+        period_cv   = float("nan")
+
+    # --- Envelope variation ---
+    env_mean = float(envelope.mean())
+    env_std  = float(envelope.std())
+    slow_envelope_variation = env_std / (env_mean + 1e-15)
+
+    # --- Summary classification ---
+    # Heuristic thresholds (dimensionless)
+    if (not np.isnan(period_cv)) and period_cv < 0.05 and slow_envelope_variation < 0.15:
+        stability_class = "stable_limit_cycle"
+    elif (not np.isnan(period_cv)) and period_cv < 0.15 and slow_envelope_variation < 0.30:
+        stability_class = "weakly_stable_oscillation"
+    elif (not np.isnan(period_cv)) and period_cv < 0.35:
+        stability_class = "slow_manifold_oscillation"
+    elif np.isnan(period_cv):
+        stability_class = "insufficient_crossings"
+    else:
+        stability_class = "irregular_oscillation"
+
+    return {
+        "n_crossings": len(crossing_times),
+        "period_mean_steps": round(period_mean, 2) if not np.isnan(period_mean) else None,
+        "period_cv": round(period_cv, 4) if not np.isnan(period_cv) else None,
+        "phase_variance": round(phase_variance, 6),
+        "slow_envelope_variation": round(slow_envelope_variation, 4),
+        "stability_class": stability_class,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # E5: Hypothesis scoring
 # ─────────────────────────────────────────────────────────────────────────────
@@ -572,6 +700,8 @@ def _score_hypotheses(
     local_dim: Dict,
     rosenstein_lle: Optional[float] = None,
     n_pca_90: Optional[int] = None,
+    period_stability: Optional[Dict] = None,
+    kmeans_uniform_suspect: bool = False,
 ) -> Dict:
     """Combine evidence streams into a ranked scorecard.
 
@@ -582,11 +712,13 @@ def _score_hypotheses(
 
     Evidence channels used
     ----------------------
-    spectral → freq_classification (FP / LC / LC+harm / QP / broadband)
-    velocity → rotation_index, has_neutral_direction, rotation_score
-    rqa      → DET, LAM
-    local_dim→ local_dim_mean
-    external → rosenstein_lle, n_pca_90
+    spectral          → freq_classification (FP / LC / LC+harm / QP / broadband)
+    velocity          → rotation_index, has_neutral_direction, rotation_score
+    rqa               → DET, LAM
+    local_dim         → local_dim_mean
+    external          → rosenstein_lle, n_pca_90
+    period_stability  → stability_class, period_cv, slow_envelope_variation
+    kmeans_uniform_suspect → uniform KMeans (ring/continuous attractor flag)
     """
     # ── raw scores (accumulators) ──────────────────────────────────────────
     scores: Dict[str, float] = {
@@ -717,6 +849,56 @@ def _score_hypotheses(
         elif n_pca_90 <= 5:
             scores["QP"] += 0.5
             evidence_notes["QP"].append(f"PCA n@90%={n_pca_90} (moderate-D)")
+
+    # ── E6: Period stability (Hilbert transform) ─────────────────────────
+    if period_stability and "error" not in period_stability:
+        sc = period_stability.get("stability_class", "")
+        pcv = period_stability.get("period_cv")
+        sev = period_stability.get("slow_envelope_variation")
+
+        if sc == "stable_limit_cycle":
+            scores["LC"] += 3.0
+            evidence_notes["LC"].append(
+                f"stable limit cycle: period_cv={pcv:.3f}, "
+                f"slow_envelope_variation={sev:.3f}"
+            )
+        elif sc == "weakly_stable_oscillation":
+            scores["LC"] += 1.5
+            scores["CA"] += 0.5
+            evidence_notes["LC"].append(
+                f"weakly stable oscillation: period_cv={pcv:.3f}, sev={sev:.3f}"
+            )
+        elif sc == "slow_manifold_oscillation":
+            # Oscillation + slow drift → fits "CA" (continuous manifold) or
+            # "QP" (two-timescale) better than pure LC
+            scores["CA"] += 1.5
+            scores["QP"] += 1.0
+            evidence_notes["CA"].append(
+                f"slow-manifold oscillation: period_cv={pcv:.3f}, "
+                f"envelope variation={sev:.3f} (two-timescale dynamics)"
+            )
+            evidence_notes["QP"].append(
+                f"two-timescale: period_cv={pcv:.3f}"
+            )
+        elif sc == "irregular_oscillation":
+            scores["SA"] += 1.0
+            scores["QP"] += 0.5
+            evidence_notes["SA"].append(
+                f"irregular oscillation: period_cv={pcv:.3f}"
+            )
+        # insufficient_crossings: no update (no crossings detected)
+
+    # ── External: KMeans uniform-cluster signature ───────────────────────
+    # When KMeans(K) gives perfectly equal cluster sizes + high silhouette,
+    # K-means is likely cutting through a continuous (ring) attractor, not
+    # detecting discrete basins.  This is evidence for CA (continuous attractor)
+    # and weak evidence AGAINST SA (strange attractor requires folding).
+    if kmeans_uniform_suspect:
+        scores["CA"] += 2.0
+        scores["SA"] -= 1.0   # uniform ring is inconsistent with strange attractor
+        evidence_notes["CA"].append(
+            "uniform KMeans cluster sizes + high silhouette → ring/continuous attractor"
+        )
 
     # ── Normalise scores (clip to 0 first) ──────────────────────────────
     for h in scores:
@@ -1011,28 +1193,31 @@ def run_attractor_topology(
     n_pca_90: Optional[int] = None,
     seed: int = 42,
     rqa_max_T: int = 500,
+    kmeans_uniform_suspect: bool = False,
 ) -> Dict:
     """Run the complete attractor topology analysis.
 
     Args:
-        trajectories:    shape (n_traj, T, N) — free-dynamics trajectories.
-        output_dir:      directory to write plots and JSON.  None → no files.
-        burnin:          steps to skip at the start of each trajectory.
-        dt:              time step size (for frequency axis labelling).
-        n_pcs:           number of PCs to use internally (default 6).
-        rosenstein_lle:  pre-computed Rosenstein LLE from pipeline Phase 3d
-                         (improves hypothesis scoring).
-        n_pca_90:        pre-computed n@90% PCA threshold from pipeline Phase
-                         3g (used as an additional dimension evidence channel).
-        seed:            random seed for local dimensionality sampling.
-        rqa_max_T:       truncate to this many steps for RQA (avoids O(T²)
-                         cost for very long trajectories).
+        trajectories:           shape (n_traj, T, N) — free-dynamics trajectories.
+        output_dir:             directory to write plots and JSON.  None → no files.
+        burnin:                 steps to skip at the start of each trajectory.
+        dt:                     time step size (for frequency axis labelling).
+        n_pcs:                  number of PCs to use internally (default 6).
+        rosenstein_lle:         pre-computed Rosenstein LLE from pipeline Phase 3d
+                                (improves hypothesis scoring).
+        n_pca_90:               pre-computed n@90% PCA threshold from pipeline Phase
+                                3g (used as an additional dimension evidence channel).
+        seed:                   random seed for local dimensionality sampling.
+        rqa_max_T:              truncate to this many steps for RQA (avoids O(T²)
+                                cost for very long trajectories).
+        kmeans_uniform_suspect: True if Phase 3b KMeans detected nearly equal-sized
+                                clusters + high silhouette (ring/continuous attractor
+                                signature from attractor_analysis.py).
 
     Returns:
         Serialisable dict with keys:
           spectral, velocity_field, recurrence, local_dimensionality,
-          scoring, top_hypothesis, confidence, (+ attractor_topology key
-          with the full report for JSON serialisation).
+          period_stability, scoring, top_hypothesis, confidence.
     """
     n_traj, T, N = trajectories.shape
     burnin = min(burnin, T - 1)
@@ -1100,6 +1285,20 @@ def run_attractor_topology(
         logger.warning("  Local dimensionality failed: %s", e)
         local_dim = {}
 
+    # ── E6: Period stability (Hilbert transform) ─────────────────────────────
+    try:
+        period_stability = _period_stability_analysis(Z, dt=dt)
+        if "error" not in period_stability:
+            logger.info(
+                "  Period stability: class=%s, period_cv=%s, envelope_var=%.3f",
+                period_stability.get("stability_class", "?"),
+                period_stability.get("period_cv"),
+                period_stability.get("slow_envelope_variation", float("nan")),
+            )
+    except Exception as e:
+        logger.warning("  Period stability analysis failed: %s", e)
+        period_stability = {"error": str(e)}
+
     # ── E5: Hypothesis scoring ──────────────────────────────────────────────
     try:
         scoring = _score_hypotheses(
@@ -1109,6 +1308,8 @@ def run_attractor_topology(
             local_dim=local_dim,
             rosenstein_lle=rosenstein_lle,
             n_pca_90=n_pca_90,
+            period_stability=period_stability,
+            kmeans_uniform_suspect=kmeans_uniform_suspect,
         )
         logger.info(
             "  Top hypothesis: %s (score=%.3f, %s confidence)",
@@ -1130,6 +1331,7 @@ def run_attractor_topology(
         "velocity_field":       _strip_internal(velocity),
         "recurrence":           _strip_internal(rqa),
         "local_dimensionality": local_dim,
+        "period_stability":     period_stability,
         "scoring":              scoring,
         "top_hypothesis":       scoring.get("top_hypothesis"),
         "top_hypothesis_name":  scoring.get("top_hypothesis_name"),
