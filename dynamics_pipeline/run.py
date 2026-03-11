@@ -16,6 +16,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import List
 
 # Allow running this file directly (e.g. ``python dynamics_pipeline/run.py``)
 # in addition to the standard module invocation
@@ -29,6 +30,24 @@ if __name__ == "__main__" and __package__ is None:
 from .pipeline import run_pipeline
 
 logger = logging.getLogger("dynamics_pipeline")
+
+# Stems/prefixes of training checkpoint files that must NOT be treated as graph caches.
+_CHECKPOINT_STEMS: frozenset = frozenset({"best_model", "swa_model"})
+_CHECKPOINT_PREFIX: str = "checkpoint_epoch_"
+
+
+def _find_graph_pts(folder: Path) -> List[Path]:
+    """Return a sorted list of graph-cache ``.pt`` files inside *folder*.
+
+    Training checkpoints (``best_model.pt``, ``swa_model.pt``,
+    ``checkpoint_epoch_*.pt``) are excluded automatically.
+    """
+    result: List[Path] = []
+    for f in sorted(folder.glob("*.pt")):
+        stem = f.stem
+        if stem not in _CHECKPOINT_STEMS and not stem.startswith(_CHECKPOINT_PREFIX):
+            result.append(f)
+    return result
 
 # ── Default configuration ─────────────────────────────────────────────────────
 
@@ -169,16 +188,30 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  Full run:   python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt
-  Quick run:  python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --quick
-  Phases 1-3: python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --phases 1 2 3
-  EEG mode:   python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality eeg
-  Both modes: python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality both
-  Joint mode: python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality joint
+  Full run:    python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt
+  Quick run:   python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --quick
+  Phases 1-3:  python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --phases 1 2 3
+  EEG mode:    python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality eeg
+  Both modes:  python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality both
+  Joint mode:  python -m dynamics_pipeline.run --model best_model.pt --graph graph.pt --modality joint
+  Folder mode: python -m dynamics_pipeline.run --model best_model.pt --graph outputs/graph_cache/
         """,
     )
     p.add_argument("--model", required=True, help="Trained model checkpoint (.pt)")
-    p.add_argument("--graph", required=True, help="Graph cache file (.pt)")
+    p.add_argument(
+        "--graph",
+        required=True,
+        help=(
+            "Graph cache file (.pt) **or** a folder containing multiple graph-cache "
+            ".pt files.  When a folder is given, all .pt files in it (sorted "
+            "alphabetically, training checkpoints excluded) are used as context "
+            "sources for free-dynamics trajectories.  The first file becomes the "
+            "primary graph (used for the response matrix and all other analyses); "
+            "the remaining files provide additional context windows so that "
+            "n_init trajectories cycle through diverse historical recordings even "
+            "when each individual file has T ≤ context_length."
+        ),
+    )
     p.add_argument("--config", type=Path, default=None, help="YAML config override")
     p.add_argument("--training-config", default=None, help="Training config.yaml")
     p.add_argument("--output", default=None, help="Output directory")
@@ -245,7 +278,27 @@ def main() -> None:
 
     # CLI overrides
     cfg["model"]["path"] = args.model
-    cfg["model"]["graph_path"] = args.graph
+    # --graph may point to a single .pt file OR a folder of .pt files.
+    # If a folder: collect all .pt files (sorted, checkpoints excluded) and
+    # store as a list so pipeline.run_pipeline() can use them for context diversity.
+    _graph_arg = Path(args.graph)
+    if _graph_arg.is_dir():
+        _graph_pts = _find_graph_pts(_graph_arg)
+        if not _graph_pts:
+            logger.error(
+                "--graph folder '%s' contains no valid .pt graph-cache files "
+                "(training checkpoints are excluded automatically).",
+                _graph_arg,
+            )
+            sys.exit(1)
+        logger.info(
+            "--graph folder: %d .pt file(s) found in '%s'. "
+            "Primary graph: '%s'. Extra graphs: %d.",
+            len(_graph_pts), _graph_arg, _graph_pts[0].name, len(_graph_pts) - 1,
+        )
+        cfg["model"]["graph_path"] = [str(p) for p in _graph_pts]
+    else:
+        cfg["model"]["graph_path"] = args.graph
     if args.training_config:
         cfg["model"]["config_path"] = args.training_config
     if args.output:
