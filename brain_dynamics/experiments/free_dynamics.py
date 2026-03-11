@@ -77,18 +77,33 @@ def _load_graph_x_only(
     required_nts: List[str],
     n_regions_primary: int,
     nt_primary: str,
+    n_nodes_per_nt: Optional[Dict[str, int]] = None,
 ) -> Optional[Dict[str, "torch.Tensor"]]:
     """Load **only** the ``.x`` tensors from a graph-cache file on CPU.
 
     Returns a ``{node_type: tensor}`` dict on success, or ``None`` when the
-    file is unreadable, not a ``HeteroData``, or the primary modality's node
-    count does not match ``n_regions_primary``.
+    file is unreadable, not a ``HeteroData``, or any required modality's node
+    count does not match the primary base-graph's node count for that type.
 
     Loading only ``.x`` data (no edge rebuilding) keeps memory use minimal
     and avoids the expensive Pearson-correlation edge-reconstruction step.
     Edges used during rollout always come from the *primary* graph; swapping
     only ``.x`` provides genuine BOLD-history diversity while preserving the
     structural connectivity of the primary subject.
+
+    Args:
+        path:              Path to the graph-cache ``.pt`` file.
+        required_nts:      Node types to collect (must all be present).
+        n_regions_primary: Expected node count for *nt_primary*.
+        nt_primary:        The primary modality node type (e.g. ``'fmri'``).
+        n_nodes_per_nt:    Expected node count for **every** required node type,
+                           keyed by node-type string.  When provided, all
+                           secondary modalities are validated against these
+                           counts — this prevents CUDA index-out-of-bounds
+                           (``srcIndex < srcSelectDimSize``) that occurs when a
+                           secondary modality (e.g. ``'eeg'``) in a pool graph
+                           has fewer nodes than the primary graph's edge_index
+                           was built for.
     """
     try:
         from torch_geometric.data import HeteroData
@@ -103,11 +118,34 @@ def _load_graph_x_only(
         if g_x.shape[0] != n_regions_primary:
             return None
         # Collect x-data for every node type also present in the primary graph.
+        # CRITICAL: validate the node count for every secondary modality against
+        # the expected count from the primary base-graph.  The primary graph's
+        # edge_index was built for a specific N per modality; swapping in a
+        # secondary graph with a different N causes edge indices to exceed the
+        # feature-tensor dimension, triggering CUDA assertion
+        # ``srcIndex < srcSelectDimSize`` during GNN message passing.
         x_data: Dict[str, torch.Tensor] = {}
         for nt in required_nts:
-            if nt in g.node_types and hasattr(g[nt], "x") and g[nt].x is not None:
-                # .clone() detaches from the loaded graph so the rest can be GC'd.
-                x_data[nt] = g[nt].x.clone()
+            if nt not in g.node_types:
+                continue
+            nt_x = getattr(g[nt], "x", None)
+            if nt_x is None:
+                continue
+            # Validate node count for secondary modalities when expected counts
+            # are provided.  Primary modality is already validated above.
+            if n_nodes_per_nt is not None and nt != nt_primary:
+                expected_n = n_nodes_per_nt.get(nt)
+                if expected_n is not None and nt_x.shape[0] != expected_n:
+                    logger.debug(
+                        "_load_graph_x_only: skipping '%s' — node type '%s' "
+                        "has N=%d but primary graph expects N=%d; "
+                        "mismatched secondary modality would cause CUDA "
+                        "index-out-of-bounds during GNN message passing.",
+                        path.name, nt, nt_x.shape[0], expected_n,
+                    )
+                    return None
+            # .clone() detaches from the loaded graph so the rest can be GC'd.
+            x_data[nt] = nt_x.clone()
         return x_data if x_data else None
     except (FileNotFoundError, IsADirectoryError, OSError,
             RuntimeError, AttributeError, TypeError,
@@ -156,6 +194,18 @@ def _build_graph_pool(
         )
         n_regions_primary = int(simulator.n_regions)
 
+    # Build per-node-type expected counts from the primary base_graph.
+    # This is used by _load_graph_x_only to validate ALL modalities, not just
+    # the primary.  Without this, a secondary pool graph with a different N_eeg
+    # would be accepted but its swapped .x would be incompatible with the primary
+    # graph's edge_index, causing CUDA ``srcIndex < srcSelectDimSize`` assertion.
+    n_nodes_per_nt: Dict[str, int] = {}
+    for nt in required_nts:
+        try:
+            n_nodes_per_nt[nt] = int(simulator.base_graph[nt].x.shape[0])
+        except (AttributeError, KeyError, TypeError):
+            pass
+
     pool: List[Optional[Dict[str, torch.Tensor]]] = [None]  # index 0 = primary
 
     n_ok = 0
@@ -164,6 +214,7 @@ def _build_graph_pool(
         path = Path(path)  # normalise: accept both str and Path
         x_data = _load_graph_x_only(
             path, required_nts, n_regions_primary, nt_primary,
+            n_nodes_per_nt=n_nodes_per_nt,
         )
         if x_data is not None:
             pool.append(x_data)
@@ -171,8 +222,8 @@ def _build_graph_pool(
         else:
             logger.warning(
                 "  多图上下文: 跳过图文件 '%s' "
-                "（无法加载、格式不符或节点数 ≠ %d）。",
-                path.name, n_regions_primary,
+                "（无法加载、格式不符或任意模态节点数不匹配）。",
+                path.name,
             )
             n_skip += 1
 
