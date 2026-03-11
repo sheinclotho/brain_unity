@@ -146,8 +146,21 @@ def _get_square_connectivity(
 
 
 def run_phase1_data(cfg: dict, simulator, output_dir: Path,
-                    device: str) -> Dict[str, Any]:
-    """Phase 1: Generate free-dynamics trajectories and response matrix."""
+                    device: str,
+                    graph_paths: Optional[List[Path]] = None) -> Dict[str, Any]:
+    """Phase 1: Generate free-dynamics trajectories and response matrix.
+
+    Args:
+        cfg:         Merged configuration dictionary.
+        simulator:   BrainDynamicsSimulator for the target modality.
+        output_dir:  Output directory for saved artefacts.
+        device:      Compute device string.
+        graph_paths: Optional list of *all* graph-cache paths (index 0 = the
+                     primary graph already loaded into ``simulator.base_graph``;
+                     indices 1+ = extra recordings for context diversity in
+                     :func:`run_free_dynamics`).  ``None`` → single-graph mode
+                     (current default behaviour).
+    """
     _step(1, "Data Generation")
     results: Dict[str, Any] = {}
     dg = cfg["data_generation"]
@@ -161,6 +174,7 @@ def run_phase1_data(cfg: dict, simulator, output_dir: Path,
         output_dir=output_dir if cfg["output"].get("save_trajectories") else None,
         device=device,
         n_temporal_windows=dg.get("n_temporal_windows", None),
+        graph_paths=graph_paths,
     )
     results["trajectories"] = trajectories
     logger.info("  → trajectories shape: %s", trajectories.shape)
@@ -3102,6 +3116,7 @@ def _run_phases_for_modality(
     modality: str,
     output_dir: Path,
     device: str,
+    graph_paths: Optional[List[Path]] = None,
 ) -> Dict[str, Any]:
     """
     Run all six analysis phases for a single modality.
@@ -3112,12 +3127,15 @@ def _run_phases_for_modality(
     two sequential runs.
 
     Args:
-        cfg:        Merged configuration dictionary.
-        simulator:  ``BrainDynamicsSimulator`` (or energy-constrained wrapper)
-                    already configured for *modality*.
-        modality:   ``"fmri"``, ``"eeg"``, or ``"joint"``.
-        output_dir: Per-modality output directory (created if absent).
-        device:     Compute device string.
+        cfg:         Merged configuration dictionary.
+        simulator:   ``BrainDynamicsSimulator`` (or energy-constrained wrapper)
+                     already configured for *modality*.
+        modality:    ``"fmri"``, ``"eeg"``, or ``"joint"``.
+        output_dir:  Per-modality output directory (created if absent).
+        device:      Compute device string.
+        graph_paths: Optional list of *all* graph-cache paths for multi-graph
+                     context diversity (see :func:`run_phase1_data`).  ``None``
+                     → single-graph mode.
 
     Returns:
         results dict containing all computed artefacts for this modality.
@@ -3126,7 +3144,8 @@ def _run_phases_for_modality(
 
     results: Dict[str, Any] = {}
 
-    results.update(run_phase1_data(cfg, simulator, output_dir, device))
+    results.update(run_phase1_data(cfg, simulator, output_dir, device,
+                                   graph_paths=graph_paths))
     run_phase2_structure(cfg, results, output_dir)
     run_phase3_dynamics(cfg, results, simulator, output_dir, modality=modality)
     run_phase4_validation(cfg, results, output_dir)
@@ -3533,8 +3552,8 @@ def run_pipeline(cfg: dict) -> Dict[str, Any]:
     logger.info("=" * 60)
     logger.info("Loading model and graph cache...")
     model_path = cfg["model"]["path"]
-    graph_path = cfg["model"]["graph_path"]
-    if not model_path or not graph_path:
+    graph_path_raw = cfg["model"]["graph_path"]
+    if not model_path or not graph_path_raw:
         raise ValueError("model.path and model.graph_path are required.")
 
     twin = load_trained_model(
@@ -3542,10 +3561,36 @@ def run_pipeline(cfg: dict) -> Dict[str, Any]:
         config_path=cfg["model"].get("config_path"),
     )
     k_cross_modal = cfg["model"].get("k_cross_modal", 5)
+
+    # graph_path_raw may be:
+    #   str / Path  → single graph-cache file (legacy / file mode)
+    #   list[str]   → multiple graph-cache paths (folder mode, set by run.py)
+    # The first entry is always the *primary* graph used for everything except
+    # the free-dynamics context pool.  Extra entries provide additional BOLD
+    # recordings so that n_init trajectories cycle through diverse contexts
+    # even when each individual file has T ≤ context_length.
+    if isinstance(graph_path_raw, list):
+        all_graph_paths: List[Path] = [Path(p) for p in graph_path_raw]
+        if not all_graph_paths:
+            raise ValueError("model.graph_path list is empty.")
+        primary_graph_path = all_graph_paths[0]
+    else:
+        primary_graph_path = Path(graph_path_raw)
+        all_graph_paths = [primary_graph_path]
+
     base_graph = load_graph_for_inference(
-        graph_path=graph_path, device=device,
+        graph_path=str(primary_graph_path), device=device,
         k_cross_modal=k_cross_modal,
     )
+    if len(all_graph_paths) > 1:
+        logger.info(
+            "Multi-graph context pool: %d total graph file(s) "
+            "(primary: '%s', extra: %d). "
+            "Free-dynamics trajectories will cycle through all files for "
+            "maximum context diversity.",
+            len(all_graph_paths), primary_graph_path.name,
+            len(all_graph_paths) - 1,
+        )
 
     # ── Determine which modalities to run ─────────────────────────────────────
     modality_cfg = cfg["simulator"].get("modality", "fmri")
@@ -3624,11 +3669,14 @@ def run_pipeline(cfg: dict) -> Dict[str, Any]:
             logger.info("⚡ Energy constraint: E_budget=%.4f", ec_budget)
         return sim
 
+    _graph_paths_for_phases = all_graph_paths if len(all_graph_paths) > 1 else None
+
     if len(modalities_to_run) == 1:
         # Single or joint: flat result dict (backward-compatible)
         mod = modalities_to_run[0]
         simulator = _make_simulator(mod)
-        results = _run_phases_for_modality(cfg, simulator, mod, output_dir, device)
+        results = _run_phases_for_modality(cfg, simulator, mod, output_dir, device,
+                                           graph_paths=_graph_paths_for_phases)
         elapsed = time.time() - t0
         logger.info("=" * 60)
         logger.info(
@@ -3648,6 +3696,7 @@ def run_pipeline(cfg: dict) -> Dict[str, Any]:
             simulator = _make_simulator(mod)
             all_results[mod] = _run_phases_for_modality(
                 cfg, simulator, mod, mod_output_dir, device,
+                graph_paths=_graph_paths_for_phases,
             )
         except Exception as exc:
             logger.error("  [%s] pipeline failed: %s", mod.upper(), exc)
