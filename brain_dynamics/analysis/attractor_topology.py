@@ -702,6 +702,7 @@ def _score_hypotheses(
     n_pca_90: Optional[int] = None,
     period_stability: Optional[Dict] = None,
     kmeans_uniform_suspect: bool = False,
+    dmd_n_hopf_pairs: Optional[int] = None,
 ) -> Dict:
     """Combine evidence streams into a ranked scorecard.
 
@@ -719,6 +720,7 @@ def _score_hypotheses(
     external          → rosenstein_lle, n_pca_90
     period_stability  → stability_class, period_cv, slow_envelope_variation
     kmeans_uniform_suspect → uniform KMeans (ring/continuous attractor flag)
+    dmd_n_hopf_pairs  → number of Hopf pairs in DMD linearised spectrum
     """
     # ── raw scores (accumulators) ──────────────────────────────────────────
     scores: Dict[str, float] = {
@@ -727,6 +729,7 @@ def _score_hypotheses(
         "QP": 0.0,   # quasi-periodic / torus
         "CA": 0.0,   # continuous attractor
         "SA": 0.0,   # strange / chaotic attractor
+        "SM": 0.0,   # slow manifold + Hopf oscillation
     }
     evidence_notes: Dict[str, List[str]] = {h: [] for h in scores}
 
@@ -869,16 +872,31 @@ def _score_hypotheses(
                 f"weakly stable oscillation: period_cv={pcv:.3f}, sev={sev:.3f}"
             )
         elif sc == "slow_manifold_oscillation":
-            # Oscillation + slow drift → fits "CA" (continuous manifold) or
-            # "QP" (two-timescale) better than pure LC
-            scores["CA"] += 1.5
-            scores["QP"] += 1.0
+            # Now that SM hypothesis exists, slow_manifold_oscillation is
+            # direct evidence for SM — NOT primarily CA.  This block adds a
+            # partial +1.5 credit (E6 period-stability evidence).  The main
+            # SM-specific scoring block below adds a further +3.0 (from the
+            # SM hypothesis section), giving a cumulative total of +4.5 for SM
+            # when period_stability == "slow_manifold_oscillation".  This
+            # higher total is intentional: two independent evidence streams
+            # (E6 period-stability + SM hypothesis scoring) both confirm the
+            # same classification, so the evidence should accumulate.
+            # The final score is normalised by max_possible_score, so the
+            # absolute magnitude of these numbers does not matter — only
+            # their relative ordering across hypotheses.
+            scores["SM"] += 1.5   # E6 period-stability partial credit
+            scores["CA"] += 0.5   # reduced from 1.5; SM is the better fit
+            scores["QP"] += 0.5   # reduced from 1.0
+            evidence_notes["SM"].append(
+                "slow-manifold oscillation (E6 preview): "
+                f"period_cv={f'{pcv:.3f}' if pcv is not None else '?'}, "
+                f"envelope variation={f'{sev:.3f}' if sev is not None else '?'}"
+            )
             evidence_notes["CA"].append(
-                f"slow-manifold oscillation: period_cv={pcv:.3f}, "
-                f"envelope variation={sev:.3f} (two-timescale dynamics)"
+                "slow-manifold oscillation (CA component): neutral drift direction"
             )
             evidence_notes["QP"].append(
-                f"two-timescale: period_cv={pcv:.3f}"
+                f"two-timescale: period_cv={f'{pcv:.3f}' if pcv is not None else '?'}"
             )
         elif sc == "irregular_oscillation":
             scores["SA"] += 1.0
@@ -899,6 +917,91 @@ def _score_hypotheses(
         evidence_notes["CA"].append(
             "uniform KMeans cluster sizes + high silhouette → ring/continuous attractor"
         )
+
+    # ── SM: Slow Manifold + Hopf Oscillation ─────────────────────────────
+    # This hypothesis captures the "canonical near-critical brain pattern":
+    #   modular network → low-rank coupling → ρ≈1 → mode decay → slow manifold
+    #   + Hopf oscillations riding on the manifold.
+    # Evidence accumulates from:
+    #   1. Period stability = "slow_manifold_oscillation" (direct evidence: two
+    #      timescales — slow drift + faster oscillation on the manifold surface)
+    #   2. Slow envelope variation (amplitude modulation by the slow mode)
+    #   3. Hopf pairs in DMD linearised spectrum
+    #   4. Local dimensionality ≈ 1 (thin manifold)
+    #   5. Neutral direction in velocity field (manifold's flat direction)
+    #   6. LLE near zero or slightly positive (near-critical, not deeply stable)
+    if period_stability and "error" not in period_stability:
+        sc = period_stability.get("stability_class", "")
+        pcv = period_stability.get("period_cv")
+        sev = period_stability.get("slow_envelope_variation", 0.0)
+
+        if sc == "slow_manifold_oscillation":
+            # Strongest single evidence for SM hypothesis.
+            scores["SM"] += 3.0
+            pcv_str = f"{pcv:.3f}" if pcv is not None else "?"
+            evidence_notes["SM"].append(
+                f"slow-manifold oscillation confirmed by Hilbert: "
+                f"period_cv={pcv_str}, "
+                f"slow_envelope_variation={sev:.3f}"
+            )
+        elif sc in ("weakly_stable_oscillation",):
+            # Partial evidence: oscillation present but less irregular drift
+            scores["SM"] += 1.0
+            evidence_notes["SM"].append(
+                f"weakly stable oscillation ({sc}): possible slow manifold"
+            )
+
+        # Slow envelope variation: amplitude modulated by slow drift
+        # (distinguishes SM from pure LC where sev < 0.15)
+        if sev > 0.25:
+            scores["SM"] += 1.0
+            # Limit cycle is characterised by constant amplitude; slow amplitude
+            # modulation (sev > 0.25) is inconsistent with that assumption.
+            # Weight -0.5 (half the SM reward) so a single signal does not
+            # dominate the comparison.
+            scores["LC"] -= 0.5
+            evidence_notes["SM"].append(
+                f"slow amplitude modulation (sev={sev:.3f}>0.25) → slow drift on manifold"
+            )
+            if "LC" in evidence_notes:
+                evidence_notes["LC"].append(
+                    f"slow amplitude modulation (sev={sev:.3f}) reduces LC likelihood"
+                )
+
+    # DMD Hopf pairs: oscillatory modes present in linearised dynamics
+    if dmd_n_hopf_pairs is not None and dmd_n_hopf_pairs > 0:
+        scores["SM"] += 1.5
+        scores["LC"] += 0.5   # Hopf is also consistent with LC
+        evidence_notes["SM"].append(
+            f"DMD has {dmd_n_hopf_pairs} Hopf pair(s) — linearised oscillatory modes"
+        )
+
+    # Neutral direction in velocity field: slow manifold's flat direction
+    has_neut = velocity.get("has_neutral_direction", False)
+    if has_neut:
+        # Already scored CA, but also consistent with SM (which has a neutral
+        # slow-drift direction in addition to oscillations)
+        scores["SM"] += 1.0
+        evidence_notes["SM"].append(
+            "neutral velocity field direction → slow manifold flat direction"
+        )
+
+    # Local dimension ≈ 1: very thin manifold (canonical SM signature)
+    ld = local_dim.get("local_dim_mean")
+    if ld is not None and np.isfinite(ld) and ld < 1.5:
+        scores["SM"] += 1.5
+        evidence_notes["SM"].append(
+            f"local dim ≈ 1 ({ld:.2f}) — very thin attractor, consistent with SM"
+        )
+
+    # LLE near zero or slightly positive: near-critical dynamics on the manifold
+    # (not strongly stable = FP; not strongly chaotic = SA)
+    if rosenstein_lle is not None:
+        if -0.02 <= rosenstein_lle <= 0.05:
+            scores["SM"] += 0.5
+            evidence_notes["SM"].append(
+                f"Rosenstein LLE ≈ 0 ({rosenstein_lle:.5f}) → near-critical SM"
+            )
 
     # ── Normalise scores (clip to 0 first) ──────────────────────────────
     for h in scores:
@@ -926,6 +1029,7 @@ def _score_hypotheses(
         "QP": "Quasi-Periodic / Torus",
         "CA": "Continuous Attractor",
         "SA": "Strange / Chaotic Attractor",
+        "SM": "Slow Manifold + Hopf Oscillation",
     }
 
     hypothesis_ranking = [
@@ -1194,6 +1298,7 @@ def run_attractor_topology(
     seed: int = 42,
     rqa_max_T: int = 500,
     kmeans_uniform_suspect: bool = False,
+    dmd_n_hopf_pairs: Optional[int] = None,
 ) -> Dict:
     """Run the complete attractor topology analysis.
 
@@ -1213,6 +1318,9 @@ def run_attractor_topology(
         kmeans_uniform_suspect: True if Phase 3b KMeans detected nearly equal-sized
                                 clusters + high silhouette (ring/continuous attractor
                                 signature from attractor_analysis.py).
+        dmd_n_hopf_pairs:       number of Hopf pairs from Phase 3e DMD spectrum
+                                analysis (improves SM hypothesis scoring; None if
+                                DMD was not run or failed).
 
     Returns:
         Serialisable dict with keys:
@@ -1310,6 +1418,7 @@ def run_attractor_topology(
             n_pca_90=n_pca_90,
             period_stability=period_stability,
             kmeans_uniform_suspect=kmeans_uniform_suspect,
+            dmd_n_hopf_pairs=dmd_n_hopf_pairs,
         )
         logger.info(
             "  Top hypothesis: %s (score=%.3f, %s confidence)",

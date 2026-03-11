@@ -495,6 +495,7 @@ class BrainDynamicsSimulator:
         steps: int = 50,
         stimulus: Optional[Stimulus] = None,
         context_window_idx: int = 0,
+        context_start: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         连续动力学模拟（TwinBrainDigitalTwin 自回归预测）。
@@ -504,24 +505,27 @@ class BrainDynamicsSimulator:
             对应模态的原始数值。这样不同的 ``x0`` 会产生不同的初始脑状态，使
             ``run_free_dynamics`` 中的多条轨迹真正从不同位置出发（计划书 §五）。
 
-        ``context_window_idx`` 时序窗口机制：
-            选择从 ``base_graph`` 时间序列的哪个历史窗口作为初始上下文。
-            使用滑动步长 ``stride = max(1, context_length // 4)``（75% 重叠），
-            从有限时序数据中最大化可用窗口数：
+        上下文窗口选择（二选一）：
 
-              context_window_idx=0 → 最近 context_length 步（默认行为）
-              context_window_idx=1 → 起点向前移动 stride 步
-              context_window_idx=k → x[:, T-L-k*s : T-k*s, :] （L=context_length, s=stride）
+        **直接模式** (``context_start`` 非 None)：
+            使用 ``data[:, context_start : context_start + context_length, :]``
+            作为初始上下文，所有节点类型的上下文长度完全相同。
+            由 :func:`run_free_dynamics` 用于随机等长窗口初始化。
 
-            可用窗口数通过 ``simulator.n_temporal_windows`` 属性查询（取决于
-            主模态时序长度和 stride 大小）。
+        **索引模式** (``context_start=None``，默认)：
+            ``context_window_idx=0`` → 最近 context_length 步（默认行为）
+            ``context_window_idx=k`` → x[:, T-L-k*s : T-k*s, :]
+            （L=context_length, s=stride=L//4）
 
         Args:
             x0:                 初始脑状态，shape (n_regions,)。
                                 注入为初始上下文最后一步（可选）。
             steps:              模拟步数（fMRI TR 数）。
             stimulus:           刺激对象（实现 Stimulus.value(t)）；None → 自由演化。
-            context_window_idx: 选择哪个时序窗口作为初始上下文（默认 0 = 最近窗口）。
+            context_window_idx: 索引模式下的时序窗口编号（默认 0）。
+                                当 ``context_start`` 非 None 时忽略。
+            context_start:      直接模式：指定上下文起始步（非负整数）。
+                                None → 使用索引模式。
 
         Returns:
             trajectory: shape (steps, n_regions)，每步的脑状态。
@@ -533,9 +537,11 @@ class BrainDynamicsSimulator:
                 stimuli=[stimulus] if stimulus is not None else [],
                 x0=x0,
                 context_window_idx=context_window_idx,
+                context_start=context_start,
             ) if self.modality == "joint" else self._rollout_with_twin(
                 steps=steps, stimulus=stimulus, x0=x0,
                 context_window_idx=context_window_idx,
+                context_start=context_start,
             )
         )
 
@@ -545,6 +551,7 @@ class BrainDynamicsSimulator:
         steps: int = 50,
         stimuli: Optional[List[Stimulus]] = None,
         context_window_idx: int = 0,
+        context_start: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         多脑区同时刺激的连续模拟（TwinBrainDigitalTwin）。
@@ -568,12 +575,14 @@ class BrainDynamicsSimulator:
             return self._rollout_multi_stim_joint(
                 steps=steps, stimuli=stimuli, x0=x0,
                 context_window_idx=context_window_idx,
+                context_start=context_start,
             )
         if stimuli is None:
             stimuli = []
         return self._rollout_multi_stim_with_twin(
             steps=steps, stimuli=stimuli, x0=x0,
             context_window_idx=context_window_idx,
+            context_start=context_start,
         )
 
     # ── Wolf-Benettin rollout pair ────────────────────────────────────────────
@@ -765,33 +774,22 @@ class BrainDynamicsSimulator:
         """
         Number of overlapping context windows available in ``base_graph``.
 
-        **Primary path** — full-context sliding windows (75 % overlap):
+        All windows have **equal length** (= ``context_length`` steps).  The
+        stride between consecutive windows is ``max(1, context_length // 4)``
+        (75 % overlap)::
 
-            stride      = max(1, context_length // 4)
-            n_windows   = max(1, (T_primary - context_length) // stride + 1)
+            stride    = max(1, context_length // 4)
+            n_windows = max(1, (T_primary - context_length) // stride + 1)
 
-        This gives n_windows ≥ 2 only when ``T_primary > context_length +
-        stride``, which requires more data than the model's full context window.
+        When ``T_primary ≤ context_length`` only **one** full-length context
+        window is available: ``[0:T]``.  In that case this property returns 1
+        and trajectory diversity in :func:`run_free_dynamics` is provided
+        entirely by different random initial states (``x0`` injection).
 
-        **Fallback path** — prediction_steps-based stride (when T ≤
-        context_length + stride and only 1 full-context window would be
-        available):  use ``prediction_steps`` as the minimum stride to extract
-        multiple shorter-context windows from the same recording.  Each window
-        uses the oldest available slice of data:
-
-            window 0  →  x[:, 0 : T, :]                    (full T steps)
-            window 1  →  x[:, 0 : T−stride, :]             (T − stride steps)
-            window k  →  x[:, 0 : T−k·stride, :]
-
-        Predictions from shorter-context windows have lower initial quality but
-        converge to full-context quality after
-        ``(context_length − window_context) / prediction_steps`` autoregressive
-        chunks.  For a 1000-step rollout this is a small fraction of the total
-        trajectory.
-
-        The fallback window count is capped at the number of genuinely distinct
-        windows that ``_get_context_for_window`` can produce (i.e. windows
-        whose ``end = T − k · stride > 0``).
+        The former "prediction_steps-based fallback" that returned *shorter*
+        context windows (lengths T, T-s, T-2s, …) has been removed: unequal
+        context lengths bias the encoder and introduce systematic artefacts in
+        downstream trajectory analysis.
 
         **Modality-aware**: For single-modality analysis (``fmri`` / ``eeg``),
         only the **primary** modality's temporal dimension ``T_primary``
@@ -801,18 +799,14 @@ class BrainDynamicsSimulator:
         For ``joint`` analysis, the minimum ``T`` across both ``fmri`` and
         ``eeg`` node types is used.
 
-        Examples (context_length = 200, stride = 50, prediction_steps = 50):
+        Examples (context_length = 200, stride = 50):
 
-            T_primary = 150  →  1 window   (T < context_length)
-            T_primary = 200  →  4 windows  fallback: [0:200],[0:150],[0:100],[0:50]
-            T_primary = 250  →  2 windows  primary: [50:250],[0:200]
-            T_primary = 300  →  3 windows
+            T_primary = 150  →  1 window   (T < context_length, only [0:150])
+            T_primary = 200  →  1 window   (T = context_length, only [0:200])
+            T_primary = 250  →  2 windows  [50:250], [0:200]
+            T_primary = 300  →  3 windows  [100:300], [50:250], [0:200]
             T_primary = 400  →  5 windows
             T_primary = 600  →  9 windows
-
-        Examples (context_length = 37, stride = 9, prediction_steps = 17):
-
-            T_primary = 200  →  19 windows  primary path (context fits many times)
         """
         ctx_len = self._get_context_length()
         stride = max(1, ctx_len // 4)
@@ -839,55 +833,42 @@ class BrainDynamicsSimulator:
 
         # ── Primary path: full-context sliding windows ────────────────────────
         n_full = max(1, (T_primary - ctx_len) // stride + 1)
-        if n_full > 1:
-            return n_full
+        return n_full
 
-        # ── Fallback path: prediction_steps-based stride ─────────────────────
-        # When T ≤ context_length + stride (only 1 full-context window), we can
-        # still offer multiple shorter-context windows whose stride equals
-        # prediction_steps.  This is only meaningful when prediction_steps <
-        # context_length; otherwise there is no benefit over the single window.
-        # Note: double-getattr is safe — getattr(None, attr, default) returns
-        # default without raising AttributeError.
-        _inner = getattr(self.model, "model", None)
-        pred_steps: int = int(getattr(_inner, "prediction_steps", 0))
-        if pred_steps > 0 and pred_steps < ctx_len and T_primary >= stride:
-            n_pred = max(1, (T_primary - pred_steps) // pred_steps + 1)
-            # Cap at the number of genuinely distinct windows _get_context_for_window
-            # can provide: only windows where end = T - k*stride > 0 are unique;
-            # beyond that the fallback in _get_context_for_window always returns
-            # the same [0:T] slice.
-            n_extractable = (T_primary - 1) // stride + 1  # ceil(T / stride)
-            n_fallback = min(n_pred, n_extractable)
-            if n_fallback > 1:
-                return n_fallback
-
-        return 1
-
-    def _get_context_for_window(self, window_idx: int = 0) -> HeteroData:
+    def _get_context_for_window(
+        self,
+        window_idx: int = 0,
+        context_start: Optional[int] = None,
+    ) -> HeteroData:
         """
         Return a cloned HeteroData using the specified temporal window as context.
 
-        Selects a ``context_length``-step slice from each node type's time series
-        using an overlapping sliding-window scheme.  The stride between consecutive
-        windows is ``max(1, context_length // 4)`` (75 % overlap), consistent with
-        ``n_temporal_windows``::
+        Two selection modes
+        -------------------
+        **Direct mode** (``context_start`` provided):
+            Use ``x[:, context_start : context_start + context_length, :]`` as
+            the context for every node type.  All node types get a window of
+            exactly ``context_length`` steps.  This is the mode used by
+            :func:`run_free_dynamics` (random equal-length windows).
 
-          stride = max(1, context_length // 4)
+        **Index mode** (``context_start=None``, default):
+            Selects a ``context_length``-step slice via an overlapping
+            sliding-window scheme keyed by ``window_idx``::
 
-          window_idx = 0  →  x[:, T-L : T, :]
-          window_idx = 1  →  x[:, T-L-s : T-s, :]
-          window_idx = k  →  x[:, T-L-k*s : T-k*s, :]   (L=context_length, s=stride)
+              stride = max(1, context_length // 4)
 
-        When ``window_idx`` would push the start before the beginning of the
-        recording (``start < 0``), the earliest available ``context_length``-step
-        slice is used instead of raising an error (graceful degradation).  This
-        can happen for secondary modalities (e.g. EEG when analysing fMRI) that
-        have a shorter stored time series than the primary modality.
+              window_idx = 0  →  x[:, T-L : T, :]
+              window_idx = 1  →  x[:, T-L-s : T-s, :]
+              window_idx = k  →  x[:, T-L-k*s : T-k*s, :]  (L=context_length, s=stride)
+
+        In both modes, indices are clamped gracefully to ``[0, T]`` so that
+        secondary modalities with shorter ``T`` never raise an error.
 
         Args:
-            window_idx: Non-negative integer selecting which historical window to
-                        use (0 = most recent = current default behaviour).
+            window_idx:    Non-negative integer (index mode only; ignored when
+                           ``context_start`` is provided).
+            context_start: Non-negative integer start position (direct mode).
+                           ``None`` → index mode.
 
         Returns:
             Cloned ``HeteroData`` with every node type's ``.x`` set to the
@@ -902,62 +883,49 @@ class BrainDynamicsSimulator:
                 continue
             nt_x = context[nt].x   # [N, T, C]
             T = int(nt_x.shape[1])
-            # Overlapping sliding windows (stride = ctx_len // 4):
-            #   window 0 → [T-L:T], window 1 → [T-L-s:T-s], ...
-            end = T - window_idx * stride
-            start = end - ctx_len
-            if start < 0 or end <= 0:
-                if end <= 0:
-                    # Window index is so large that the window end falls before
-                    # the start of the recording.  Use the earliest data slice.
+
+            if context_start is not None:
+                # ── Direct mode: caller supplies exact start position ──────────
+                start = int(context_start)
+                if start < 0:
+                    raise ValueError(
+                        f"context_start must be non-negative, got {start}"
+                    )
+                end = start + ctx_len
+                if start >= T:
+                    logger.warning(
+                        "_get_context_for_window: '%s' T=%d, context_start=%d ≥ T; "
+                        "clamping to earliest valid window [0:%d].",
+                        nt, T, start, min(ctx_len, T),
+                    )
+                    start = 0
+                    end = min(ctx_len, T)
+            else:
+                # ── Index mode: stride-based sliding window ───────────────────
+                end = T - window_idx * stride
+                start = end - ctx_len
+                if start < 0 or end <= 0:
+                    # Window index is out of range for this node type.
+                    # Clamp gracefully to the earliest available full-length slice.
                     start = 0
                     end = min(ctx_len, T)
                     if window_idx > 0:
                         logger.debug(
                             "_get_context_for_window: '%s' T=%d, window_idx=%d "
-                            "gives end≤0 (stride=%d); using earliest window [0:%d].",
-                            nt, T, window_idx, stride, end,
-                        )
-                elif T <= ctx_len:
-                    # ── Fallback mode (T ≤ context_length) ────────────────────
-                    # n_temporal_windows used prediction_steps as the stride to
-                    # generate multiple diverse starting contexts from a short
-                    # recording.  Each window k should see a DIFFERENT prefix of
-                    # the recording:
-                    #
-                    #   window 0  →  x[:, 0 : T, :]           (T steps)
-                    #   window 1  →  x[:, 0 : T−s, :]         (T−s steps)
-                    #   window k  →  x[:, 0 : T−k·s, :]       (T−k·s steps)
-                    #
-                    # Using the full [0:T] for every window (old behaviour)
-                    # gave all fallback windows identical contexts, completely
-                    # defeating the purpose of multi-window diversity.
-                    start = 0
-                    # end = T - window_idx * stride (computed above).
-                    # Strictly positive: the end <= 0 branch was not taken,
-                    # so end ≥ 1.
-                    if window_idx > 0:
-                        logger.debug(
-                            "_get_context_for_window: '%s' T=%d ≤ ctx_len=%d, "
-                            "window_idx=%d → variable-length prefix [0:%d] "
-                            "(fallback mode).",
-                            nt, T, ctx_len, window_idx, end,
-                        )
-                else:
-                    # ── Primary mode, window too old ──────────────────────────
-                    # T > context_length but this window would start before the
-                    # beginning of the recording.  Clamp to the earliest
-                    # full-length ctx_len slice.
-                    start = 0
-                    end = min(ctx_len, T)
-                    if window_idx > 0:
-                        logger.debug(
-                            "_get_context_for_window: '%s' T=%d, window_idx=%d is "
-                            "out of range (ctx_len=%d, stride=%d, need T≥%d); "
+                            "out of range (stride=%d, ctx_len=%d); "
                             "using earliest window [0:%d].",
-                            nt, T, window_idx, ctx_len, stride,
-                            ctx_len + window_idx * stride, end,
+                            nt, T, window_idx, stride, ctx_len, end,
                         )
+
+            # Final clamp to valid data range
+            start = max(0, min(start, T))
+            end   = max(start, min(end, T))
+            if end <= start:
+                raise ValueError(
+                    f"_get_context_for_window: context window [{start}:{end}] is empty "
+                    f"for node type '{nt}' (T={T}, ctx_len={ctx_len}).  "
+                    "This indicates the graph has zero temporal steps after slicing."
+                )
             context[nt].x = nt_x[:, start:end, :]
 
         return context
@@ -1099,18 +1067,18 @@ class BrainDynamicsSimulator:
         stimulus: Optional[Stimulus],
         x0: Optional[np.ndarray] = None,
         context_window_idx: int = 0,
+        context_start: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Autoregressive rollout using TwinBrainDigitalTwin.
 
         Initialization (计划书 §四/§十三):
-            ``_get_context_for_window(context_window_idx)`` selects the initial
-            context window from ``base_graph``.  ``window_idx=0`` reproduces the
-            original behaviour (last ``context_length`` steps).  Higher indices
-            select earlier historical segments, giving each trajectory a genuinely
-            different context history.  This resolves the Wolf context-dilution
-            bias where all trajectories shared the same ``context_length − 1``
-            history steps (see AGENTS.md §Wolf上下文稀释).
+            ``_get_context_for_window`` selects the initial context window.
+            When ``context_start`` is provided (direct mode), uses that exact
+            start position for all node types.  Otherwise ``context_window_idx``
+            selects a stride-based historical window.  In both cases every node
+            type's context has exactly ``context_length`` steps, avoiding the
+            variable-length bias of the old fallback path.
 
             If ``x0`` is provided, it is injected into the last time step of the
             selected context window.
@@ -1118,8 +1086,7 @@ class BrainDynamicsSimulator:
         chunk_size: int = getattr(getattr(self.model, "model", None), "prediction_steps", 50)
 
         # Select the requested temporal window from base_graph.
-        # window_idx=0 reproduces the previous _trim_context behaviour exactly.
-        context = self._get_context_for_window(context_window_idx)
+        context = self._get_context_for_window(context_window_idx, context_start)
 
         # Inject x0 as the "current brain state" (last time step override).
         # This ensures 200 rollouts start from 200 different initial conditions.
@@ -1189,6 +1156,7 @@ class BrainDynamicsSimulator:
         stimuli: List[Stimulus],
         x0: Optional[np.ndarray] = None,
         context_window_idx: int = 0,
+        context_start: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Joint fMRI+EEG autoregressive rollout for ``modality='joint'``.
@@ -1216,7 +1184,7 @@ class BrainDynamicsSimulator:
         chunk_size: int = getattr(
             getattr(self.model, "model", None), "prediction_steps", 50
         )
-        context = self._get_context_for_window(context_window_idx)
+        context = self._get_context_for_window(context_window_idx, context_start)
         self._inject_x0_into_context(context, x0)
 
         trajectory = np.empty((steps, self.n_regions), dtype=np.float32)
@@ -1295,6 +1263,7 @@ class BrainDynamicsSimulator:
         stimuli: List[Stimulus],
         x0: Optional[np.ndarray] = None,
         context_window_idx: int = 0,
+        context_start: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Autoregressive rollout with multiple simultaneous stimuli using TwinBrainDigitalTwin.
@@ -1302,14 +1271,15 @@ class BrainDynamicsSimulator:
         All active stimuli in a chunk are packed into the ``interventions`` dict.
         Context selection matches ``_rollout_with_twin`` via ``_get_context_for_window``
         so that a stimulated run and its counterfactual (``stimuli=[]``) start from
-        exactly the same historical context when given the same ``context_window_idx``.
+        exactly the same historical context when given the same ``context_window_idx``
+        or ``context_start``.
         All modalities are advanced together after each prediction step.
         """
         chunk_size: int = getattr(getattr(self.model, "model", None), "prediction_steps", 50)
 
         # Use the same context-window selection as _rollout_with_twin so that
         # stimulated and counterfactual rollouts share an identical starting context.
-        context = self._get_context_for_window(context_window_idx)
+        context = self._get_context_for_window(context_window_idx, context_start)
         self._inject_x0_into_context(context, x0)
 
         trajectory = np.empty((steps, self.n_regions), dtype=np.float32)

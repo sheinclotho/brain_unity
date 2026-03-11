@@ -912,6 +912,7 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
                     seed=cfg["data_generation"].get("seed", 42),
                     rqa_max_T=at_cfg.get("rqa_max_T", 500),
                     kmeans_uniform_suspect=_ca_suspect,
+                    dmd_n_hopf_pairs=results.get("dmd_spectrum", {}).get("n_hopf_pairs"),
                 )
                 if "error" not in at:
                     results["attractor_topology"] = at
@@ -930,6 +931,32 @@ def run_phase3_dynamics(cfg: dict, results: Dict[str, Any],
                     )
         except Exception as e:
             logger.warning("  Attractor topology analysis failed: %s", e)
+
+    # 3m: Line Attractor Analysis
+    # Tests whether the low-dimensional dynamics live on a near-1D slow
+    # manifold (line attractor structure) with contraction toward the line
+    # and neutral drift along it.  The result feeds back into the narrative
+    # (is_line_attractor + lambda_pc2) and corroborates the SM hypothesis.
+    la_cfg = dyn_cfg.get("line_attractor", {})
+    if la_cfg.get("enabled", True):
+        try:
+            from analysis.line_attractor import draw as _la_draw
+            _la_burnin = _pca_burnin(trajs.shape[1])
+            la = _la_draw(
+                trajectories=trajs,
+                output_dir=dyn_dir / "line_attractor",
+                burnin=_la_burnin,
+            )
+            results["line_attractor"] = la
+            la_interp = la.get("assessment", {}).get("interpretation", "?")
+            la_lam = la.get("assessment", {}).get("lambda_pc2", float("nan"))
+            logger.info(
+                "  Line attractor: %s (lambda_PC2=%.4f, is_line=%s)",
+                la_interp, la_lam,
+                la.get("assessment", {}).get("is_line_attractor", "?"),
+            )
+        except Exception as e:
+            logger.warning("  Line attractor analysis failed: %s", e)
 
 
 def run_phase4_validation(cfg: dict, results: Dict[str, Any],
@@ -1612,6 +1639,37 @@ def _build_manifold_collapse_narrative(
         if ps_class not in ("unknown", "insufficient_crossings"):
             evidence.append(f"Period stability (Hilbert): {ps_class}")
 
+    # ── 4b. Line Attractor evidence ──────────────────────────────────────────
+    # line_attractor.draw() fits a 2-D vector field to the PCA portrait and
+    # assesses whether the dynamics live on a near-1D line attractor.
+    la = results.get("line_attractor", {})
+    la_assess = la.get("assessment", {})
+    la_interp = la_assess.get("interpretation")
+    la_is_line = la_assess.get("is_line_attractor", False)
+    la_lam_pc2 = la_assess.get("lambda_pc2")
+    la_pc1_neutral = la_assess.get("pc1_neutral", False)
+    if la_interp and la_interp not in ("unknown", "other"):
+        parts = []
+        if la_lam_pc2 is not None:
+            parts.append(f"λ_PC2={la_lam_pc2:.4f}")
+        if la_pc1_neutral:
+            parts.append("PC1 neutral")
+        suffix = f" ({', '.join(parts)})" if parts else ""
+        evidence.append(f"Line attractor analysis: {la_interp}{suffix}")
+    if la_is_line:
+        evidence.append(
+            "✓ is_line_attractor=True: PC1 nearly neutral, PC2 contracts strongly "
+            "— strong evidence for slow manifold / line attractor geometry"
+        )
+        # If attractor_class hasn't been resolved to SM already, override with
+        # line-attractor-based classification when the topology analysis missed it.
+        if attractor_class in ("unknown", "N/A", "Continuous Attractor"):
+            attractor_class = "Slow Manifold + Hopf Oscillation"
+            evidence.append(
+                "Attractor class upgraded to 'Slow Manifold + Hopf Oscillation' "
+                "based on line_attractor evidence (is_line_attractor=True)"
+            )
+
     # ── 5. Coherence (convergence) ────────────────────────────────────────────
     conv = results.get("convergence", {})
     dist_ratio = conv.get("distance_ratio")
@@ -1681,7 +1739,42 @@ def _build_manifold_collapse_narrative(
 
     # Attractor statement
     if attractor_class not in ("unknown", "N/A"):
-        if attractor_class == "Limit Cycle" or attractor_class == "LC":
+        if attractor_class in ("Slow Manifold + Hopf Oscillation", "SM"):
+            # Retrieve DMD Hopf info for the narrative
+            dmd_data = results.get("dmd_spectrum", {})
+            n_hopf = dmd_data.get("n_hopf_pairs", 0)
+            rho_str = f", DMD ρ={rho:.4f}" if rho is not None and np.isfinite(rho) else ""
+            lle_str = f"Rosenstein λ={lle:.5f}" if lle is not None and np.isfinite(lle) else "Rosenstein λ=N/A"
+            hopf_str = (
+                f" {n_hopf} Hopf oscillation pair(s) detected in the linearised spectrum."
+                if n_hopf > 0 else ""
+            )
+            # Check line-attractor confirmation
+            la_conf = ""
+            la_data = results.get("line_attractor", {})
+            if la_data.get("assessment", {}).get("is_line_attractor"):
+                lam_pc2 = la_data["assessment"].get("lambda_pc2")
+                la_conf = (
+                    f" Line attractor confirmed: PC2 contraction rate λ_PC2={lam_pc2:.4f},"
+                    " PC1 neutral direction."
+                    if lam_pc2 is not None else
+                    " Line attractor confirmed by velocity field analysis."
+                )
+            narrative_parts.append(
+                "The attractor is a SLOW MANIFOLD with Hopf oscillations — "
+                "a two-timescale dynamical structure:"
+                " (1) a low-dimensional slow manifold onto which the high-dimensional"
+                " state rapidly contracts, and"
+                " (2) Hopf oscillations (periodic modes) riding along the manifold surface."
+                f"{hopf_str}{la_conf} "
+                "This pattern — modular brain network → low-rank coupling structure →"
+                " spectral radius near 1 → high-dimensional mode decay →"
+                " dynamics confined to a slow manifold → Hopf oscillations between modes"
+                " → nonlinear coupling producing near-critical behaviour —"
+                " is the theoretical signature of a near-critical brain network"
+                f" ({lle_str}{rho_str}). "
+            )
+        elif attractor_class == "Limit Cycle" or attractor_class == "LC":
             narrative_parts.append(
                 "The attractor geometry is consistent with a limit cycle: "
                 "stable periodic oscillation on the low-dimensional manifold. "
@@ -2657,7 +2750,7 @@ def _build_validation_table(results: Dict[str, Any]) -> List[Dict[str, Any]]:
         top_hyp = at_res.get("top_hypothesis")
         at_conf = at_res.get("confidence", "low")
         if top_hyp is not None and at_conf in ("high", "moderate"):
-            if top_hyp in ("LC", "CA", "FP"):
+            if top_hyp in ("LC", "CA", "FP", "SM"):
                 # Topology says NOT a strange attractor → downgrade if necessary
                 if verified_q1:
                     verdict_q1 = (
