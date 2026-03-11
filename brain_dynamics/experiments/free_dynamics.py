@@ -138,7 +138,23 @@ def _build_graph_pool(
         nt for nt in simulator.base_graph.node_types
         if hasattr(simulator.base_graph[nt], "x")
     ]
-    n_regions_primary = simulator.n_regions
+    # IMPORTANT: use the primary modality's node count (e.g. fmri=190),
+    # NOT simulator.n_regions in joint mode (fmri+eeg, e.g. 253).
+    # Multi-graph compatibility must be validated against the context modality
+    # actually swapped during free dynamics initialisation.
+    try:
+        n_regions_primary = int(simulator.base_graph[nt_primary].x.shape[0])
+    except (AttributeError, KeyError, TypeError) as exc:
+        # Defensive fallback for malformed base_graph objects.
+        logger.warning(
+            "  多图上下文: 无法从主模态 '%s' 提取节点数，"
+            "回退到 simulator.n_regions=%s 进行兼容校验。(%s: %s)",
+            nt_primary,
+            getattr(simulator, "n_regions", "unknown"),
+            type(exc).__name__,
+            exc,
+        )
+        n_regions_primary = int(simulator.n_regions)
 
     pool: List[Optional[Dict[str, torch.Tensor]]] = [None]  # index 0 = primary
 
