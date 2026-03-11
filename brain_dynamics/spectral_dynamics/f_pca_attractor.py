@@ -70,31 +70,148 @@ _POINCARE_PERIODIC_THRESH: float = 1e-6  # range < this → trivially periodic (
 _POINCARE_TIGHT_RATIO: float = 0.15      # std/range < this → clustered (periodic)
 _POINCARE_QUASI_RATIO: float = 0.50      # std/range < this → smooth manifold (quasi-periodic)
 
+# Delay-embedding quality constants
+# If |corr(y(t), y(t+tau))| exceeds this after ACF-based tau selection, we
+# apply linear detrending to the observable and recompute tau.  A good tau
+# should produce a correlation close to zero (maximally decorrelated coords).
+_DETREND_CORR_THRESHOLD: float = 0.60
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Delay-embedding helpers (Takens' theorem)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _estimate_tau(obs: np.ndarray, max_tau: int = 100) -> int:
+def _estimate_tau(obs: np.ndarray, max_tau: int = 200) -> int:
     """Estimate optimal delay τ as the first zero-crossing of the
     autocorrelation function (Takens / Fraser-Swinney criterion).
 
+    Uses *unbiased* per-lag normalization: at lag τ the denominator is
+    ``(n−τ)/n × Σx²`` rather than ``Σx²`` alone.  The biased estimator
+    systematically pulls the ACF toward zero at large lags, which caused
+    spuriously small τ values (e.g. τ=22) when the channel-mean of
+    z-scored fMRI was used as the observable.  With the unbiased estimator
+    the ACF stays positive for longer, yielding larger and more meaningful τ.
+
     Args:
         obs:     1-D observation time series (float64).
-        max_tau: Maximum τ to search.
+        max_tau: Maximum τ to search (default 200 — raised from 100 to
+                 accommodate slower PC1 decorrelation timescales).
 
     Returns:
-        τ (int, ≥ 1).  Falls back to 1 if no zero-crossing is found.
+        τ (int, ≥ 1).  Falls back to n//8 if no zero-crossing is found.
     """
     obs = obs - obs.mean()
-    norm = float(np.dot(obs, obs))
-    if norm < 1e-30:
+    n = len(obs)
+    ss = float(np.dot(obs, obs))   # n × variance
+    if ss < 1e-30:
         return 1
-    for tau in range(1, min(max_tau, len(obs) // 4)):
-        acf = float(np.dot(obs[:-tau], obs[tau:])) / norm
+    max_search = min(max_tau, n // 4)
+    for tau in range(1, max_search):
+        num = float(np.dot(obs[:-tau], obs[tau:]))
+        # Unbiased per-lag denominator: scale ss by (n-tau)/n
+        denom = ss * (n - tau) / n
+        if denom < 1e-30:
+            return tau
+        acf = num / denom
         if acf <= 0.0:
             return tau
-    return max(1, min(max_tau, len(obs) // 8))
+    return max(1, min(max_tau, n // 8))
+
+
+def _corr_at_tau(obs: np.ndarray, tau: int) -> float:
+    """Return Pearson correlation between y(t) and y(t+tau).
+
+    Used to assess the quality of a delay-embedding coordinate pair: a good τ
+    produces |corr| close to 0 (maximally decorrelated axes).  When |corr| is
+    large (≥ 0.6) the delay portrait collapses to a diagonal line.
+
+    Args:
+        obs:  Zero-mean, 1-D observable array (float64).
+        tau:  Delay lag (steps).
+
+    Returns:
+        Pearson r ∈ [−1, 1].  Returns 1.0 for degenerate inputs.
+    """
+    if tau <= 0 or tau >= len(obs):
+        return 1.0
+    x = obs[:-tau].astype(np.float64)
+    y = obs[tau:].astype(np.float64)
+    sx, sy = x.std(), y.std()
+    if sx < 1e-10 or sy < 1e-10:
+        # Degenerate (constant or near-constant) input: return 1.0 so that
+        # _find_best_observable will attempt detrending — detrending a constant
+        # is safe (it stays zero) and avoids silently accepting a bad observable.
+        return 1.0
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _find_best_observable(
+    obs_raw: np.ndarray,
+    max_tau: int = 200,
+    detrend_threshold: float = _DETREND_CORR_THRESHOLD,
+) -> tuple:
+    """Choose the best scalar observable for Takens delay embedding.
+
+    **The two-stage algorithm**
+
+    Stage 1 — Demean:
+      ``obs = obs_raw − mean(obs_raw)``
+      Estimate τ via unbiased ACF zero-crossing (`_estimate_tau`).
+      Compute quality: ``corr = corr_at_tau(obs, τ)``.
+
+    Stage 2 — Linear detrend (only if quality is poor):
+      If ``|corr| > detrend_threshold``, the observable is dominated by a
+      slow drift (e.g. convergent fMRI trajectory drifting toward equilibrium).
+      In that case the delay portrait would collapse to a diagonal regardless
+      of τ.  Linear detrending removes the trend and reveals the residual
+      oscillations/noise on the attractor.
+      After detrending, τ is re-estimated and quality is re-checked.
+      The detrended observable is used only if it yields a strictly lower |corr|.
+
+    This fixes both failure modes observed in the original images:
+
+    * **tau=22 star pattern**: channel-mean observable oscillated rapidly →
+      small τ → thousands of dense overlapping segments.
+      *Fixed by previous session* (use PC1 instead of channel mean).
+
+    * **tau=100 diagonal**: convergent model trajectory → PC1 also drifts →
+      ACF never crosses zero → fallback τ → |corr| ≈ 0.96 → diagonal.
+      *Fixed here* by detrending PC1 before tau estimation.
+
+    Args:
+        obs_raw:           Raw 1-D observable (any scale).
+        max_tau:           Maximum τ to search.
+        detrend_threshold: |corr| above which detrending is attempted.
+
+    Returns:
+        (obs_processed, tau, method_str, corr)
+        method_str: ``'demeaned'`` or ``'linear_detrend'``
+    """
+    obs = (obs_raw - obs_raw.mean()).astype(np.float64)
+    tau = _estimate_tau(obs, max_tau=max_tau)
+    corr = _corr_at_tau(obs, tau)
+
+    if abs(corr) > detrend_threshold:
+        # Fit and remove linear trend using scipy.signal.detrend (O(n), optimized).
+        # Falls back to numpy polyfit if scipy is unavailable.
+        try:
+            from scipy.signal import detrend as _scipy_detrend
+            obs_dt = _scipy_detrend(obs, type="linear").astype(np.float64)
+        except ImportError:
+            t_norm = np.linspace(0.0, 1.0, len(obs))
+            poly = np.polyfit(t_norm, obs, 1)
+            obs_dt = obs - np.polyval(poly, t_norm)
+        tau_dt = _estimate_tau(obs_dt, max_tau=max_tau)
+        corr_dt = _corr_at_tau(obs_dt, tau_dt)
+        if abs(corr_dt) < abs(corr):
+            logger.info(
+                "_find_best_observable: linear detrend improved corr "
+                "%.3f→%.3f, tau %d→%d (drift-dominated observable)",
+                corr, corr_dt, tau, tau_dt,
+            )
+            return obs_dt, tau_dt, "linear_detrend", corr_dt
+
+    return obs, tau, "demeaned", corr
 
 
 def _build_delay_portrait(
@@ -102,41 +219,94 @@ def _build_delay_portrait(
     burnin: int,
     m: int = 3,
     tau: Optional[int] = None,
-) -> np.ndarray:
+    observable_scores: Optional[np.ndarray] = None,
+) -> tuple:
     """Build Takens delay-embedding coordinates from multi-channel trajectories.
 
-    For each trajectory the *mean across all channels* is used as the scalar
-    observation y(t).  The delay portrait is then::
+    **Observable priority order**
+
+    1. ``observable_scores`` supplied by the caller (preferred): a pre-computed
+       1-D projection such as the **PC1 score** from an already-computed PCA.
+       PC1 captures the dominant mode of variance (typically 20–40 % for fMRI),
+       has a much slower decorrelation timescale than the channel mean, and
+       yields a meaningful τ in the range 10–80 TR rather than the spuriously
+       small τ ≈ 20 obtained from the near-zero channel mean of z-scored data.
+    2. Channel mean (fallback when ``observable_scores=None``): mean across all
+       N channels after burnin.  For z-scored fMRI this is close to zero with
+       rapid decorrelation, so the first ACF zero-crossing occurs very early.
+
+    **Tau estimation** uses a two-stage robust algorithm via
+    `_find_best_observable`:
+
+    * Stage 1: demean → ACF zero-crossing → check |corr(y(t), y(t+τ))|.
+    * Stage 2: if |corr| > 0.60, apply linear detrending and re-estimate τ.
+      This fixes the *diagonal portrait* failure mode where a convergent
+      model trajectory produces a PC1 that drifts monotonically, causing the
+      ACF to never cross zero and the delay portrait to be a diagonal line.
+
+    **Delay portrait construction**::
 
         z(t) = [y(t), y(t+τ), y(t+2τ), ..., y(t+(m-1)τ)]
 
     which, by Takens' theorem, preserves the topological structure of the
-    attractor for m ≥ 2D+1 (D = intrinsic dimension).  This avoids the
-    flattening artefacts of PCA linear projection.
+    attractor for m ≥ 2D+1 (D = intrinsic dimension).
 
     Args:
-        trajectories: shape (n_traj, T, N).
-        burnin:       Steps to skip at the start of each trajectory.
-        m:            Embedding dimension (default 3 for 2-D / 3-D portraits).
-        tau:          Time delay (steps).  If None, estimated automatically
-                      from the mean-channel autocorrelation of the first
-                      trajectory.
+        trajectories:      shape (n_traj, T, N).
+        burnin:            Steps to skip at the start of each trajectory.
+        m:                 Embedding dimension (default 3 for 2-D / 3-D).
+        tau:               Time delay (steps).  If None, estimated robustly
+                           via `_find_best_observable`.
+        observable_scores: Optional pre-computed scores, shape
+                           ``(n_traj * T_eff,)`` where ``T_eff = T - burnin``.
+                           Pass ``pca_result["X_pca"][:, 0]`` to use PC1.
 
     Returns:
-        X_delay: shape (n_traj * T_embed, m) — all trajectories stacked.
-        tau_used: int — the τ actually used.
-        T_embed: int — number of delay-vector time points per trajectory.
+        5-tuple:
+          X_delay   (n_traj * T_embed, m) — all trajectories stacked.
+          tau_used  int    — the τ actually used.
+          T_embed   int    — number of delay-vector time points per trajectory
+                             (0 if trajectory too short).
+          obs_method str   — 'demeaned' | 'linear_detrend'.
+          tau_corr  float  — |corr(y(t), y(t+τ))| at selected τ
+                             (lower is better; < 0.6 means non-diagonal portrait).
     """
     n_traj, T, N = trajectories.shape
     burnin = min(burnin, T - 1)
+    T_eff = T - burnin
 
-    # Scalar observable: mean over all channels (after burnin)
-    obs_all = trajectories[:, burnin:, :].mean(axis=-1)   # (n_traj, T_eff)
-    T_eff = obs_all.shape[1]
+    if observable_scores is not None:
+        # Caller-supplied scores (e.g. PC1): reshape (n_traj*T_eff,) → (n_traj, T_eff)
+        scores_arr = np.asarray(observable_scores, dtype=np.float64)
+        expected = n_traj * T_eff
+        if scores_arr.size != expected:
+            raise ValueError(
+                f"_build_delay_portrait: observable_scores has {scores_arr.size} elements "
+                f"but expected {expected} = n_traj({n_traj}) × T_eff({T_eff}).  "
+                f"The array must be a 1-D sequence of length n_traj × (T − burnin)."
+            )
+        obs_all = scores_arr.reshape(n_traj, T_eff).copy().astype(np.float64)
+    else:
+        # Fallback: channel mean after burnin
+        obs_all = trajectories[:, burnin:, :].mean(axis=-1).astype(np.float64)
 
-    # Estimate τ from first trajectory if not supplied
+    # ── Robust tau estimation (with linear detrend fallback) ────────────────
+    obs_method = "demeaned"
+    tau_corr = float("nan")
     if tau is None:
-        tau = _estimate_tau(obs_all[0].astype(np.float64))
+        obs_first = obs_all[0]
+        obs_first_proc, tau, obs_method, tau_corr = _find_best_observable(obs_first)
+        # If detrending improved quality, apply it consistently to ALL trajectories.
+        # scipy.signal.detrend(obs_all, axis=1) processes all rows in one call.
+        if obs_method == "linear_detrend":
+            try:
+                from scipy.signal import detrend as _scipy_detrend
+                obs_all = _scipy_detrend(obs_all, axis=1, type="linear")
+            except ImportError:
+                t_norm = np.linspace(0.0, 1.0, T_eff)
+                for i in range(n_traj):
+                    poly = np.polyfit(t_norm, obs_all[i], 1)
+                    obs_all[i] = obs_all[i] - np.polyval(poly, t_norm)
 
     T_embed = T_eff - (m - 1) * tau
     if T_embed < 4:
@@ -144,45 +314,30 @@ def _build_delay_portrait(
         tau = max(1, tau // 2)
         T_embed = T_eff - (m - 1) * tau
     if T_embed < 4:
-        # Fallback stage 2: minimum-possible embedding (m=2, τ=1 for m-param,
-        # overriding any caller-supplied m > 2 with a warning).
-        if m != 3:
-            logger.warning(
-                "_build_delay_portrait: reducing m from %d to 3 (τ=1) "
-                "because T_eff=%d is too short for the requested embedding.",
-                m, T_eff,
-            )
+        # Fallback stage 2: minimum-possible embedding
         m = 3
         tau = 1
         T_embed = T_eff - (m - 1) * tau
     if T_embed < 4:
-        # Trajectories are too short even for the minimal embedding;
-        # return an empty array so callers can skip plotting gracefully.
         logger.warning(
             "_build_delay_portrait: T_eff=%d too short for delay embedding "
             "(need T_eff >= 4 + 2*tau); returning empty array.",
             T_eff,
         )
-        return np.empty((0, m), dtype=np.float64), tau, 0
+        return np.empty((0, m), dtype=np.float64), tau, 0, obs_method, tau_corr
 
     # Build delay portrait.
-    # Each slice obs[j*tau : j*tau + T_embed] has exactly T_embed elements
-    # by construction: for j in [0, m-1], end = j*tau + T_embed
-    # ≤ (m-1)*tau + T_embed = T_eff (by definition of T_embed). ✓
     rows = []
     for i in range(n_traj):
         obs = obs_all[i].astype(np.float64)
-        # Centre each trajectory's observable around its mean so that
-        # zero-crossings in compute_poincare_section correspond to crossings
-        # through the trajectory's own mean level (not the global zero).
-        # This is standard practice in Poincaré-section analysis and does not
-        # change the topological structure of the attractor.
+        # Demean each trajectory's observable so Poincaré-section zero-crossings
+        # correspond to crossings through the trajectory's own mean level.
         obs = obs - obs.mean()
         mat = np.stack([obs[j * tau: j * tau + T_embed] for j in range(m)], axis=1)
         rows.append(mat)
 
     X_delay = np.concatenate(rows, axis=0)   # (n_traj * T_embed, m)
-    return X_delay, tau, T_embed
+    return X_delay, tau, T_embed, obs_method, tau_corr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -621,16 +776,49 @@ def run_pca_attractor(
         # ── New Test 2b: Delay-embedding (Takens) phase portrait ─────────────
         # Delay embedding preserves nonlinear attractor topology while PCA
         # is a linear projection that can flatten curved manifolds.
-        # We generate BOTH so users can compare.
-        X_delay, tau_used, T_embed = _build_delay_portrait(
+        # Use PC1 scores as the scalar observable (instead of channel mean):
+        #   - PC1 captures the dominant mode of variance (~20-40% for fMRI)
+        #   - PC1 has longer autocorrelation → larger, more meaningful τ
+        #   - Channel mean of z-scored data is near zero with rapid decorrelation
+        #     → biased τ ≈ 22, producing dense, hard-to-interpret star patterns
+        # _build_delay_portrait applies linear detrending automatically when
+        # |corr(y(t),y(t+τ))| > 0.60 (drift-dominated convergent trajectories).
+        X_pca_scores = pca_result["X_pca"]
+        pc1_scores = X_pca_scores[:, 0] if X_pca_scores.shape[1] > 0 else None
+        X_delay, tau_used, T_embed, obs_method, tau_corr = _build_delay_portrait(
             trajectories, burnin=burnin, m=3,
+            observable_scores=pc1_scores,
         )
         result["delay_embed_tau"] = int(tau_used)
         result["delay_embed_T"] = int(T_embed)
+        result["delay_embed_obs_method"] = obs_method
+        result["delay_embed_corr"] = round(float(tau_corr), 4) if np.isfinite(tau_corr) else None
         if T_embed > 0:
             _try_plot_delay_portrait(
                 X_delay, n_traj=n_traj, steps_per_traj=T_embed, tau=tau_used,
+                obs_method=obs_method, tau_corr=tau_corr,
                 output_path=out / "phase_portrait_delay_embed.png",
+            )
+
+            # ── Combined manifold portrait (primary output) ───────────────────
+            # 4-panel figure: PCA linear + Takens nonlinear, density + trajectories
+            _try_plot_manifold_portrait(
+                pca_result["X_pca"], X_delay,
+                n_traj=n_traj, T_eff=T_eff, T_embed=T_embed,
+                tau=tau_used, evr=pca_result["explained_variance_ratio"],
+                obs_method=obs_method, tau_corr=tau_corr,
+                output_path=out / "manifold_portrait.png",
+            )
+
+            # ── Velocity portrait (always informative) ────────────────────────
+            # Shows dPC1/dt vs PC1[t] — the phase velocity field on the attractor.
+            # This is guaranteed to reveal attractor structure even for convergent
+            # or drift-dominated trajectories where the position portrait is diagonal.
+            _try_plot_velocity_portrait(
+                pca_result["X_pca"],
+                n_traj=n_traj, T_eff=T_eff,
+                evr=pca_result["explained_variance_ratio"],
+                output_path=out / "velocity_portrait.png",
             )
 
             # ── New Test 3: Poincaré Section (delay-embedding coordinates) ────
@@ -700,10 +888,32 @@ def _try_plot_phase_portrait_pair(
 
     n_show = min(n_traj_show, n_traj)
     T = steps_per_traj
-    cmap = plt.cm.viridis
-    colors_t = cmap(np.linspace(0.05, 0.95, T))
+    # Subsampling: target ~100 visible points per trajectory
+    stride = max(1, T // 100)
+    traj_colors = plt.cm.tab10(np.linspace(0, 1, max(n_show, 1)))
+    cmap_time = plt.cm.viridis
 
-    fig, ax = plt.subplots(figsize=(6, 6))
+    n_pts = min(n_show * T, X_pca.shape[0])
+    var_a = float(evr[pc_a]) * 100 if pc_a < len(evr) else 0.0
+    var_b = float(evr[pc_b]) * 100 if pc_b < len(evr) else 0.0
+
+    fig, (ax_dens, ax_traj) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # ── Left: density heatmap ──────────────────────────────────────────────────
+    hb = ax_dens.hexbin(
+        X_pca[:n_pts, pc_a], X_pca[:n_pts, pc_b],
+        gridsize=40, cmap="YlOrRd", mincnt=1,
+    )
+    plt.colorbar(hb, ax=ax_dens, label="Visit count")
+    ax_dens.set_xlabel(f"PC{pc_a+1}  ({var_a:.1f}% var)")
+    ax_dens.set_ylabel(f"PC{pc_b+1}  ({var_b:.1f}% var)")
+    ax_dens.set_title(
+        f"Attractor Density: PC{pc_a+1}-PC{pc_b+1}\n"
+        f"Bright = trajectory spends more time here"
+    )
+    ax_dens.set_aspect("equal", adjustable="datalim")
+
+    # ── Right: sparse trajectory overlay ──────────────────────────────────────
     for i in range(n_show):
         start = i * T
         end = start + T
@@ -711,29 +921,351 @@ def _try_plot_phase_portrait_pair(
             break
         pc_x = X_pca[start:end, pc_a]
         pc_y = X_pca[start:end, pc_b]
-        for t in range(T - 1):
-            ax.plot(pc_x[t:t+2], pc_y[t:t+2], color=colors_t[t], lw=0.8, alpha=0.7)
-        ax.scatter(pc_x[0], pc_y[0], color="blue", s=25, zorder=5, marker="o")
-        ax.scatter(pc_x[-1], pc_y[-1], color="red", s=25, zorder=5, marker="x")
+        idx = np.arange(0, T, stride)
+        sub_x, sub_y = pc_x[idx], pc_y[idx]
+        sub_t = idx / float(T - 1 if T > 1 else 1)
+        ax_traj.plot(sub_x, sub_y, "-", color=traj_colors[i], lw=0.8, alpha=0.4, zorder=2)
+        ax_traj.scatter(sub_x, sub_y, c=sub_t, cmap=cmap_time, s=6, alpha=0.8,
+                        zorder=3, linewidths=0)
+        ax_traj.scatter(pc_x[0], pc_y[0], color=traj_colors[i], s=50, marker="o",
+                        edgecolors="k", linewidths=0.5, zorder=5)
+        ax_traj.scatter(pc_x[-1], pc_y[-1], color=traj_colors[i], s=50, marker="X",
+                        edgecolors="k", linewidths=0.5, zorder=5)
 
-    # Colorbar for time
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, T))
+    sm = plt.cm.ScalarMappable(cmap=cmap_time, norm=plt.Normalize(0, T))
     sm.set_array([])
-    plt.colorbar(sm, ax=ax, label="Time Step")
-
-    var_a = float(evr[pc_a]) * 100 if pc_a < len(evr) else 0
-    var_b = float(evr[pc_b]) * 100 if pc_b < len(evr) else 0
-    ax.set_xlabel(f"PC{pc_a+1}  ({var_a:.1f}% var)")
-    ax.set_ylabel(f"PC{pc_b+1}  ({var_b:.1f}% var)")
-    ax.set_title(
+    plt.colorbar(sm, ax=ax_traj, label="Time step")
+    ax_traj.set_xlabel(f"PC{pc_a+1}  ({var_a:.1f}% var)")
+    ax_traj.set_ylabel(f"PC{pc_b+1}  ({var_b:.1f}% var)")
+    ax_traj.set_title(
         f"Phase Portrait: PC{pc_a+1} vs PC{pc_b+1}\n"
-        f"({n_show} trajectories, blue=start, red×=end, colour=time)"
+        f"({n_show} trajectories, circle=start, X=end, colour=time)"
     )
-    ax.grid(True, alpha=0.2)
+    ax_traj.set_aspect("equal", adjustable="datalim")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info("保存 phase portrait: %s", output_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Combined manifold portrait (PCA linear + Takens nonlinear)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _try_plot_manifold_portrait(
+    X_pca: np.ndarray,
+    X_delay: np.ndarray,
+    n_traj: int,
+    T_eff: int,
+    T_embed: int,
+    tau: int,
+    evr: List[float],
+    output_path: Path,
+    n_show: int = 5,
+    obs_method: str = "demeaned",
+    tau_corr: float = float("nan"),
+) -> None:
+    """Combined 4-panel manifold portrait.
+
+    Shows the low-dimensional attractor structure from two complementary views:
+
+    ┌───────────────────────┬───────────────────────┐
+    │  PC1–PC2 density      │  PC1–PC2 trajectories │
+    │  (linear projection)  │  (subsampled, n_show) │
+    ├───────────────────────┼───────────────────────┤
+    │  Takens delay density │  Takens delay traj.   │
+    │  (nonlinear embed.)   │  (subsampled, n_show) │
+    └───────────────────────┴───────────────────────┘
+
+    The density panels (left column) show where the trajectory *spends its
+    time* — the invariant measure on the attractor.  The trajectory panels
+    (right column) show *how* the system evolves in that space.
+
+    This is the primary "manifold structure" figure for the analysis report.
+
+    Args:
+        X_pca:       shape (n_traj * T_eff, n_pcs)  — PCA projections.
+        X_delay:     shape (n_traj * T_embed, m)    — Takens delay coords.
+        n_traj:      total number of trajectories.
+        T_eff:       post-burnin length per trajectory for PCA data.
+        T_embed:     delay-adjusted length per trajectory.
+        tau:         delay lag used.
+        evr:         explained variance ratios list.
+        output_path: where to save the PNG.
+        n_show:      max trajectories in overlay panels.
+        obs_method:  'demeaned' | 'linear_detrend' — for annotation.
+        tau_corr:    |corr(y(t),y(t+tau))| — quality metric.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
+    except ImportError:
+        _write_fallback_png(output_path)
+        return
+
+    if X_pca.shape[1] < 2 or X_delay.shape[1] < 2:
+        _write_fallback_png(output_path)
+        return
+
+    n_show = min(n_show, n_traj)
+    stride_pca = max(1, T_eff // 100)
+    stride_del = max(1, T_embed // 100)
+    traj_colors = plt.cm.tab10(np.linspace(0, 1, max(n_show, 1)))
+    cmap_time = plt.cm.viridis
+
+    var1 = float(evr[0]) * 100 if len(evr) > 0 else 0.0
+    var2 = float(evr[1]) * 100 if len(evr) > 1 else 0.0
+
+    _obs_label = "PC1 (detrended)" if obs_method == "linear_detrend" else "PC1"
+    _corr_str = f"|corr|={abs(tau_corr):.3f}" if np.isfinite(tau_corr) else ""
+
+    fig = plt.figure(figsize=(14, 10))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.38, wspace=0.32)
+    ax_pca_dens = fig.add_subplot(gs[0, 0])
+    ax_pca_traj = fig.add_subplot(gs[0, 1])
+    ax_del_dens = fig.add_subplot(gs[1, 0])
+    ax_del_traj = fig.add_subplot(gs[1, 1])
+
+    # ── Row 0: PCA linear projection ──────────────────────────────────────────
+    n_pts_pca = min(n_show * T_eff, X_pca.shape[0])
+    hb1 = ax_pca_dens.hexbin(
+        X_pca[:n_pts_pca, 0], X_pca[:n_pts_pca, 1],
+        gridsize=40, cmap="YlOrRd", mincnt=1,
+    )
+    plt.colorbar(hb1, ax=ax_pca_dens, label="Visit count")
+    ax_pca_dens.set_xlabel(f"PC1  ({var1:.1f}% var)")
+    ax_pca_dens.set_ylabel(f"PC2  ({var2:.1f}% var)")
+    ax_pca_dens.set_title("Linear Projection: PC1–PC2 Density\n(attractor invariant measure)")
+    ax_pca_dens.set_aspect("equal", adjustable="datalim")
+
+    for i in range(n_show):
+        s, e = i * T_eff, (i + 1) * T_eff
+        if e > X_pca.shape[0]:
+            break
+        idx = np.arange(0, T_eff, stride_pca)
+        px = X_pca[s:e, 0][idx]
+        py = X_pca[s:e, 1][idx]
+        sub_t = idx / float(T_eff - 1 if T_eff > 1 else 1)
+        ax_pca_traj.plot(px, py, "-", color=traj_colors[i], lw=0.8, alpha=0.4, zorder=2)
+        ax_pca_traj.scatter(px, py, c=sub_t, cmap=cmap_time, s=6, alpha=0.8,
+                            zorder=3, linewidths=0)
+        ax_pca_traj.scatter(X_pca[s, 0], X_pca[s, 1], color=traj_colors[i],
+                            s=50, marker="o", edgecolors="k", lw=0.5, zorder=5)
+        ax_pca_traj.scatter(X_pca[e - 1, 0], X_pca[e - 1, 1], color=traj_colors[i],
+                            s=50, marker="X", edgecolors="k", lw=0.5, zorder=5)
+    sm = plt.cm.ScalarMappable(cmap=cmap_time, norm=plt.Normalize(0, T_eff))
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax_pca_traj, label="Time step")
+    ax_pca_traj.set_xlabel(f"PC1  ({var1:.1f}% var)")
+    ax_pca_traj.set_ylabel(f"PC2  ({var2:.1f}% var)")
+    ax_pca_traj.set_title(
+        f"Linear Projection: PC1–PC2 Trajectories\n"
+        f"({n_show} traj, circle=start, X=end, colour=time)"
+    )
+    ax_pca_traj.set_aspect("equal", adjustable="datalim")
+
+    # ── Row 1: Takens delay embedding ─────────────────────────────────────────
+    n_pts_del = min(n_show * T_embed, X_delay.shape[0])
+    hb2 = ax_del_dens.hexbin(
+        X_delay[:n_pts_del, 0], X_delay[:n_pts_del, 1],
+        gridsize=40, cmap="YlOrRd", mincnt=1,
+    )
+    plt.colorbar(hb2, ax=ax_del_dens, label="Visit count")
+    ax_del_dens.set_xlabel("y(t)  [observable]")
+    ax_del_dens.set_ylabel(f"y(t+{tau})  [observable]")
+    ax_del_dens.set_title(
+        f"Takens Delay Embedding: Density  (tau={tau})\n"
+        f"(nonlinear topology — preserves attractor geometry)"
+    )
+    ax_del_dens.set_aspect("equal", adjustable="datalim")
+
+    for i in range(n_show):
+        s, e = i * T_embed, (i + 1) * T_embed
+        if e > X_delay.shape[0]:
+            break
+        idx = np.arange(0, T_embed, stride_del)
+        dy0 = X_delay[s:e, 0][idx]
+        dy1 = X_delay[s:e, 1][idx]
+        sub_t = idx / float(T_embed - 1 if T_embed > 1 else 1)
+        ax_del_traj.plot(dy0, dy1, "-", color=traj_colors[i], lw=0.8, alpha=0.4, zorder=2)
+        ax_del_traj.scatter(dy0, dy1, c=sub_t, cmap=cmap_time, s=6, alpha=0.8,
+                            zorder=3, linewidths=0)
+        ax_del_traj.scatter(X_delay[s, 0], X_delay[s, 1], color=traj_colors[i],
+                            s=50, marker="o", edgecolors="k", lw=0.5, zorder=5)
+        ax_del_traj.scatter(X_delay[e - 1, 0], X_delay[e - 1, 1], color=traj_colors[i],
+                            s=50, marker="X", edgecolors="k", lw=0.5, zorder=5)
+    sm2 = plt.cm.ScalarMappable(cmap=cmap_time, norm=plt.Normalize(0, T_embed))
+    sm2.set_array([])
+    plt.colorbar(sm2, ax=ax_del_traj, label="Time step")
+    ax_del_traj.set_xlabel("y(t)  [observable]")
+    ax_del_traj.set_ylabel(f"y(t+{tau})  [observable]")
+    ax_del_traj.set_title(
+        f"Takens Delay Embedding: Trajectories  (tau={tau})\n"
+        f"({n_show} traj, circle=start, X=end, colour=time)"
+    )
+    ax_del_traj.set_aspect("equal", adjustable="datalim")
+
+    # Quality/method annotation on the bottom-left density panel
+    _qual_lines = [f"obs: {_obs_label}", f"tau={tau}"]
+    if _corr_str:
+        _qual_lines.append(_corr_str)
+    ax_del_dens.text(
+        0.02, 0.98, "\n".join(_qual_lines),
+        transform=ax_del_dens.transAxes, fontsize=7,
+        va="top", ha="left",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.75, ec="grey"),
+    )
+
+    fig.suptitle(
+        "Brain Dynamics Manifold Portrait\n"
+        "Top: PCA linear projection  |  Bottom: Takens nonlinear delay embedding"
+        + f"  |  {_obs_label}"
+        + (f", {_corr_str}" if _corr_str else ""),
+        fontsize=11, fontweight="bold",
+    )
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved combined manifold portrait: %s", output_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase velocity portrait  (always informative — guaranteed non-degenerate)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _try_plot_velocity_portrait(
+    X_pca: np.ndarray,
+    n_traj: int,
+    T_eff: int,
+    evr: List[float],
+    output_path: Path,
+    n_traj_show: int = 5,
+) -> None:
+    """Phase velocity portrait: dPC1/dt vs PC1[t].
+
+    Shows the **velocity field** of the attractor dynamics — how fast and in
+    which direction the system moves at each point in PC1 space.
+
+    **Why this is guaranteed to be informative** regardless of dynamics type:
+
+    * **Fixed-point attractor**: velocities point toward the fixed point
+      (arrows converge).  Shows a clear "V"-shape or funnel.
+    * **Limit cycle**: velocities form a closed ring.
+    * **Chaos / noise**: velocities form a diffuse cloud with visible structure.
+
+    For convergent (drift-dominated) trajectories where the delay portrait
+    collapses to a diagonal, this plot reveals the convergence dynamics in
+    full detail.
+
+    Two-panel layout:
+
+    * **Left** — hexbin density of (PC1[t], dPC1/dt): where the system spends
+      time in phase-velocity space (invariant measure on the flow).
+    * **Right** — sparse trajectory overlay: how each trajectory evolves.
+      Color encodes time from start (dark) to end (bright).
+
+    Args:
+        X_pca:       shape (n_traj * T_eff, n_pcs) — PCA projections.
+        n_traj:      number of trajectories.
+        T_eff:       post-burnin length per trajectory.
+        evr:         explained variance ratios list.
+        output_path: PNG save path.
+        n_traj_show: max trajectories to overlay.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from spectral_dynamics.plot_utils import configure_matplotlib
+        configure_matplotlib()
+    except ImportError:
+        _write_fallback_png(output_path)
+        return
+
+    if X_pca.shape[1] < 1 or T_eff < 3:
+        _write_fallback_png(output_path)
+        return
+
+    n_show = min(n_traj_show, n_traj)
+    var1 = float(evr[0]) * 100 if len(evr) > 0 else 0.0
+
+    # Build (position, velocity) pairs for all n_show trajectories
+    pos_all: list = []
+    vel_all: list = []
+    for i in range(n_show):
+        s = i * T_eff
+        e = s + T_eff
+        if e > X_pca.shape[0]:
+            break
+        pc1 = X_pca[s:e, 0].astype(np.float64)
+        # Finite difference velocity (forward difference, length T_eff-1)
+        vel = np.diff(pc1)
+        pos_all.append(pc1[:-1])
+        vel_all.append(vel)
+
+    if not pos_all:
+        _write_fallback_png(output_path)
+        return
+
+    pos_cat = np.concatenate(pos_all)
+    vel_cat = np.concatenate(vel_all)
+
+    fig, (ax_dens, ax_traj) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # ── Left: density hexbin ───────────────────────────────────────────────────
+    hb = ax_dens.hexbin(pos_cat, vel_cat, gridsize=40, cmap="YlOrRd", mincnt=1)
+    plt.colorbar(hb, ax=ax_dens, label="Visit count")
+    # Mark the zero-velocity line
+    ax_dens.axhline(0, color="k", lw=0.8, ls="--", alpha=0.4)
+    ax_dens.set_xlabel(f"PC1  ({var1:.1f}% var)")
+    ax_dens.set_ylabel("dPC1/dt  (velocity)")
+    ax_dens.set_title(
+        "Phase Velocity Density  (PC1 space)\n"
+        "Bright = system spends most time here"
+    )
+
+    # ── Right: trajectory overlay ──────────────────────────────────────────────
+    traj_colors = plt.cm.tab10(np.linspace(0, 1, max(n_show, 1)))
+    cmap_time = plt.cm.viridis
+    stride = max(1, (T_eff - 1) // 100)
+
+    for i, (pos, vel) in enumerate(zip(pos_all, vel_all)):
+        idx = np.arange(0, len(pos), stride)
+        sub_pos, sub_vel = pos[idx], vel[idx]
+        sub_t = idx / float(len(pos) - 1 if len(pos) > 1 else 1)
+        ax_traj.plot(sub_pos, sub_vel, "-", color=traj_colors[i],
+                     lw=0.8, alpha=0.4, zorder=2)
+        ax_traj.scatter(sub_pos, sub_vel, c=sub_t, cmap=cmap_time,
+                        s=6, alpha=0.8, zorder=3, linewidths=0)
+        ax_traj.scatter(pos[0], vel[0], color=traj_colors[i], s=50,
+                        marker="o", edgecolors="k", linewidths=0.5, zorder=5)
+        ax_traj.scatter(pos[-1], vel[-1], color=traj_colors[i], s=50,
+                        marker="X", edgecolors="k", linewidths=0.5, zorder=5)
+
+    ax_traj.axhline(0, color="k", lw=0.8, ls="--", alpha=0.4)
+    sm = plt.cm.ScalarMappable(cmap=cmap_time, norm=plt.Normalize(0, T_eff - 1))
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax_traj, label="Time step")
+    ax_traj.set_xlabel(f"PC1  ({var1:.1f}% var)")
+    ax_traj.set_ylabel("dPC1/dt  (velocity)")
+    ax_traj.set_title(
+        f"Phase Velocity Trajectories  ({n_show} traj)\n"
+        "circle=start, X=end, colour=time"
+    )
+
+    fig.suptitle(
+        "Phase Velocity Portrait  (dPC1/dt vs PC1)\n"
+        "Always informative: converging system shows arrows toward attractor; "
+        "limit cycle shows ring; chaos shows cloud",
+        fontsize=10, fontweight="bold",
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved velocity portrait: %s", output_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -905,15 +1437,22 @@ def _try_plot_delay_portrait(
     tau: int,
     output_path: Path,
     n_traj_show: int = 5,
+    obs_method: str = "demeaned",
+    tau_corr: float = float("nan"),
 ) -> None:
     """Plot delay-embedding phase portrait: y(t) vs y(t+tau) [vs y(t+2*tau)].
 
-    Uses Takens delay embedding (mean channel observable) so the phase portrait
-    preserves the nonlinear attractor topology that PCA linear projection may
-    flatten or distort.
+    Uses a two-panel layout that matches the clean design of
+    ``_try_plot_attractor_2d``:
 
-    If the embedding dimension is ≥ 3, a 3-D trajectory plot is also produced
-    alongside the 2-D panel.
+    * **Left panel** — hexbin density heatmap: shows *where* the trajectory
+      spends its time on the attractor (invariant measure).  Robust against
+      visual clutter even for very long trajectories.
+    * **Right panel** — sparse trajectory overlay: shows *how* the trajectory
+      moves.  Subsampled to ≤ 100 points per trajectory to avoid overlapping
+      segments.
+
+    When the embedding dimension m ≥ 3 a third panel shows the 3-D portrait.
 
     Args:
         X_delay:        shape (n_traj * T_embed, m) from _build_delay_portrait.
@@ -921,7 +1460,9 @@ def _try_plot_delay_portrait(
         steps_per_traj: T_embed (delay-adjusted trajectory length).
         tau:            delay lag used (for axis labels).
         output_path:    PNG save path.
-        n_traj_show:    max trajectories to overlay.
+        n_traj_show:    max trajectories shown in the sparse-overlay panel.
+        obs_method:     'demeaned' | 'linear_detrend' — for plot annotation.
+        tau_corr:       |corr(y(t),y(t+tau))| — quality metric, shown in plot.
     """
     try:
         import matplotlib
@@ -934,22 +1475,61 @@ def _try_plot_delay_portrait(
         return
 
     m = X_delay.shape[1]
-    if m < 2:
+    # Need m >= 2 for a 2-D portrait and steps_per_traj >= 4 for meaningful
+    # subsampling (stride = max(1, T//100); T < 4 gives only 0-3 points).
+    if m < 2 or steps_per_traj < 4:
         _write_fallback_png(output_path)
         return
 
     has_3d = m >= 3
     n_show = min(n_traj_show, n_traj)
     T = steps_per_traj
-    cmap = plt.cm.viridis
-    colors_t = cmap(np.linspace(0.05, 0.95, T))
 
+    # Subsampling stride: target ~100 visible points per trajectory
+    stride = max(1, T // 100)
+
+    # ── Collect density data (all n_show trajectories) ────────────────────────
+    n_pts = min(n_show * T, X_delay.shape[0])
+    all_y0 = X_delay[:n_pts, 0]
+    all_y1 = X_delay[:n_pts, 1]
+
+    # ── Figure layout ──────────────────────────────────────────────────────────
     if has_3d:
-        fig = plt.figure(figsize=(12, 6))
-        ax2 = fig.add_subplot(1, 2, 1)
-        ax3 = fig.add_subplot(1, 2, 2, projection="3d")
+        fig = plt.figure(figsize=(18, 5))
+        ax_dens = fig.add_subplot(1, 3, 1)
+        ax_traj = fig.add_subplot(1, 3, 2)
+        ax3d = fig.add_subplot(1, 3, 3, projection="3d")
     else:
-        fig, ax2 = plt.subplots(figsize=(6, 6))
+        fig, (ax_dens, ax_traj) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Quality annotation text (shown in density panel)
+    _obs_label = "PC1 (detrended)" if obs_method == "linear_detrend" else "PC1"
+    _corr_str = f"|corr|={abs(tau_corr):.3f}" if np.isfinite(tau_corr) else ""
+
+    # ── Left: density heatmap ──────────────────────────────────────────────────
+    hb = ax_dens.hexbin(all_y0, all_y1, gridsize=40, cmap="YlOrRd", mincnt=1)
+    plt.colorbar(hb, ax=ax_dens, label="Visit count")
+    ax_dens.set_xlabel("y(t)")
+    ax_dens.set_ylabel(f"y(t+{tau})")
+    ax_dens.set_title(
+        f"Takens Attractor Density  (tau={tau})\n"
+        f"{n_show} traj — bright = more time spent here"
+    )
+    ax_dens.set_aspect("equal", adjustable="datalim")
+    # Quality annotation box
+    _qual_lines = [f"obs: {_obs_label}", f"tau={tau}"]
+    if _corr_str:
+        _qual_lines.append(_corr_str)
+    ax_dens.text(
+        0.02, 0.98, "\n".join(_qual_lines),
+        transform=ax_dens.transAxes, fontsize=7,
+        va="top", ha="left",
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.75, ec="grey"),
+    )
+
+    # ── Right: sparse trajectory overlay ──────────────────────────────────────
+    traj_colors = plt.cm.tab10(np.linspace(0, 1, max(n_show, 1)))
+    cmap_time = plt.cm.viridis
 
     for i in range(n_show):
         start = i * T
@@ -958,40 +1538,63 @@ def _try_plot_delay_portrait(
             break
         y0 = X_delay[start:end, 0]
         y1 = X_delay[start:end, 1]
+        idx = np.arange(0, T, stride)
+        sub0, sub1 = y0[idx], y1[idx]
+        sub_t = idx / float(T - 1 if T > 1 else 1)
 
-        # 2-D portrait
-        for t in range(T - 1):
-            ax2.plot(y0[t:t+2], y1[t:t+2], color=colors_t[t], lw=0.8, alpha=0.7)
-        ax2.scatter(y0[0], y1[0], color="blue", s=25, zorder=5, marker="o")
-        ax2.scatter(y0[-1], y1[-1], color="red", s=25, zorder=5, marker="x")
+        ax_traj.plot(sub0, sub1, "-", color=traj_colors[i], lw=0.8, alpha=0.45, zorder=2)
+        ax_traj.scatter(sub0, sub1, c=sub_t, cmap=cmap_time,
+                        s=6, alpha=0.8, zorder=3, linewidths=0)
+        ax_traj.scatter(y0[0], y1[0], color=traj_colors[i], s=50, marker="o",
+                        edgecolors="k", linewidths=0.5, zorder=5)
+        ax_traj.scatter(y0[-1], y1[-1], color=traj_colors[i], s=50, marker="X",
+                        edgecolors="k", linewidths=0.5, zorder=5)
 
-        # 3-D portrait
-        if has_3d:
-            y2 = X_delay[start:end, 2]
-            ax3.plot(y0, y1, y2, lw=0.6, alpha=0.6)
-            ax3.scatter(y0[0], y1[0], y2[0], color="blue", s=20)
-            ax3.scatter(y0[-1], y1[-1], y2[-1], color="red", s=20, marker="^")
-
-    # Colorbar for time
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, T))
+    sm = plt.cm.ScalarMappable(cmap=cmap_time, norm=plt.Normalize(0, T))
     sm.set_array([])
-    plt.colorbar(sm, ax=ax2, label="Time Step")
-
-    ax2.set_xlabel(f"y(t)")
-    ax2.set_ylabel(f"y(t+{tau})")
-    ax2.set_title(
-        f"Phase Portrait: Delay Embedding (tau={tau})\n"
-        f"({n_show} traj, blue=start, redX=end, colour=time)"
+    plt.colorbar(sm, ax=ax_traj, label="Time step")
+    ax_traj.set_xlabel("y(t)")
+    ax_traj.set_ylabel(f"y(t+{tau})")
+    ax_traj.set_title(
+        f"Delay Embedding Trajectories  (tau={tau})\n"
+        f"{n_show} traj, circle=start, X=end, colour=time"
     )
-    ax2.grid(True, alpha=0.2)
+    ax_traj.set_aspect("equal", adjustable="datalim")
 
+    # ── Optional 3-D portrait ──────────────────────────────────────────────────
     if has_3d:
-        ax3.set_xlabel(f"y(t)")
-        ax3.set_ylabel(f"y(t+{tau})")
-        ax3.set_zlabel(f"y(t+{2*tau})")
-        ax3.set_title(f"3-D Delay Portrait (tau={tau})")
+        stride3d = max(1, T // 80)
+        for i in range(n_show):
+            start = i * T
+            end = start + T
+            if end > X_delay.shape[0]:
+                break
+            y0 = X_delay[start:end, 0]
+            y1 = X_delay[start:end, 1]
+            y2 = X_delay[start:end, 2]
+            idx = np.arange(0, T, stride3d)
+            sub0, sub1, sub2 = y0[idx], y1[idx], y2[idx]
+            sub_t = idx / float(T - 1 if T > 1 else 1)
+            ax3d.plot(sub0, sub1, sub2, "-", color=traj_colors[i],
+                      lw=0.6, alpha=0.30, zorder=2)
+            ax3d.scatter(sub0, sub1, sub2, c=sub_t, cmap=cmap_time,
+                         s=8, alpha=0.75, zorder=3, linewidths=0)
+            ax3d.scatter(y0[0], y1[0], y2[0], color=traj_colors[i], s=40,
+                         marker="o", depthshade=False,
+                         edgecolors="k", linewidths=0.5, zorder=5)
+            ax3d.scatter(y0[-1], y1[-1], y2[-1], color=traj_colors[i], s=40,
+                         marker="X", depthshade=False,
+                         edgecolors="k", linewidths=0.5, zorder=5)
+        ax3d.set_xlabel("y(t)")
+        ax3d.set_ylabel(f"y(t+{tau})")
+        ax3d.set_zlabel(f"y(t+{2*tau})")
+        ax3d.set_title(f"3-D Delay Portrait  (tau={tau})")
 
-    fig.suptitle("Takens Delay Embedding Phase Portrait", fontsize=10)
+    fig.suptitle(
+        f"Takens Delay Embedding  (obs: {_obs_label}, tau={tau}"
+        + (f", {_corr_str}" if _corr_str else "") + ")",
+        fontsize=11, fontweight="bold",
+    )
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
