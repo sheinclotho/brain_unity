@@ -5,34 +5,31 @@ Free Dynamics Experiment
 验证系统在 **无输入情况下** 的长期行为。
 
 流程：
-1. 确定可用的时序窗口数（见下文时序窗口机制）
-2. 采样 n_init 个随机初始状态
-3. 轨迹 i 使用窗口 i % n_windows 作为历史上下文（不同历史片段）
-4. 将 x0 注入选定上下文的最后一个时间步
-5. 运行 steps 步自回归预测，记录轨迹
+1. 确定可用的随机起始位置数量
+2. 为每条轨迹随机采样一个等长上下文窗口（context_start ∈ [0, T - ctx_len]）
+3. x0 = 上下文末步对应的数据值（上下文 + x0 在时序上连续）
+4. 运行 steps 步自回归预测，记录轨迹
 
 输出文件：outputs/trajectories.npy
 
-**时序窗口机制（解决 Wolf 上下文稀释偏差）**：
+**随机等长上下文窗口策略（替换旧的变长回退策略）**：
 
-  以前所有轨迹共享同一个历史上下文（base_graph 最后 context_length 步），
-  只有最后 1 步被不同 x0 覆盖。注意力机制将这 1 步扰动稀释在 L-1 个相同历史中，
-  导致所有轨迹几乎相同（Wolf std ≈ 1.85e-05，见 AGENTS.md §Wolf上下文稀释偏差）。
+  所有轨迹的上下文长度完全相同（= context_length 步），区别仅在于起始位置。
+  对每条轨迹 i，随机采样 context_start ∈ [0, max(0, T - ctx_len)]：
 
-  本模块使用 **滑窗策略**：步长 stride = context_length // 4（75% 重叠），
-  从主模态时序 T_primary 中提取多个历史窗口：
+    轨迹 i → context_start_i = rand([0, T - ctx_len])
+            → 上下文 = data[:, context_start_i : context_start_i + ctx_len]
+            → x0     = data[:, context_start_i + ctx_len - 1]（时序连续）
 
-    窗口 0：x[:, T-L:T, :]               （最近历史，原有行为）
-    窗口 1：x[:, T-L-s:T-s, :]           （s = stride = L // 4）
-    窗口 k：x[:, T-L-k*s:T-k*s, :]
+  这与旧的"prediction_steps 步幅回退"策略有本质区别：
+  旧策略产生 window0=T步, window1=T-s步, … 等 **不同长度** 的上下文，
+  导致编码器的初始输入质量系统性不均等，干扰后续动力学分析。
+  新策略确保所有轨迹经历相同质量的初始化。
 
-  相比非重叠分块（要求 T ≥ k × L），滑窗方案只需 T > L + stride 即可产生第 2
-  个窗口。对于典型 10 分钟 fMRI（300 TR、L=200、s=50），可得 3 个窗口，
-  显著提升轨迹多样性。
-
-  **模态感知**：窗口数仅由主模态（fmri/eeg）的时序长度决定。次要模态（如
-  joint 模式中的 EEG）若时序较短，_get_context_for_window 会自动回退到
-  最早可用窗口，不影响主模态的窗口计数。
+  **当 T ≤ context_length 时**（如本次 T=200, ctx_len=200）：
+  只有一个有效起始位置（context_start=0），上下文 = data[0:T]。
+  100 条轨迹的多样性完全来自 x0 注入噪声（0.3σ 扰动）。
+  在近临界系统（LLE ≈ 0）中，0.3σ 扰动足以驱散轨迹覆盖吸引子。
 """
 
 import logging
@@ -114,19 +111,18 @@ def run_free_dynamics(
     rng = np.random.default_rng(seed)
     n_regions = simulator.n_regions
 
-    # ── Determine effective number of temporal windows ────────────────────────
-    max_available = simulator.n_temporal_windows
-    if n_temporal_windows is None:
-        eff_windows = max_available
-    else:
-        eff_windows = min(int(n_temporal_windows), max_available)
-        if int(n_temporal_windows) > max_available:
-            logger.warning(
-                "  ⚠  n_temporal_windows=%d 超过可用滑窗数 %d"
-                "（主模态时序 T 不足以支撑该数量的 stride=context_length//4 滑窗），"
-                "实际使用 %d 个窗口。",
-                n_temporal_windows, max_available, eff_windows,
-            )
+    # ── Determine data dimensions ─────────────────────────────────────────────
+    ctx_len = simulator._get_context_length()
+    _nt = simulator.modality if simulator.modality != "joint" else "fmri"
+    try:
+        T_primary = (
+            int(simulator.base_graph[_nt].x.shape[1])
+            if _nt in simulator.base_graph.node_types
+            and hasattr(simulator.base_graph[_nt], "x")
+            else 0
+        )
+    except Exception:
+        T_primary = 0
 
     est_mb = _estimate_memory_mb(n_init, steps, n_regions)
     logger.info(
@@ -134,118 +130,68 @@ def run_free_dynamics(
         n_init, steps, n_regions, est_mb,
     )
 
-    if eff_windows > 1:
-        ctx_len = simulator._get_context_length()
-        stride = max(1, ctx_len // 4)
-        _nt = simulator.modality if simulator.modality != "joint" else "fmri"
-        _T_primary = (
-            int(simulator.base_graph[_nt].x.shape[1])
-            if _nt in simulator.base_graph.node_types
-            and hasattr(simulator.base_graph[_nt], "x")
-            else 0
-        )
-        if _T_primary <= ctx_len:
-            # Fallback path: prediction_steps-based stride gave us multiple
-            # shorter-context windows.  Each window uses a different-length
-            # initial context (window k starts with T - k*stride timesteps).
-            logger.info(
-                "  时序窗口: 使用 %d 个变长上下文窗口（回退模式）。\n"
-                "  主模态 '%s' 时序 T=%d ≤ context_length=%d，"
-                "使用 prediction_steps 步幅提取多个较短初始上下文：\n"
-                "    窗口 0 → %d 步上下文（最完整）\n"
-                "    窗口 1 → %d 步上下文\n"
-                "    …\n"
-                "    窗口 %d → %d 步上下文（最短）\n"
-                "  初始上下文质量随窗口编号递减，但在约 %d 步后自回归预测会"
-                "补充到完整 context_length 步，对长轨迹（steps=%d）影响极小。\n"
-                "  轨迹 i → 窗口 i %% %d。",
-                eff_windows,
-                _nt, _T_primary, ctx_len,
-                _T_primary,
-                max(0, _T_primary - stride),
-                eff_windows - 1, max(0, _T_primary - (eff_windows - 1) * stride),
-                ctx_len,
-                steps,
-                eff_windows,
-            )
-        else:
-            logger.info(
-                "  时序窗口: 使用 %d 个滑窗上下文"
-                "（context_length=%d，stride=%d，%.0f%% 重叠；"
-                "轨迹 i → 窗口 i %% %d）。\n"
-                "  每条轨迹从真正不同的历史时段出发，有效缓解上下文稀释效应。",
-                eff_windows, ctx_len, stride, (1 - stride / ctx_len) * 100, eff_windows,
-            )
+    # ── Random equal-length context window strategy ───────────────────────────
+    # All contexts have exactly min(ctx_len, T_primary) steps; the only
+    # variation between trajectories is WHERE in the recording we start.
+    # This avoids the systematic encoder-quality bias that the old
+    # "prediction_steps fallback" introduced by using shorter and shorter
+    # contexts for higher window indices.
+    #
+    # n_valid_starts = max(1, T_primary - ctx_len + 1):
+    #   T >= ctx_len  →  uniform draw from [0, T - ctx_len]
+    #                    (multiple distinct full-length windows possible)
+    #   T < ctx_len   →  always start=0; diversity comes from x0 noise alone
+    #
+    # x0 alignment: x0_step = context_start + effective_ctx - 1
+    # (last step of the selected context window).  Injecting the data value at
+    # that step means context + x0 form a CONTIGUOUS BOLD segment → no
+    # correction transient in the encoder output.
+    if T_primary > 0:
+        eff_ctx = min(ctx_len, T_primary)
+        n_valid_starts = max(1, T_primary - eff_ctx + 1)
     else:
-        ctx_len = simulator._get_context_length()
-        stride = max(1, ctx_len // 4)
-        # Determine primary modality T for the diagnostic message.
-        _nt = simulator.modality if simulator.modality != "joint" else "fmri"
-        _T_primary = (
-            int(simulator.base_graph[_nt].x.shape[1])
-            if _nt in simulator.base_graph.node_types
-            and hasattr(simulator.base_graph[_nt], "x")
-            else 0
-        )
+        eff_ctx = ctx_len
+        n_valid_starts = 1
+
+    if n_valid_starts > 1:
         logger.info(
-            "  时序窗口: 仅使用 1 个上下文窗口"
-            "（主模态 '%s' 时序 T=%d，context_length=%d，stride=%d）。\n"
-            "  当前多样性来源: %d 个不同随机初始状态 Uniform[0,1]^%d。\n"
-            "  若 context_length（%d）远大于模型实际所需，请检查 config.yaml 中\n"
-            "  v5_optimization.advanced_prediction.context_length 是否与\n"
-            "  训练时一致（当前从 predictor.context_length=%d 读取）。",
-            _nt, _T_primary, ctx_len, stride,
-            n_init, n_regions,
-            ctx_len, ctx_len,
+            "  初始化策略: 随机等长上下文窗口"
+            "（%d 条轨迹各自随机截取 %d 步历史，"
+            "起始位置 ∈ [0, %d]，全部等长，无偏差）。\n"
+            "  x0 = 上下文窗口末步对应的数据值（时序连续）。",
+            n_init, eff_ctx, n_valid_starts - 1,
+        )
+    else:
+        logger.info(
+            "  初始化策略: 单一上下文窗口（主模态 '%s' T=%d ≤ context_length=%d）。\n"
+            "  仅有一个等长上下文 [0:%d]，%d 条轨迹的多样性来自 x0 注入噪声。\n"
+            "  提示: 若需要更多轨迹多样性，请提供更长的输入时序（T > %d）。",
+            _nt, T_primary, ctx_len, eff_ctx, n_init, ctx_len,
+        )
+
+    # Warn if caller passed n_temporal_windows (parameter now ignored in favour
+    # of the random-start strategy, but we log so the caller knows).
+    if n_temporal_windows is not None and int(n_temporal_windows) != 1:
+        logger.warning(
+            "  n_temporal_windows=%d 参数已忽略：当前使用随机等长上下文策略，"
+            "轨迹多样性由 context_start 随机采样而非固定窗口数控制。",
+            n_temporal_windows,
         )
 
     trajectories = np.empty((n_init, steps, n_regions), dtype=np.float32)
     log_interval = max(1, n_init // 10)
 
-    # ── Compute context-end-aligned step indices for each temporal window ────
-    # For temporal window k:
-    #   context_window_k  = data[:, T - ctx - k*s : T - k*s]
-    #   x0_natural        = data[:, T - k*s]       (step immediately after context)
-    #
-    # Injecting x0 = data[:, T - k*s] makes context + x0 a CONTIGUOUS BOLD
-    # segment, so the model encoder sees internally consistent temporal structure
-    # with zero spatial-structure mismatch.  This eliminates the long
-    # "correction transient" that otherwise dominates PC1.
-    #
-    # For window 0: T - 0*s = T, clamped to T-1 (last available BOLD step).
-    # The resulting x0 = context[-1] effectively re-uses the last context step,
-    # which is identical to running with x0=None — the model immediately
-    # produces a natural continuation without any correction.
-    try:
-        _stride_fd  = simulator._get_stride()   # canonical: max(1, ctx_len // 4)
-        _nt_fd = simulator.modality if simulator.modality != "joint" else "fmri"
-        _T_fd = (int(simulator.base_graph[_nt_fd].x.shape[1])
-                 if _nt_fd in simulator.base_graph.node_types
-                 and hasattr(simulator.base_graph[_nt_fd], "x")
-                 else 0)
-    except Exception:
-        _stride_fd  = 50
-        _T_fd       = 0
-
-    def _x0_step_for_window(w_idx: int) -> Optional[int]:
-        """Return the context-aligned step index for temporal window w_idx."""
-        if _T_fd <= 0:
-            return None  # no data available; fall back to random step
-        step = _T_fd - w_idx * _stride_fd
-        return int(max(0, min(step, _T_fd - 1)))
-
     for i in range(n_init):
-        window_idx = i % eff_windows
-        # Context-end-aligned initial state: x0 is the BOLD step that immediately
-        # follows the context window being used.  This makes context+x0 a
-        # temporally contiguous segment, so the model predicts naturally from the
-        # first step, producing oscillatory/chaotic orbits rather than a long
-        # correction drift toward the free-run attractor.
-        x0_step = _x0_step_for_window(window_idx)
+        # Random context start position — equal length for all trajectories
+        context_start = int(rng.integers(0, n_valid_starts))
+        # x0 aligned to the last step of the selected context window.
+        # context covers [context_start : context_start + eff_ctx]
+        # so the last step index is context_start + eff_ctx - 1.
+        x0_step = min(context_start + eff_ctx - 1, max(0, T_primary - 1)) if T_primary > 0 else None
         x0 = simulator.sample_random_state(rng, from_data=True, step_idx=x0_step)
         traj, _ = simulator.rollout(
             x0=x0, steps=steps, stimulus=None,
-            context_window_idx=window_idx,
+            context_start=context_start,
         )
         trajectories[i] = traj
         if (i + 1) % log_interval == 0:
