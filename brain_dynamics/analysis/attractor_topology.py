@@ -828,8 +828,6 @@ def _score_hypotheses(
         if rosenstein_lle > 0.01:
             scores["SA"] += 2.5
             evidence_notes["SA"].append(f"Rosenstein LLE > 0 ({rosenstein_lle:.5f})")
-            # Positive LLE is also consistent with CA (marginal stability)
-            scores["CA"] += 0.5
         elif rosenstein_lle < -0.01:
             scores["FP"] += 1.5
             scores["LC"] += 1.0
@@ -912,8 +910,7 @@ def _score_hypotheses(
     # detecting discrete basins.  This is evidence for CA (continuous attractor)
     # and weak evidence AGAINST SA (strange attractor requires folding).
     if kmeans_uniform_suspect:
-        scores["CA"] += 2.0
-        scores["SA"] -= 1.0   # uniform ring is inconsistent with strange attractor
+        scores["CA"] += 0.8
         evidence_notes["CA"].append(
             "uniform KMeans cluster sizes + high silhouette → ring/continuous attractor"
         )
@@ -1002,6 +999,30 @@ def _score_hypotheses(
             evidence_notes["SM"].append(
                 f"Rosenstein LLE ≈ 0 ({rosenstein_lle:.5f}) → near-critical SM"
             )
+
+    # ── CA anti-false-positive guard ──────────────────────────────────────
+    # Continuous attractor should not be selected from a single weak clue
+    # (e.g., one near-zero Jacobian eigenvalue in a noisy global fit).
+    # Require at least 2 independent CA-consistent evidences before allowing
+    # large CA scores.
+    ca_support = 0
+    if has_neut:
+        ca_support += 1
+    if ld is not None and np.isfinite(ld) and ld < 1.5:
+        ca_support += 1
+    if rosenstein_lle is not None and abs(rosenstein_lle) <= 0.01:
+        ca_support += 1
+    if kmeans_uniform_suspect:
+        ca_support += 1
+    if period_stability and period_stability.get("stability_class") == "slow_manifold_oscillation":
+        ca_support += 1
+
+    if ca_support < 2:
+        scores["CA"] = min(scores["CA"], 0.8)
+        evidence_notes["CA"].append(
+            f"CA guard: only {ca_support} independent manifold signal(s), "
+            "suppressing single-clue false positive"
+        )
 
     # ── Normalise scores (clip to 0 first) ──────────────────────────────
     for h in scores:

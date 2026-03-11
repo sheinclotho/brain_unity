@@ -153,8 +153,9 @@ def run_attractor_analysis(
     db_n_clusters = len(set(db_labels)) - (1 if -1 in db_labels else 0)
     logger.info("  DBSCAN 检测到 %d 个吸引子（噪声点排除后）", db_n_clusters)
 
-    # DBSCAN=1 + KMeans=4 with high silhouette is an additional ring-attractor flag
-    if db_n_clusters <= 1 and best_k >= 3 and (best_sil or 0) > 0.90:
+    # DBSCAN=1 + high-K uniform KMeans can indicate ring/continuous manifold.
+    # Keep this conservative to avoid over-reporting CA on generic low-rank clouds.
+    if db_n_clusters <= 1 and best_k >= 4 and (best_sil or 0) > 0.92:
         ca_suspect = True
         ca_reason = (
             f"DBSCAN=1 cluster + KMeans={best_k} (silhouette={best_sil:.4f}) — "
@@ -217,7 +218,7 @@ def _uniform_cluster_check(
     silhouette: Optional[float],
     dbscan_k: int = 0,
     uniform_tol: float = 0.08,
-    high_sil_thresh: float = 0.90,
+    high_sil_thresh: float = 0.92,
 ) -> tuple:
     """Check whether the KMeans result looks like a ring/continuous attractor.
 
@@ -239,7 +240,9 @@ def _uniform_cluster_check(
     (suspect: bool, reason: str)
     """
     K = len(basin)
-    if K < 2:
+    # Ring segmentation by KMeans is most plausible when K is moderately large.
+    # For K=2/3, near-uniform splits are too common to be diagnostic.
+    if K < 4:
         return False, ""
     expected = 1.0 / K
     fracs = list(basin.values())
