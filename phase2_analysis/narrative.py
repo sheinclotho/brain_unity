@@ -436,7 +436,7 @@ def _layer3_mechanism(
                 "coupling (as arises naturally in brain-scale connectivity), the "
                 "linearised dynamics exhibits complex-conjugate eigenvalue pairs "
                 "— the fingerprint of a Hopf bifurcation.  The oscillation frequency "
-                f"({dmd.get('dominant_oscillation_hz', '?'):.4f} Hz) encodes the "
+                f"({float(dmd.get('dominant_oscillation_hz', 0.0)):.4f} Hz) encodes the "
                 f"inter-community coupling time scale."
                 if dmd.get("dominant_oscillation_hz") else
                 "The oscillation frequency encodes the inter-community coupling "
@@ -746,4 +746,4 @@ def _json_serial(obj: Any) -> Any:
         return float(obj)
     if isinstance(obj, np.ndarray):
         return obj.tolist()
-    raise TypeError(f"Object of type {type(obj)} is not JSON serialisable")
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")

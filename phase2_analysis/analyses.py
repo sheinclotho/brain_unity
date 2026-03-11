@@ -142,9 +142,10 @@ def mode_node_coupling(
         eigvals = dmd_eigenvalues.astype(complex)
 
     # ── 3. Identify slow and Hopf modes ───────────────────────────────────────
-    # Discrete → continuous-time: λ_ct = ln(λ_discrete) / dt  (dt=1 step here)
-    eigvals_ct = np.log(np.maximum(np.abs(eigvals), 1e-30)).astype(float)
-    # Full complex log for Im part:
+    # Discrete → continuous-time: λ_ct = ln(λ_discrete)  (dt=1 step here).
+    # Use the full complex log to retain the imaginary part for Hopf detection.
+    # Hopf pairs have conjugate eigenvalues λ, λ*, so Im(ln λ) = ±θ; using
+    # np.abs(im_ct) treats both members of a pair identically.
     eigvals_ct_complex = np.log(np.where(np.abs(eigvals) > 1e-30, eigvals, 1e-30))
 
     re_ct = eigvals_ct_complex.real
@@ -228,7 +229,28 @@ def mode_node_coupling(
 
 def _estimate_dmd(trajectories: np.ndarray, burnin: int = 0,
                   reg_alpha: float = 1e-6) -> np.ndarray:
-    """Estimate DMD operator A from trajectory pairs via Tikhonov LS."""
+    """
+    Estimate the DMD linear transfer operator A from trajectory pairs.
+
+    Solves the Tikhonov-regularised least-squares problem::
+
+        A = argmin ‖X₁ − A X₀‖_F + α‖A‖_F
+          = X₁ᵀ X₀ (X₀ᵀ X₀ + α I)⁻¹
+
+    where X₀, X₁ are matrices of consecutive state pairs (x_t, x_{t+1})
+    stacked over all trajectories.
+
+    Parameters
+    ----------
+    trajectories : (n_traj, T, N) float array
+    burnin       : steps to skip at the start of each trajectory
+    reg_alpha    : Tikhonov regularisation strength (default 1e-6 for
+                   numerical stability without distorting the spectrum)
+
+    Returns
+    -------
+    A : (N, N) float64 — real-valued linear transfer operator
+    """
     n_traj, T, N = trajectories.shape
     pairs: List[np.ndarray] = []
     for traj in trajectories:
@@ -354,8 +376,9 @@ def attractor_fingerprint(
         std_cos_theta1       float — std across pairs
     """
     n_traj, T, N = trajectories.shape
-    k = min(n_components, N - 1, n_traj * (T - burnin) // 2 - 1)
-    if k < 1:
+    # Global upper bound on k; actual k per split is clamped by split size
+    k_max = min(n_components, N - 1)
+    if k_max < 1:
         return {"error": "insufficient_data_for_fingerprint"}
 
     # ── Build splits ──────────────────────────────────────────────────────────
@@ -364,27 +387,37 @@ def attractor_fingerprint(
     temporal_splits = []
     for i in range(n_splits):
         t_start = burnin + i * step
-        t_end   = burnin + (i + 1) * step
-        t_end   = min(t_end, T)
+        t_end   = min(burnin + (i + 1) * step, T)
         chunk   = trajectories[:, t_start:t_end, :]  # (n_traj, chunk_T, N)
         flat    = chunk.reshape(-1, N)
-        if flat.shape[0] > k:
-            temporal_splits.append(("temporal_win_%d" % i, flat))
+        # Each split needs strictly more rows than the number of PCA components
+        # we want to fit.  Clamp k to the split capacity.
+        k_split = min(k_max, flat.shape[0] - 1)
+        if k_split >= 1:
+            temporal_splits.append(("temporal_win_%d" % i, flat, k_split))
 
     # Split 2: trajectory index (odd/even)
     if n_traj >= 4:
         even_flat = trajectories[0::2, burnin:, :].reshape(-1, N)
         odd_flat  = trajectories[1::2, burnin:, :].reshape(-1, N)
-        if even_flat.shape[0] > k and odd_flat.shape[0] > k:
-            temporal_splits.append(("traj_even", even_flat))
-            temporal_splits.append(("traj_odd",  odd_flat))
+        k_even = min(k_max, even_flat.shape[0] - 1)
+        k_odd  = min(k_max, odd_flat.shape[0] - 1)
+        if k_even >= 1:
+            temporal_splits.append(("traj_even", even_flat, k_even))
+        if k_odd >= 1:
+            temporal_splits.append(("traj_odd",  odd_flat, k_odd))
 
     if len(temporal_splits) < 2:
         return {"error": "not_enough_splits"}
 
     # ── Fit PCA and compare subspaces ─────────────────────────────────────────
+    # Use the minimum k across all splits so subspaces have the same dimension
+    k = min(ts[2] for ts in temporal_splits)
+    if k < 1:
+        return {"error": "not_enough_splits"}
+
     subspaces: Dict[str, np.ndarray] = {}
-    for label, flat in temporal_splits:
+    for label, flat, _ in temporal_splits:
         flat = flat.astype(np.float64)
         flat -= flat.mean(axis=0)
         _, _, Vt = np.linalg.svd(flat, full_matrices=False)
@@ -896,4 +929,4 @@ def _json_serial(obj: Any) -> Any:
         return float(obj)
     if isinstance(obj, np.ndarray):
         return obj.tolist()
-    raise TypeError(f"Object of type {type(obj)} is not JSON serialisable")
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")

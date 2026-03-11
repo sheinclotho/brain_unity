@@ -96,6 +96,6 @@ def load_phase1_results(phase1_dir: Path) -> Dict[str, Any]:
     pr = out.get("pipeline_report") or {}
     out["results"] = pr.get("results", {})
 
-    n_loaded = sum(1 for v in out.values() if v is not None and not isinstance(v, str))
+    n_loaded = sum(1 for k, v in out.items() if k != "phase1_dir" and v is not None)
     logger.info("Phase 1 loader: %d artefacts found in %s", n_loaded, d)
     return out

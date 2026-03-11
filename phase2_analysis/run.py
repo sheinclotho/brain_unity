@@ -154,6 +154,16 @@ def run_phase2(
             "attractor_fingerprint and mode_node_coupling will be limited.",
             phase1_dir,
         )
+    if dmd_op is None:
+        logger.info(
+            "  dynamics/jacobian_dmd.npy not found — "
+            "DMD operator will be re-estimated from trajectories."
+        )
+    if dmd_eig is None and dmd_op is not None:
+        logger.info(
+            "  dynamics/jacobian_eigenvalues.npy not found — "
+            "eigenvalues will be recomputed from the DMD operator."
+        )
 
     phase2: Dict[str, Any] = {}
 
