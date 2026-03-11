@@ -39,8 +39,8 @@ def _import_free_dynamics_with_stubs():
 
 
 class _FakeNode:
-    def __init__(self, n: int, t: int = 5):
-        self.x = types.SimpleNamespace(shape=(n, t, 1))
+    def __init__(self, n_regions: int, n_timesteps: int = 5):
+        self.x = types.SimpleNamespace(shape=(n_regions, n_timesteps, 1))
 
 
 class _FakeBaseGraph(dict):

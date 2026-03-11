@@ -71,6 +71,7 @@ _GRID_N: int = 20                  # velocity field grid resolution
 _RQA_EPS_PERCENTILE: float = 10.0  # recurrence threshold as % of distance range
 _RQA_LMIN: int = 2                 # minimum diagonal / vertical line length
 _LOCAL_DIM_K: int = 30             # neighbourhood size for local PCA
+_CA_SINGLE_CLUE_MAX_SCORE: float = 0.8  # anti-false-positive cap for weak CA evidence
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1008,17 +1009,22 @@ def _score_hypotheses(
     ca_support = 0
     if has_neut:
         ca_support += 1
-    if ld is not None and np.isfinite(ld) and ld < 1.5:
+    local_dim_mean = local_dim.get("local_dim_mean") if isinstance(local_dim, dict) else None
+    try:
+        local_dim_mean_f = float(local_dim_mean) if local_dim_mean is not None else None
+    except (TypeError, ValueError):
+        local_dim_mean_f = None
+    if local_dim_mean_f is not None and np.isfinite(local_dim_mean_f) and local_dim_mean_f < 1.5:
         ca_support += 1
     if rosenstein_lle is not None and abs(rosenstein_lle) <= 0.01:
         ca_support += 1
     if kmeans_uniform_suspect:
         ca_support += 1
-    if period_stability and period_stability.get("stability_class") == "slow_manifold_oscillation":
+    if isinstance(period_stability, dict) and period_stability.get("stability_class") == "slow_manifold_oscillation":
         ca_support += 1
 
     if ca_support < 2:
-        scores["CA"] = min(scores["CA"], 0.8)
+        scores["CA"] = min(scores["CA"], _CA_SINGLE_CLUE_MAX_SCORE)
         evidence_notes["CA"].append(
             f"CA guard: only {ca_support} independent manifold signal(s), "
             "suppressing single-clue false positive"

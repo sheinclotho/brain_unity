@@ -879,3 +879,18 @@ PCA 轨迹图显示所有轨迹沿 PC1（占 86%+ 方差）作单向漂移（右
 - **问题**: 方法 A（`classify_dynamics`）的亚稳态条件 `mean_delta < 0.05`，方法 B（`classify_dynamics_delay`）的 `delta_mean < 0.1`，均为绝对阈值。z-score 数据（幅值 ±3）与 [0,1] 归一化数据触发阈值的条件完全不同，导致六七次不同数据集测试结果三方法不一致且分散。
 - **修复**: 为方法 A 和 B 新增 `traj_rms` 可选参数。当 `traj_rms` 可用时，用相对阈值 `delta / traj_rms < 0.15`（与方法 C 的 `_ADAPTIVE_META_RATIO` 相同）替代绝对阈值。`analyze_trajectory_stability` 提前计算 `features`（包含 `traj_rms`）并传递给三个方法，不产生重复计算。
 - **规则**: 稳定性分类的亚稳态判断**必须**使用相对阈值（`delta / traj_rms < 0.15`），绝不能对跨数据集分析使用绝对 δ 阈值。方法 A/B/C 在相同数据上应给出一致结论，分歧来自动力学类型的真实差异而非数据归一化方式。
+
+### [2026-03-11] 多图上下文节点数误判 & 连续吸引子过度触发
+
+#### 多图上下文（joint 模式）节点数误判
+- **问题**: `free_dynamics._build_graph_pool` 用 `simulator.n_regions` 做节点数校验。joint 模式下该值是 `n_fmri+n_eeg`（如 253），导致额外图文件中合法的 `fmri=190` 被全部误判为不匹配并跳过。
+- **修复**: 校验改为使用主模态节点数 `base_graph[nt_primary].x.shape[0]`（如 fmri=190），仅在主模态提取失败时回退到 `simulator.n_regions` 并记录 warning。
+- **规则**: 多图上下文加载的节点数一致性必须按**主模态**校验，绝不能使用 joint 总节点数。
+
+#### 连续吸引子（CA）误报过多
+- **问题**: `attractor_analysis` 的 KMeans 均匀分簇判据过宽（K=2/3 也可触发），且 `attractor_topology` 中 CA 加分偏高（含 `kmeans_uniform_suspect +2.0` 和 `LLE>0` 仍给 CA 加分），导致很多运行被过度标记为 CA。
+- **修复**:
+  - `_uniform_cluster_check`：仅 `K>=4` 才可能触发，silhouette 阈值 `0.90→0.92`。
+  - DBSCAN 联合判据同步收紧为 `K>=4 && silhouette>0.92`。
+  - `_score_hypotheses`：`kmeans_uniform_suspect` 对 CA 加分降到 `+0.8`，移除 `LLE>0` 对 CA 的加分；新增 CA guard（独立证据 <2 时限制 CA 分数上限）。
+- **规则**: Continuous-attractor 结论必须基于至少 2 条独立证据（如中性方向+低维流形+LLE≈0+均匀分簇等），单一线索不得主导最终分类。
