@@ -873,12 +873,18 @@ def _score_hypotheses(
             )
         elif sc == "slow_manifold_oscillation":
             # Now that SM hypothesis exists, slow_manifold_oscillation is
-            # direct evidence for SM — NOT primarily CA.  The SM-specific
-            # scoring block below will add the main SM credit.  Here we
-            # retain a small CA credit (the neutral manifold direction is
-            # CA-like) and QP credit (two incommensurate timescales), but
-            # redirect the bulk to SM.
-            scores["SM"] += 1.5   # preview credit; full +3.0 in SM block below
+            # direct evidence for SM — NOT primarily CA.  This block adds a
+            # partial +1.5 credit (E6 period-stability evidence).  The main
+            # SM-specific scoring block below adds a further +3.0 (from the
+            # SM hypothesis section), giving a cumulative total of +4.5 for SM
+            # when period_stability == "slow_manifold_oscillation".  This
+            # higher total is intentional: two independent evidence streams
+            # (E6 period-stability + SM hypothesis scoring) both confirm the
+            # same classification, so the evidence should accumulate.
+            # The final score is normalised by max_possible_score, so the
+            # absolute magnitude of these numbers does not matter — only
+            # their relative ordering across hypotheses.
+            scores["SM"] += 1.5   # E6 period-stability partial credit
             scores["CA"] += 0.5   # reduced from 1.5; SM is the better fit
             scores["QP"] += 0.5   # reduced from 1.0
             evidence_notes["SM"].append(

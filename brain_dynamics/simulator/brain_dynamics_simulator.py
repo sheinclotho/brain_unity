@@ -888,6 +888,14 @@ class BrainDynamicsSimulator:
                 # ── Direct mode: caller supplies exact start position ──────────
                 start = int(context_start)
                 end = start + ctx_len
+                if start >= T:
+                    logger.warning(
+                        "_get_context_for_window: '%s' T=%d, context_start=%d ≥ T; "
+                        "clamping to earliest valid window [0:%d].",
+                        nt, T, start, min(ctx_len, T),
+                    )
+                    start = 0
+                    end = min(ctx_len, T)
             else:
                 # ── Index mode: stride-based sliding window ───────────────────
                 end = T - window_idx * stride

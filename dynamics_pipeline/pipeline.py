@@ -1649,12 +1649,13 @@ def _build_manifold_collapse_narrative(
     la_lam_pc2 = la_assess.get("lambda_pc2")
     la_pc1_neutral = la_assess.get("pc1_neutral", False)
     if la_interp and la_interp not in ("unknown", "other"):
-        evidence.append(
-            f"Line attractor analysis: {la_interp} "
-            + (f"(λ_PC2={la_lam_pc2:.4f}" if la_lam_pc2 is not None else "")
-            + (", PC1 neutral" if la_pc1_neutral else "")
-            + ")"
-        )
+        parts = []
+        if la_lam_pc2 is not None:
+            parts.append(f"λ_PC2={la_lam_pc2:.4f}")
+        if la_pc1_neutral:
+            parts.append("PC1 neutral")
+        suffix = f" ({', '.join(parts)})" if parts else ""
+        evidence.append(f"Line attractor analysis: {la_interp}{suffix}")
     if la_is_line:
         evidence.append(
             "✓ is_line_attractor=True: PC1 nearly neutral, PC2 contracts strongly "

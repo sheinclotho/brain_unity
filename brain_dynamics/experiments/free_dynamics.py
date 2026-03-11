@@ -184,10 +184,15 @@ def run_free_dynamics(
     for i in range(n_init):
         # Random context start position — equal length for all trajectories
         context_start = int(rng.integers(0, n_valid_starts))
-        # x0 aligned to the last step of the selected context window.
-        # context covers [context_start : context_start + eff_ctx]
-        # so the last step index is context_start + eff_ctx - 1.
-        x0_step = min(context_start + eff_ctx - 1, max(0, T_primary - 1)) if T_primary > 0 else None
+        # x0 aligned to the last step of the selected context window:
+        #   context covers [context_start : context_start + eff_ctx]
+        #   → last step = context_start + eff_ctx - 1
+        # Clamped to [0, T_primary-1] so we never request an out-of-range step.
+        if T_primary > 0:
+            natural_x0_step = context_start + eff_ctx - 1
+            x0_step: Optional[int] = min(natural_x0_step, T_primary - 1)
+        else:
+            x0_step = None  # no data; sample_random_state uses noise only
         x0 = simulator.sample_random_state(rng, from_data=True, step_idx=x0_step)
         traj, _ = simulator.rollout(
             x0=x0, steps=steps, stimulus=None,
