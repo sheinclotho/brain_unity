@@ -832,8 +832,29 @@ class BrainDynamicsSimulator:
             T_primary = int(self.base_graph[nt].x.shape[1])
 
         # ── Primary path: full-context sliding windows ────────────────────────
-        n_full = max(1, (T_primary - ctx_len) // stride + 1)
-        return n_full
+        if T_primary > ctx_len:
+            n_full = max(1, (T_primary - ctx_len) // stride + 1)
+            return n_full
+
+        # ── Fallback path: T ≤ ctx_len — use prediction_steps stride ──────────
+        # When T ≤ context_length there are no full-length sliding windows
+        # (the only full-length window is [0:T]).  The fallback generates
+        # diversity by yielding *shorter* contexts: window w returns
+        # data[:, 0 : T-w*stride, :], giving the encoder a different prefix
+        # of the recording rather than the same [0:T] window every time.
+        #
+        # n_pred_based: how many windows fit with pred_steps as stride.
+        # n_extractable: how many windows remain before T-w*stride hits zero.
+        # The final count is the smaller of the two.
+        _pred_steps: int = int(
+            getattr(getattr(self.model, "model", None), "prediction_steps", 50)
+        )
+        if _pred_steps >= T_primary:
+            # stride ≥ T → only the full [0:T] window is meaningful.
+            return 1
+        n_pred_based = max(1, (T_primary - _pred_steps) // _pred_steps + 1)
+        n_extractable = max(1, (T_primary - 1) // stride + 1)
+        return min(n_pred_based, n_extractable)
 
     def _get_context_for_window(
         self,
@@ -893,20 +914,26 @@ class BrainDynamicsSimulator:
                     )
                 end = start + ctx_len
                 if start >= T:
-                    logger.warning(
+                    # For secondary modalities (e.g. fMRI when primary is EEG),
+                    # context_start is derived from the primary's T and will
+                    # routinely exceed the secondary's T.  This is expected: the
+                    # secondary modality always uses its latest available window.
+                    # Log at DEBUG so as not to pollute logs for every trajectory.
+                    _is_secondary = (nt != self.modality)
+                    _log = logger.debug if _is_secondary else logger.warning
+                    _log(
                         "_get_context_for_window: '%s' T=%d, context_start=%d ≥ T; "
-                        "clamping to earliest valid window [0:%d].",
-                        nt, T, start, min(ctx_len, T),
+                        "clamping to latest valid window [%d:%d].",
+                        nt, T, start, max(0, T - ctx_len), T,
                     )
-                    start = 0
-                    end = min(ctx_len, T)
+                    start = max(0, T - ctx_len)
+                    end = T
             else:
                 # ── Index mode: stride-based sliding window ───────────────────
                 end = T - window_idx * stride
                 start = end - ctx_len
-                if start < 0 or end <= 0:
-                    # Window index is out of range for this node type.
-                    # Clamp gracefully to the earliest available full-length slice.
+                if end <= 0:
+                    # Window completely out of range — use earliest valid slice.
                     start = 0
                     end = min(ctx_len, T)
                     if window_idx > 0:
@@ -916,6 +943,12 @@ class BrainDynamicsSimulator:
                             "using earliest window [0:%d].",
                             nt, T, window_idx, stride, ctx_len, end,
                         )
+                elif start < 0:
+                    # Fallback: T ≤ ctx_len.  Return a shorter prefix [0:end]
+                    # so that consecutive window indices yield genuinely different
+                    # (shorter) context slices rather than all returning [0:T].
+                    start = 0
+                    # end is already T - window_idx*stride (> 0 by the branch above)
 
             # Final clamp to valid data range
             start = max(0, min(start, T))

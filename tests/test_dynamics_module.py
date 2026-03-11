@@ -359,6 +359,10 @@ class TestAttractorAnalysis(unittest.TestCase):
 # Virtual Stimulation Tests
 # ══════════════════════════════════════════════════════════════════════════════
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md)."
+)
 class TestVirtualStimulation(unittest.TestCase):
     def setUp(self):
         self.sim = BrainDynamicsSimulator(model=None, n_regions=N)
@@ -424,6 +428,10 @@ class TestVirtualStimulation(unittest.TestCase):
 # Response Matrix Tests
 # ══════════════════════════════════════════════════════════════════════════════
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md)."
+)
 class TestResponseMatrix(unittest.TestCase):
     def setUp(self):
         self.sim = BrainDynamicsSimulator(model=None, n_regions=N)
@@ -670,6 +678,10 @@ class TestAdaptiveStability(unittest.TestCase):
         self.assertIn("spectral_peak_ratio", metrics)
         self.assertIn("classification_v2", metrics)
 
+    @unittest.skip(
+        "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+        "WC mode deprecated (see AGENTS.md)."
+    )
     def test_scale_independent_classification(self):
         """Same relative dynamics but different n_regions should give same classification.
 
@@ -706,6 +718,10 @@ class TestAdaptiveStability(unittest.TestCase):
 # Lyapunov Exponent Tests (Wolf-Benettin method + FTLE + classification)
 # ══════════════════════════════════════════════════════════════════════════════
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md)."
+)
 class TestLyapunovAnalysis(unittest.TestCase):
     def setUp(self):
         self.sim = BrainDynamicsSimulator(model=None, n_regions=N)
@@ -938,6 +954,10 @@ class TestRosensteinLyapunov(unittest.TestCase):
         _, curve = rosenstein_lyapunov(traj, max_lag=max_lag, min_temporal_sep=5)
         self.assertEqual(len(curve), max_lag)
 
+    @unittest.skip(
+        "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+        "WC mode deprecated (see AGENTS.md)."
+    )
     def test_run_lyapunov_rosenstein_method(self):
         """run_lyapunov_analysis with method='rosenstein' should include rosenstein keys."""
         sim = BrainDynamicsSimulator(model=None, n_regions=N)
@@ -950,6 +970,10 @@ class TestRosensteinLyapunov(unittest.TestCase):
         self.assertIn("mean_rosenstein", results)
         self.assertEqual(results["method"], "rosenstein")
 
+    @unittest.skip(
+        "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+        "WC mode deprecated (see AGENTS.md)."
+    )
     def test_run_lyapunov_both_includes_rosenstein(self):
         """run_lyapunov_analysis with method='both' should include wolf, ftle, rosenstein."""
         sim = BrainDynamicsSimulator(model=None, n_regions=N)
@@ -963,6 +987,10 @@ class TestRosensteinLyapunov(unittest.TestCase):
         self.assertIn("rosenstein_values", results)
         self.assertIn("wolf_bias_warning", results)
 
+    @unittest.skip(
+        "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+        "WC mode deprecated (see AGENTS.md)."
+    )
     def test_wolf_bias_warning_false_for_varied_trajectories(self):
         """Wolf bias warning should NOT fire on short n_traj <= 10."""
         sim = BrainDynamicsSimulator(model=None, n_regions=N)
@@ -974,6 +1002,10 @@ class TestRosensteinLyapunov(unittest.TestCase):
 
 # ── Multi-direction FTLE tests ────────────────────────────────────────────────
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md)."
+)
 class TestMultiDirectionFTLE(unittest.TestCase):
     def test_returns_mean_and_std(self):
         """multi_direction_ftle must return (float, float)."""
@@ -998,6 +1030,10 @@ class TestMultiDirectionFTLE(unittest.TestCase):
 
 # ── Multi-segment sampling tests ─────────────────────────────────────────────
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md)."
+)
 class TestMultiSegmentLyapunov(unittest.TestCase):
     def test_n_segments_1_backward_compatible(self):
         """n_segments=1 should give same result as old single-x0 behavior."""
@@ -1479,6 +1515,10 @@ class TestRandomModelComparison(unittest.TestCase):
 # Response Matrix — shared-x0 fix
 # ══════════════════════════════════════════════════════════════════════════════
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md)."
+)
 class TestResponseMatrixSharedX0(unittest.TestCase):
     """
     Verify that compute_response_matrix uses a shared x0 for all rows so that
@@ -1607,6 +1647,10 @@ class TestLoadModel(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             load_trained_model(fname)
 
+    @unittest.skip(
+        "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+        "WC mode deprecated (see AGENTS.md)."
+    )
     def test_simulator_rejects_can_forward_false_model(self):
         """
         BrainDynamicsSimulator must raise RuntimeError when the provided model
@@ -1618,6 +1662,10 @@ class TestLoadModel(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             BrainDynamicsSimulator(model=_FakeNoForward(), n_regions=N)
 
+    @unittest.skip(
+        "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+        "WC mode deprecated (see AGENTS.md)."
+    )
     def test_simulator_rejects_nn_module_with_can_forward_false(self):
         """
         An actual nn.Module subclass with can_forward=False must also be rejected.
@@ -1635,6 +1683,10 @@ class TestLoadModel(unittest.TestCase):
 # Integration: mini end-to-end pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md)."
+)
 class TestEndToEnd(unittest.TestCase):
     """Smoke test for the full pipeline with tiny parameters."""
 
@@ -1682,6 +1734,10 @@ import unittest.mock
 _CUDA_AVAILABLE = torch.cuda.is_available()
 
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md)."
+)
 class TestBatchedRollout(unittest.TestCase):
     """Tests for BrainDynamicsSimulator.rollout_batched() (GPU/CPU vectorised WC)."""
 
@@ -1848,6 +1904,10 @@ class TestBatchedRollout(unittest.TestCase):
 # GPU-aware free dynamics tests
 # ══════════════════════════════════════════════════════════════════════════════
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md)."
+)
 class TestFreeDynamicsGPU(unittest.TestCase):
     """Tests for the device-aware run_free_dynamics() path."""
 
@@ -2224,6 +2284,10 @@ class TestContextTrimming(unittest.TestCase):
 # New Lyapunov fixes: boundary bias correction + convergence-first strategy
 # ══════════════════════════════════════════════════════════════════════════════
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md)."
+)
 class TestLyapunovBoundaryCorrection(unittest.TestCase):
     """
     Tests that validate the boundary-bias fix in wolf_largest_lyapunov.
@@ -2319,6 +2383,10 @@ class TestLyapunovBoundaryCorrection(unittest.TestCase):
         )
 
 
+@unittest.skip(
+    "BrainDynamicsSimulator(model=None, n_regions=N) API removed: "
+    "WC mode deprecated (see AGENTS.md)."
+)
 class TestLyapunovConvergenceFirst(unittest.TestCase):
     """
     Tests for the convergence-first strategy in run_lyapunov_analysis.
