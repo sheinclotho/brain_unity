@@ -1,0 +1,391 @@
+
+
+**模型与配置**
+- 模型类型: v5_optimized, hidden_channels=128, prediction_steps=50
+- 加载检查点: best_model.pt (device=cuda)
+- 模型参数: H=128, node_types=['eeg', 'fmri'], num_subjects=3
+- 上下文长度: context_length=200
+- 模型参数量: 6871718
+- 图缓存: sub-004_ECON_6fb94f80.pt
+  - 节点类型: {'fmri': (190, 200, 1), 'eeg': (63, 98500, 1)}
+  - fMRI同模态边: 2506
+  - EEG同模态边: 831
+  - 跨模态边: 315 (top-5 per EEG channel, mean |r|=0.158)
+- 动力学模拟器: BrainDynamicsSimulator, modality=joint, n_regions=253, dt=2.0000 s/TR
+
+**Phase 1/6 数据生成**
+- 自由动力学实验: n_init=100, steps=2000, 轨迹形状: (100, 2000, 253)
+- 轨迹多样性: 初始 std=0.2536 → 终止 std=0.2095 (多样性基本不变)
+- 响应矩阵:
+  - 全局均值 = -0.0127, 最大绝对值 = 1.9273
+  - 列均值 mean=0.4015, std=0.3969 (hub节点 ±2σ: 8个)
+  - 刺激特异性 mean=0.5644, std=0.0001 (低特异性节点: 0个)
+
+**Phase 2/6 网络结构**
+- **谱分析 (响应矩阵)**: ρ=3.1721, PR=8.2, n_dominant=1, gap_ratio=31.12, top5_share=0.38
+- **社区检测 (基于FC)**: Louvain k=3, Q=0.1839, 显著性检验 (weight_permutation): null mean=0.0479±0.0010, z=134.34, p=0.0000 (显著)
+- **层级结构**: hierarchy_index=-5.802, n_clusters@20%h=250, @80%h=138, is_hierarchical=False
+- **模态投影 (SVD)**: top5 奇异值 = [1.4283e+02, 1.0600e-01, 7.5000e-02, 7.3000e-02, 6.6000e-02]
+  - 模态能量: top1=41.1%, top2=43.3%, top5=47.1%, n_modes@80%=167, n_modes@90%=221
+
+**Phase 3/6 动力学特征**
+- **稳定性分析**:
+  - [方法C-自适应] 不动点: 0.0%, 极限环: 25.0%, 亚稳态: 0.0%, 不稳定: 75.0%
+  - delta_ratio 分布: 均值=1.3095, 中位数=1.3569, p25=1.1745, p75=1.4928, p95=1.5708
+  - acf_score 分布: 均值=0.361, 中位数=0.341, p25=0.339, p75=0.363
+- **吸引子分析**:
+  - KMeans 最优 K=4, silhouette=0.9965
+  - 吸引子分布: A:25.0%, B:25.0%, C:25.0%, D:25.0%
+- **轨迹收敛分析**: 初始距离=5.2617, 终止距离=5.4315, 比率=1.032 → no_structure
+- **Lyapunov指数分析 (Rosenstein)**:
+  - 均值 λ=0.00718, 中位数=0.00667, std=0.00211
+  - 混沌比例=100.0%, 收敛比例=0.0%
+  - 评估结果: **[EDGE_OF_CHAOS]** 系统处于混沌边缘
+- **DMD转移算子估计**:
+  - Jacobian谱: ρ=1.0000, n_slow=33 (|Re|<0.05), n_Hopf=88, dominant_osc=0.0770 Hz/step
+  - DMD (linearised): ρ=1.0000, n_slow=33, n_Hopf=88, K-Y_lin=1.00
+- **功率谱分析**: dominant_freq=0.0100 Hz [infraslow], Nyquist=0.250 Hz, 最活跃脑区（very_low/low）= 区域 189, 189
+- **PCA + 吸引子**: PCA: top1=88.4%, top2=96.0%, top5=99.0%, n@80%=1, n@90%=2
+- **吸引子维度**:
+  - D₂=2.48±0.24 (n=50/50, fail=0%, R²_mean=0.995)
+  - K-Y_linear=1.00 (from DMD)
+  - PCA n@90%=2 (upper bound)
+  - Lyapunov spectrum (DMD linearised): K-Y_lin=1.00, n_pos=0, n_neg=252, strange_attractor=likely
+- **节点贡献度**: core_size=87/253, top10=9.1%, has_core=False
+- **Basin测试 (n=150)**: n_clusters=3, dominant=68.0%, single_attractor=False
+
+**Phase 4/6 统计验证**
+- **代替数据检验**:
+  - 真实系统 LLE = 0.01789 (±0.00180, n=5)
+  - [phase_randomize] 代替LLE均值=0.00141±0.00016, z=102.90 (显著)
+  - [shuffle] 代替LLE均值=-0.00002±0.00009, z=207.66 (显著)
+  - [ar] 代替LLE均值=0.00369±0.00013, z=112.77 (显著)
+  - 结论: **✓ 系统具有显著非线性动力学**
+- **随机模型对照实验**:
+  - 真实模型: n_attractors=4, mean_lyapunov=0.00718, trajectory_variance=0.08525
+  - 随机模型 ρ=0.90: LLE = -0.47637 ± 0.03010 [stable]
+  - 随机模型 ρ=1.50: LLE = 0.00856 ± 0.01537 [critical]
+  - 随机模型 ρ=2.00: LLE = 0.07355 ± 0.01691 [chaotic]
+  - 结论: 真实模型介于稳定与混沌之间。
+- **嵌入维度分析**:
+  - FNN 最小充分维度 = 8
+  - Grassberger-Procaccia 关联维数 D₂ = 2.80 (R²=0.998)
+  - 内在维度 D=2.8, Takens 嵌入定理满足 (m=253 ≥ 2D+1=7)
+  - 有效维度 ≈ 1.6, PCA 95%方差需 3 主成分
+  - 数据泄漏检查: 归一化泄漏低, PCA泄漏低
+- **结构扰动分析 (响应矩阵)**:
+  - 原始矩阵: ρ=3.1721, PR=8.2, n_dominant=1
+  - weight_shuffle: ρ=9.0062, PR=223.8, n_dominant=245
+  - degree_preserving_rewire: ρ=3.1721, PR=8.2 (保持不变)
+  - low_rank_truncation (k=1): ρ=3.1897, PR=1.0, top5_share=1.00
+- **TwoNN 内在维度**: d=2.55±0.21 (n=10/10, fail=0%)
+- **枢纽节点扰动**: hub nodes strongly control manifold (max ρ-shift=218.2%)
+- **权重随机化**: weight structure determines dynamics (ρ-shift=192.5% after weight shuffle)
+- **子网络缩放**: moderate scale sensitivity (ρ-CV=23.7%)
+- **结构保留随机化**: training suppresses spectral radius vs random — structured damping (ρ delta=-6.0749, K-Y delta=-251.49)
+- **图结构比较**:
+  - Brain tanh(W@x) LLE=0.0000 | Degree-preserving LLE=0.0000±0.0000 | Fully-random LLE=0.2096±0.0269
+  - brain PR=8.191, random PR=224.552
+- **输入维度控制**:
+  - A: No input: D2=2.77, PCA_dim=2, LLE=0.00992
+  - B: High-dim noise: D2=35.73, PCA_dim=210, LLE=0.00024
+  - C: 3-D low-dim drive: D2=2.76, PCA_dim=2, LLE=0.00999
+- **节点消融**: top-5 nodes by |ΔLLE|: [0, 189, 169, 62, 63]
+- **预测维度**: Optimal m: AIC=1, BIC=1, MSE=10
+
+**Phase 5/6 高级分析**
+- **能量分析**: E* = 0.7336 ± 0.1971（中位数 0.6752）
+  - 建议 E_budget: 紧=0.2935, 中等=0.5135, 自然=0.7336
+- **相图**: ρ(W)=3.172, g_linear_critical=0.32, g=1 LLE 参考值 = 0.0097
+- **可控性分析**: AC 最高=[5, 6, 48], MC 最高=[167, 223, 211], BC 最高=[5, 6, 48]
+- **信息流分析 (Transfer Entropy)**: 平均 TE=0.5586 nats, 最大 TE=0.8926 nats, 非对称性=0.0506
+- **临界慢化分析**: EWS 评分=0.450±0.166, DFA α=1.089±0.060, 75% 轨迹显示中等以上 CSD
+- **动态损伤分析**: 20 nodes analysed, 所有节点损伤后均使轨迹逃离原始吸引子 (escape=1.0)
+- **Granger因果分析**:
+  - Top-5 sources: [158, 126, 155, 133, 171]
+  - Top-5 sinks: [48, 6, 126, 92, 90]
+  - Top-5 drivers: [158, 155, 69, 133, 132]
+
+**Phase 6/6 综合报告**
+- **一致性检验**:
+  - Rosenstein λ=0.00718 (near_zero) ↔ DMD ρ=1.0000 (near_critical) [nonlinearity=1.00]
+  - LLE multi-source consistency: range=0.0097 across 4 sources.
+- **假设检验结果**:
+  - **H1 (因果多样性低)**: SUPPORTED — PR/N=0.03 (<0.30), n_dominant=1
+  - **H2 (吸引子维度低)**: SUPPORTED — n@90%/N=0.01 (<0.15), D₂=2.48±0.24, K-Y_lin=1.00
+  - **H3 (系统处于混沌边缘)**: SUPPORTED — regime=edge_of_chaos, λ=0.00718, CSD:[AC1_tau=-0.44, Var_tau=-0.34, EWS=0.45]
+  - **H4 (极慢频率主导)**: SUPPORTED — f_dom=0.0100 Hz [infraslow]
+  - **H5 (能量预算可测试)**: TESTABLE — E*=0.7336.
+- **置信度标志**: {'H1': 'HIGH', 'H2': 'HIGH', 'H3': 'HIGH', 'H4': 'HIGH', 'H5': 'INSUFFICIENT_DATA'}
+- **验证问题**:
+  - ✓ Q1: single strange attractor — strange_attractor=likely
+  - ✗ Q2: low-dimensional chaos stable — insufficient evidence
+  - ✗ Q3: dynamical core nodes exist — no strong core (top10=9.1% ≤ 50%)
+  - ✓ Q4: training structure determines dynamics — structured damping (ρ delta=-6.0749)
+  - ✓ Q5: random networks lose structure — real LLE=0.0072 > random=-0.1314
+  - ✓ Q6: hub nodes control manifold — max ρ-shift=218.2%
+  - ✓ Q7: weight structure determines dynamics — ρ-shift=192.5%
+  - ✗ Q8: dynamics scale-invariant — moderate scale sensitivity (ρ-CV=23.7%)
+  - ○ Q9: modalities share dynamical core — requires further comparison
+
+**总运行时间**: 10754.9 秒
+
+
+
+好的，这是第二份日志（`--modality both` 中的 fMRI 部分）处理后的结果：
+
+---
+
+**模型与配置**
+- 模型类型: v5_optimized, hidden_channels=128, prediction_steps=50
+- 加载检查点: best_model.pt (device=cuda)
+- 模型参数量: 6871718
+- 图缓存: sub-004_ECON_6fb94f80.pt
+  - 节点类型: {'fmri': (190, 200, 1), 'eeg': (63, 98500, 1)}
+  - fMRI同模态边: 2506
+  - EEG同模态边: 831
+  - 跨模态边: 315 (top-5 per EEG channel, mean |r|=0.158)
+- 模态: both (先运行fmri)
+
+**◆ [FMRI] 模态管道**
+
+**Phase 1/6 数据生成**
+- 自由动力学实验: n_init=100, steps=2000, 轨迹形状: (100, 2000, 190)
+- 轨迹多样性: 初始 std=0.2088 → 终止 std=0.1887 (多样性基本不变)
+- 响应矩阵:
+  - 全局均值 = 0.0000, 最大绝对值 = 0.1043
+  - 列均值 mean=0.0002, std=0.0001 (hub节点 ±2σ: 6个)
+  - 刺激特异性 mean=0.0016, std=0.0011 (低特异性节点: 40个)
+
+**Phase 2/6 网络结构**
+- **谱分析 (响应矩阵)**: ρ=0.1064, PR=130.36, n_dominant=88, gap_ratio=1.25, top5_share=0.09
+- **社区检测 (基于FC)**: Louvain k=3, Q=0.0811, 显著性检验: null mean=0.0230±0.0004, z=137.99, p=0.0000 (显著)
+- **层级结构**: hierarchy_index=-6.822, n_clusters@20%h=180, @80%h=4, is_hierarchical=False
+- **模态投影 (SVD)**: top5 奇异值 = [0.109, 0.088, 0.078, 0.06, 0.052]
+  - 模态能量: top1=0.5%, top2=1.0%, top5=3.5%, n_modes@80%=162, n_modes@90%=173
+
+**Phase 3/6 动力学特征**
+- **稳定性分析**:
+  - [方法C-自适应] 不动点: 75.0%, 极限环: 25.0%, 亚稳态: 0.0%, 不稳定: 0.0%
+  - delta_ratio 分布: 均值=0.0050, 中位数=0.0042, p25=0.0032, p75=0.0060, p95=0.0097
+  - acf_score 分布: 均值=0.482, 中位数=0.475, p25=0.383, p75=0.575
+- **吸引子分析**:
+  - KMeans 最优 K=4, silhouette=0.9998
+  - 吸引子分布: A:25.0%, B:25.0%, C:25.0%, D:25.0%
+- **轨迹收敛分析**: 初始距离=4.0018, 终止距离=3.6131, 比率=0.903 → no_structure
+- **Lyapunov指数分析 (Rosenstein)**:
+  - 均值 λ=0.00060, 中位数=0.00035, std=0.00083
+  - 混沌比例=70.0%, 收敛比例=30.0%
+  - Rosenstein std=8.28e-04：轨迹 LLE 高度一致，是系统存在单一全局吸引子的有力证据
+  - 评估结果: **[EDGE_OF_CHAOS]** 系统处于混沌边缘
+- **DMD转移算子估计**:
+  - Jacobian谱: ρ=0.9967, n_slow=26 (|Re|<0.05), n_Hopf=64, dominant_osc=0.0023 Hz/step
+  - DMD (linearised): ρ=0.9967, n_slow=26, n_Hopf=64, K-Y_lin=0.00
+- **功率谱分析**: dominant_freq=0.0003 Hz [infraslow], Nyquist=0.250 Hz, 最活跃脑区 = 区域 143, 158
+- **PCA + 吸引子**: PCA: top1=89.2%, top2=97.9%, top5=99.6%, n@80%=1, n@90%=2
+- **吸引子维度**:
+  - D₂=1.89±0.38 (n=24/50, fail=52%, R²_mean=0.987) **[警告: fail率>50%，H2证据降级]**
+  - K-Y_linear=0.00 (from DMD)
+  - PCA n@90%=2 (upper bound)
+  - Lyapunov spectrum (DMD linearised): K-Y_lin=0.00, n_pos=0, n_neg=189, strange_attractor=unlikely
+- **节点贡献度**: core_size=73/190, top10=9.2%, has_core=False
+- **Basin测试 (n=150)**: n_clusters=2, dominant=74.7%, single_attractor=False
+
+**Phase 4/6 统计验证**
+- **代替数据检验**:
+  - 真实系统 LLE = 0.01047 (±0.00444, n=5)
+  - [phase_randomize] 代替LLE均值=0.00158±0.00007, z=135.16 (显著)
+  - [shuffle] 代替LLE均值=-0.00000±0.00008, z=139.10 (显著)
+  - [ar] 代替LLE均值=0.00249±0.00009, z=90.32 (显著)
+  - 结论: **✓ 系统具有显著非线性动力学**
+- **随机模型对照实验**:
+  - 真实模型: n_attractors=4, mean_lyapunov=0.000595, trajectory_variance=0.06321
+  - 随机模型 ρ=0.90: LLE = -0.51829 ± 0.12400 [stable]
+  - 随机模型 ρ=1.50: LLE = -0.05270 ± 0.07135 [stable]
+  - 随机模型 ρ=2.00: LLE = 0.07055 ± 0.01432 [chaotic]
+  - 结论: 真实模型介于稳定与混沌之间。
+- **嵌入维度分析**:
+  - FNN 最小充分维度 = 3 (FNN比例: 0.579, 0.070, 0.010, ...)
+  - Grassberger-Procaccia 关联维数 D₂ = 1.45 (R²=0.995)
+  - 内在维度 D=3.0, Takens 嵌入定理满足 (m=190 ≥ 2D+1=7)
+  - 有效维度 ≈ 1.6, PCA 95%方差需 3 主成分
+  - 数据泄漏检查: 归一化泄漏低, PCA泄漏低
+- **结构扰动分析 (响应矩阵)**:
+  - 原始矩阵: ρ=0.1064, PR=130.4, n_dominant=88
+  - weight_shuffle: ρ=0.0241, PR=134.4, n_dominant=138
+  - degree_preserving_rewire: ρ=0.0865, PR=98.5, n_dominant=62
+  - low_rank_truncation (k=1): ρ=0.1047, PR=1.0, top5_share=1.00
+- **TwoNN 内在维度**: d=4.82±0.26 (n=10/10, fail=0%)
+- **枢纽节点扰动**: hub nodes strongly control manifold (max ρ-shift=56.4%)
+- **权重随机化**: weight structure determines dynamics (ρ-shift=73.6% after weight shuffle)
+- **子网络缩放**: dynamics stable across scales (ρ-CV=5.7% < 10%) — low-dimensional structure is scale-invariant
+- **结构保留随机化**: moderate structural effect (ρ delta=0.0795)
+- **图结构比较**:
+  - Brain tanh(W@x) LLE=0.0000 | Degree-preserving LLE=0.0000±0.0000 | Fully-random LLE=-2.6429±0.0461
+  - brain PR=130.359, random PR=167.991
+- **输入维度控制**:
+  - A: No input: D2=1.57, PCA_dim=2, LLE=0.00397
+  - B: High-dim noise: D2=32.03, PCA_dim=162, LLE=0.00010
+  - C: 3-D low-dim drive: D2=1.57, PCA_dim=2, LLE=0.00392
+- **节点消融**: top-5 nodes by |ΔLLE|: [87, 122, 175, 63, 107]
+- **预测维度**: Optimal m: AIC=10, BIC=10, MSE=10
+
+**Phase 5/6 高级分析**
+- **能量分析**: E* = 0.6143 ± 0.2239（中位数 0.5543）
+  - 建议 E_budget: 紧=0.2457, 中等=0.4300, 自然=0.6143
+- **相图**: ρ(W)=0.106, g_linear_critical=9.40, g=1 LLE 参考值 = 0.0033
+- **可控性分析**: AC 最高=[3, 2, 4], MC 最高=[96, 93, 91], BC 最高=[3, 4, 2]
+- **信息流分析 (Transfer Entropy)**: 平均 TE=0.5587 nats, 最大 TE=0.8933 nats, 非对称性=0.0506
+- **临界慢化分析**: EWS 评分=0.450±0.166, DFA α=1.124±0.069, 75% 轨迹显示中等以上 CSD
+- **动态损伤分析**: 20 nodes analysed, 所有节点损伤后均使轨迹逃离原始吸引子 (escape=1.0)
+- **Granger因果分析**:
+  - Top-5 sources: [158, 126, 155, 133, 171]
+  - Top-5 sinks: [48, 6, 126, 92, 90]
+  - Top-5 drivers: [158, 155, 69, 133, 132]
+
+**Phase 6/6 综合报告**
+- **一致性检验**:
+  - Rosenstein λ=0.00060 (near_zero) ↔ DMD ρ=0.9967 (near_critical) [nonlinearity=6.52]
+  - LLE multi-source consistency: range=0.0039 across 4 sources.
+- **假设检验结果**:
+  - **H1 (因果多样性低)**: NOT_SUPPORTED — PR/N=0.69 (≥0.30), n_dominant=88
+  - **H2 (吸引子维度低)**: SUPPORTED — n@90%/N=0.01 (<0.15), D₂=1.89±0.38 (但 fail=52%, 结果不可靠), K-Y_lin=0.00
+  - **H3 (系统处于混沌边缘)**: SUPPORTED — regime=edge_of_chaos, λ=0.00060, CSD:[AC1_tau=-0.83, Var_tau=-0.62, EWS=0.45]
+  - **H4 (极慢频率主导)**: NOT_SUPPORTED — f_dom=0.0003 Hz [infraslow]
+  - **H5 (能量预算可测试)**: TESTABLE — E*=0.6143.
+- **置信度标志**: {'H1': 'HIGH', 'H2': 'HIGH', 'H3': 'HIGH', 'H4': 'HIGH', 'H5': 'INSUFFICIENT_DATA'}
+- **验证问题**:
+  - ✗ Q1: single strange attractor — strange_attractor=unlikely
+  - ✓ Q2: low-dimensional chaos stable — low-dim chaos stable
+  - ✗ Q3: dynamical core nodes exist — no strong core (top10=9.2% ≤ 50%)
+  - ✓ Q4: training structure determines dynamics — moderate structural effect (ρ delta=0.0795)
+  - ✓ Q5: random networks lose structure — real LLE=0.0006 > random=-0.1668
+  - ✓ Q6: hub nodes control manifold — max ρ-shift=56.4%
+  - ✓ Q7: weight structure determines dynamics — ρ-shift=73.6%
+  - ✓ Q8: dynamics scale-invariant — dynamics stable across scales (ρ-CV=5.7% < 10%)
+  - ○ Q9: modalities share dynamical core — requires further comparison
+  
+好的，这是第三份日志（`--modality both` 中的 EEG 部分）处理后的结果：
+
+---
+
+**◆ [EEG] 模态管道**
+- **时间分辨率说明**：EEG 预测步长 = 2.0000 s（fMRI TR），而非 EEG 原生采样率 250.0 Hz（0.0040 s/样本）
+
+**Phase 1/6 数据生成**
+- 自由动力学实验: n_init=100, steps=2000, 轨迹形状: (100, 2000, 63)
+- 轨迹多样性: 初始 std=0.3944 → 终止 std=0.0680 (收敛)
+- 响应矩阵:
+  - 全局均值 = 0.0002, 最大绝对值 = 0.0365
+  - 列均值 mean=0.0003, std=0.0002 (hub节点 ±2σ: 5个)
+  - 刺激特异性 mean=0.0013, std=0.0010 (低特异性节点: 19个)
+
+**Phase 2/6 网络结构**
+- **谱分析 (响应矩阵)**: ρ=0.0381, PR=37.28, n_dominant=31, gap_ratio=1.08, top5_share=0.24
+- **社区检测 (基于FC)**: Louvain k=3, Q=0.2289, 显著性检验: null mean=0.0752±0.0019, z=80.66, p=0.0000 (显著)
+- **层级结构**: hierarchy_index=-4.5005, n_clusters@20%h=52, @80%h=4, is_hierarchical=False
+- **模态投影 (SVD)**: top5 奇异值 = [0.039, 0.036, 0.029, 0.026, 0.026]
+  - 模态能量: top1=8.8%, top2=13.5%, top5=17.4%, n_modes@80%=45, n_modes@90%=56
+
+**Phase 3/6 动力学特征**
+- **稳定性分析**:
+  - [方法C-自适应] 不动点: 0.0%, 极限环: 100.0%, 亚稳态: 0.0%, 不稳定: 0.0%
+  - delta_ratio 分布: 均值=9.9438, 中位数=9.6958, p25=9.2506, p75=10.3224, p95=11.7877
+  - acf_score 分布: 均值=0.527, 中位数=0.465, p25=0.443, p75=0.510
+- **吸引子分析**:
+  - KMeans 最优 K=2, silhouette=0.4895
+  - 吸引子分布: A:46.0%, B:54.0%
+  - DBSCAN 检测到 1 个吸引子
+- **轨迹收敛分析**: 初始距离=1.7367, 终止距离=0.9563, 比率=0.551 → no_structure
+- **Lyapunov指数分析 (Rosenstein)**:
+  - 均值 λ=0.02263, 中位数=0.02183, std=0.00544
+  - 混沌比例=100.0%, 收敛比例=0.0%
+  - 评估结果: **[WEAKLY_CHAOTIC]** 系统弱混沌，轨迹缓慢发散
+- **DMD转移算子估计**:
+  - Jacobian谱: ρ=0.9682, n_slow=7 (|Re|<0.05), n_Hopf=23, dominant_osc=0.0017 Hz/step
+  - DMD (linearised): ρ=0.9682, n_slow=7, n_Hopf=23, K-Y_lin=0.00
+- **功率谱分析**: dominant_freq=0.0028 Hz [infraslow], Nyquist=0.250 Hz, 最活跃脑区 = 区域 52, 52
+- **PCA + 吸引子**: PCA: top1=70.8%, top2=97.8%, top5=99.8%, n@80%=2, n@90%=2
+- **吸引子维度**:
+  - D₂=1.52±0.16 (n=50/50, fail=0%, R²_mean=0.998)
+  - K-Y_linear=0.00 (from DMD)
+  - PCA n@90%=2 (upper bound)
+  - Lyapunov spectrum (DMD linearised): K-Y_lin=0.00, n_pos=0, n_neg=63, strange_attractor=likely
+- **节点贡献度**: core_size=27/63, top10=21.2%, has_core=False
+- **Basin测试 (n=150)**: n_clusters=2, dominant=52.0%, single_attractor=False
+
+**Phase 4/6 统计验证**
+- **代替数据检验**:
+  - 真实系统 LLE = 0.04696 (±0.00920, n=5)
+  - [phase_randomize] 代替LLE均值=0.00429±0.00019, z=221.38 (显著)
+  - [shuffle] 代替LLE均值=0.00002±0.00007, z=630.81 (显著)
+  - [ar] 代替LLE均值=0.00635±0.00016, z=253.99 (显著)
+  - 结论: **✓ 系统具有显著非线性动力学**
+- **随机模型对照实验**:
+  - 真实模型: n_attractors=2, mean_lyapunov=0.02263, trajectory_variance=0.01449
+  - 随机模型 ρ=0.90: LLE = -0.48213 ± 0.16854 [stable]
+  - 随机模型 ρ=1.50: LLE = -0.06308 ± 0.10481 [stable]
+  - 随机模型 ρ=2.00: LLE = 0.04197 ± 0.05681 [chaotic]
+  - 结论: 真实模型与随机混沌系统相当。
+- **嵌入维度分析**:
+  - FNN 最小充分维度 = 8 (FNN比例: 0.785, 0.082, 0.026, ...)
+  - Grassberger-Procaccia 关联维数 D₂ = 2.09 (R²=1.000)
+  - 内在维度 D=2.1, Takens 嵌入定理满足 (m=63 ≥ 2D+1=6)
+  - 有效维度 ≈ 2.1, PCA 95%方差需 3 主成分
+  - 数据泄漏检查: 归一化泄漏低, PCA泄漏高 (最大主成分夹角=48.4°)
+- **结构扰动分析 (响应矩阵)**:
+  - 原始矩阵: ρ=0.0381, PR=37.3, n_dominant=31
+  - weight_shuffle: ρ=0.0167, PR=41.2, n_dominant=38
+  - degree_preserving_rewire: ρ=0.0370, PR=33.8, n_dominant=24
+  - low_rank_truncation (k=1): ρ=0.0383, PR=1.0, top5_share=1.00
+- **TwoNN 内在维度**: d=2.74±0.20 (n=10/10, fail=0%)
+- **枢纽节点扰动**: hub nodes strongly control manifold (max ρ-shift=46.9%)
+- **权重随机化**: weight structure determines dynamics (ρ-shift=47.6% after weight shuffle)
+- **子网络缩放**: dynamics stable across scales (ρ-CV=0.0% < 10%) — low-dimensional structure is scale-invariant
+- **结构保留随机化**: moderate structural effect (ρ delta=0.0233)
+- **图结构比较**:
+  - Brain tanh(W@x) LLE=0.0000 | Degree-preserving LLE=0.0000±0.0000 | Fully-random LLE=0.0000±0.0000
+  - brain PR=37.278, random PR=55.050
+- **输入维度控制**:
+  - A: No input: D2=2.08, PCA_dim=2, LLE=0.02297
+  - B: High-dim noise: D2=19.23, PCA_dim=57, LLE=0.00018
+  - C: 3-D low-dim drive: D2=2.08, PCA_dim=2, LLE=0.02301
+- **节点消融**: top-5 nodes by |ΔLLE|: [57, 8, 3, 26, 7]
+- **预测维度**: Optimal m: AIC=10, BIC=10, MSE=10
+
+**Phase 5/6 高级分析**
+- **能量分析**: E* = 0.0838 ± 0.0057（中位数 0.0833）
+  - 建议 E_budget: 紧=0.0335, 中等=0.0587, 自然=0.0838
+- **相图**: ρ(W)=0.038, g_linear_critical=26.22, g=1 LLE 参考值 = 0.0247
+- **可控性分析**: AC 最高=[8, 14, 9], MC 最高=[37, 11, 16], BC 最高=[14, 9, 44]
+- **信息流分析 (Transfer Entropy)**: 平均 TE=0.2564 nats, 最大 TE=0.3346 nats, 非对称性=0.0152
+- **临界慢化分析**: EWS 评分=0.580±0.060, DFA α=0.942±0.057, 100% 轨迹显示中等以上 CSD
+- **动态损伤分析**: 20 nodes analysed, escape 率约 89.5%
+- **Granger因果分析**:
+  - Top-5 sources: [57, 26, 59, 22, 53]
+  - Top-5 sinks: [22, 57, 26, 51, 59]
+  - Top-5 drivers: [57, 0, 39, 2, 33]
+
+**Phase 6/6 综合报告**
+- **一致性检验**:
+  - **⚠ 不一致**: Rosenstein λ=0.02263 (positive) vs DMD ρ=0.9682 (subcritical) [nonlinearity=2.43]
+  - **⚠ 不一致**: LLE multi-source range=0.0228 (methods disagree)
+- **假设检验结果**:
+  - **H1 (因果多样性低)**: NOT_SUPPORTED — PR/N=0.59 (≥0.30), n_dominant=31
+  - **H2 (吸引子维度低)**: SUPPORTED — n@90%/N=0.03 (<0.15), D₂=1.52±0.16, K-Y_lin=0.00
+  - **H3 (系统处于混沌边缘)**: SUPPORTED — regime=weakly_chaotic, λ=0.02263, CSD:[AC1_tau=0.75, Var_tau=0.46, EWS=0.58]
+  - **H4 (极慢频率主导)**: SUPPORTED — f_dom=0.0028 Hz [infraslow]
+  - **H5 (能量预算可测试)**: TESTABLE — E*=0.0838.
+- **置信度标志**: {'H1': 'HIGH', 'H2': 'HIGH', 'H3': 'HIGH', 'H4': 'HIGH', 'H5': 'INSUFFICIENT_DATA'}
+- **验证问题**:
+  - ✓ Q1: single strange attractor — strange_attractor=likely
+  - ✓ Q2: low-dimensional chaos stable — low-dim chaos stable
+  - ✗ Q3: dynamical core nodes exist — no strong core (top10=21.2% ≤ 50%)
+  - ✗ Q4: training structure determines dynamics — moderate structural effect (ρ delta=0.0233)
+  - ✓ Q5: random networks lose structure — real LLE=0.0226 > random=-0.1677
+  - ✓ Q6: hub nodes control manifold — max ρ-shift=46.9%
+  - ✓ Q7: weight structure determines dynamics — ρ-shift=47.6%
+  - ✓ Q8: dynamics scale-invariant — dynamics stable across scales (ρ-CV=0.0% < 10%)
+  - ○ Q9: modalities share dynamical core — requires further comparison
+
+**总运行时间**: 10960.9 秒
