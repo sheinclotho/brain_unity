@@ -9,7 +9,10 @@ Cross-Task PCA Projection — Unified Cognitive Dynamics Manifold Analysis
 
 **方法**：
   1. 从 graph 文件夹读取所有图缓存 (``.pt`` 文件）
-  2. 对每个图文件，使用 GNN 模型生成自由动力学轨迹
+  2. 对**每个**图文件，使用 GNN 模型生成自由动力学轨迹。
+     每个任务只使用**自身**的 BOLD 历史作为初始上下文，不混入其它任务的数据。
+     这是关键设计原则：轨迹必须反映该任务自身的内在动力学，
+     才能在 PCA 空间中对不同任务进行有意义的比较。
   3. 将所有任务的轨迹**合并后**拟合一个统一 PCA（确保投影空间相同）
   4. 将每个任务的轨迹投影到 PC1-PC2 平面，用不同颜色标注任务
   5. 输出可视化图和 JSON 指标文件
@@ -105,22 +108,30 @@ def _trajectories_for_graph(
     steps: int,
     seed: int,
     device: str,
-    all_graph_paths: Optional[List[Path]] = None,
 ) -> Optional[np.ndarray]:
-    """Load one graph, build a simulator, run free dynamics.
+    """Load one graph, build a simulator, run free dynamics using this graph's context only.
 
     Parameters
     ----------
     graph_path:
-        Path to the primary graph cache file.  Its connectivity structure is
-        used for all rollouts.
-    all_graph_paths:
-        Optional list of *all* graph-cache paths (including ``graph_path``).
-        When provided and ``len > 1``, the multi-graph context pool is
-        activated: each of the ``n_init`` trajectories cycles through a
-        different recording's BOLD history as its initial context, providing
-        genuine context diversity even when each individual file has
-        ``T ≤ context_length``.
+        Path to the graph cache file representing one task / run / subject.
+        Its BOLD history is used **exclusively** as the initial context for
+        all ``n_init`` rollouts.
+
+    Design rationale
+    ----------------
+    For cross-task PCA the goal is to compare whether different tasks produce
+    trajectories that occupy the same manifold.  This comparison is only
+    meaningful when each task's trajectories are generated from **that task's
+    own BOLD history** — not from a pool of other tasks' BOLD data.
+
+    Mixing another task's BOLD as initial context would contaminate the
+    per-task signal: trajectories for task A initialised with task B's context
+    no longer represent task A's intrinsic dynamics and cannot be used to
+    characterise task A's attractor geometry.
+
+    Therefore ``graph_paths=None`` is passed to ``run_free_dynamics``,
+    enforcing single-graph (task-specific) context throughout.
 
     Returns ``trajectories`` of shape ``(n_init, steps, n_regions)`` or
     ``None`` if loading / simulation failed.
@@ -133,16 +144,10 @@ def _trajectories_for_graph(
         graph = load_graph_for_inference(graph_path, device=device)
         sim = BrainDynamicsSimulator(model, graph, modality=modality, device=device)
 
-        # Build the multi-graph pool: primary graph first, then all others.
-        # _build_graph_pool (inside run_free_dynamics) uses graph_paths[0] as the
-        # primary (already loaded) and graph_paths[1:] as extra context sources.
-        pool: Optional[List[Path]] = None
-        if all_graph_paths and len(all_graph_paths) > 1:
-            others = [p for p in all_graph_paths if Path(p) != Path(graph_path)]
-            pool = [graph_path] + others
-
+        # Single-graph mode (graph_paths=None): use only this task's own BOLD
+        # history as initial context.  No cross-task context mixing.
         trajs = run_free_dynamics(sim, n_init=n_init, steps=steps, seed=seed,
-                                  graph_paths=pool)
+                                  graph_paths=None)
         logger.info(
             "  [%s] shape=%s, init_std=%.4f, final_std=%.4f",
             graph_path.name, trajs.shape,
@@ -500,7 +505,6 @@ def run_cross_task_pca(
         label = gp.stem
         trajs = _trajectories_for_graph(
             gp, model, modality, n_init, steps, seed, device,
-            all_graph_paths=graph_paths,
         )
         if trajs is None:
             continue
