@@ -460,7 +460,10 @@ def run_cross_task_pca(
     from loader.load_model import load_trained_model
     logger.info("加载模型: %s", model_path)
     model = load_trained_model(model_path, device=device)
-    model.eval()
+    # Note: load_trained_model already returns the twin with model.eval() applied
+    # internally (TwinBrainDigitalTwin.__init__ calls self.model.eval()).
+    # Calling .eval() on the TwinBrainDigitalTwin wrapper itself is a no-op error
+    # because TwinBrainDigitalTwin is not an nn.Module.
 
     if pca_burnin is None:
         pca_burnin = max(10, steps // 10)

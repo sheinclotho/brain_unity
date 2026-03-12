@@ -689,22 +689,57 @@ def _add_surrogate_evidence(
         })
         return
 
+    # Phase 1 run_surrogate_test() returns:
+    #   {"real_lle": float, "surrogate_results": {type: {"z_score", "significant",
+    #    "p_value_upper_bound", ...}}, "summary": str}
+    # Try top-level keys first (legacy / future flat format), then fall back to
+    # the nested surrogate_results structure actually produced by Phase 1.
     is_nonlinear = surr.get("is_nonlinear")
     z = surr.get("z_score")
     p = surr.get("p_value")
 
+    if is_nonlinear is None:
+        # Parse from nested surrogate_results produced by run_surrogate_test()
+        sr = surr.get("surrogate_results") or {}
+        if sr:
+            sig_flags: List[bool] = []
+            z_scores:  List[float] = []
+            p_bounds:  List[float] = []
+            for v in sr.values():
+                if not isinstance(v, dict):
+                    continue
+                sig_flags.append(bool(v.get("significant", False)))
+                z_val = v.get("z_score")
+                if z_val is not None:
+                    z_scores.append(float(z_val))
+                p_val = v.get("p_value_upper_bound")
+                if p_val is not None:
+                    p_bounds.append(float(p_val))
+            if sig_flags:
+                # is_nonlinear = True if real LLE exceeds ALL surrogate distributions
+                is_nonlinear = all(sig_flags)
+                z = max(z_scores) if z_scores else None
+                p = min(p_bounds) if p_bounds else None
+
+    real_lle = surr.get("real_lle")
+    real_lle_str = f", real_LLE={real_lle:.5f}" if real_lle is not None else ""
+
     if is_nonlinear is True:
+        z_str = f"{z:.2f}" if z is not None else "N/A"
+        p_str = f"{p:.4f}" if p is not None else "N/A"
         verdict = "supports"
         detail  = (
             f"Real LLE is significantly higher than surrogate LLE "
-            f"(z={z:.2f}, p={p:.4f}): dynamics are nonlinear, ruling out "
+            f"(z={z_str}, p<{p_str}{real_lle_str}): dynamics are nonlinear, ruling out "
             "linear stochastic process as explanation."
         )
     elif is_nonlinear is False:
+        z_str = f"{z:.2f}" if z is not None else "N/A"
+        p_str = f"{p:.4f}" if p is not None else "N/A"
         verdict = "neutral"
         detail  = (
             f"Surrogate test: real LLE is NOT significantly higher than "
-            f"surrogates (z={z:.2f if z else 'N/A'}, p={p:.4f if p else 'N/A'}). "
+            f"all surrogates (z={z_str}, p<{p_str}{real_lle_str}). "
             "Cannot rule out linear explanation."
         )
     else:
@@ -728,18 +763,58 @@ def _add_weight_randomisation_evidence(
         })
         return
 
-    # Try to read weight_randomisation results from nested structure
+    # Phase 1 run_random_model_comparison() writes analysis_comparison.json with:
+    #   {"model": {"mean_lyapunov": float, ...},
+    #    "random_sr0.90": {"mean_lyapunov": float, ...},
+    #    "random_sr1.50": {...}, "random_sr2.00": {...}, ...}
+    # Try legacy flat keys first, then the nested structure actually produced.
     wr = cmp.get("weight_randomisation") or cmp
     real_lle = wr.get("real_lle") or wr.get("brain_lle_mean")
     rand_lle = wr.get("random_lle_mean") or wr.get("rand_lle_mean")
 
-    if real_lle is None and rand_lle is None:
-        # Try another nesting: from pipeline_report
+    if real_lle is None:
+        # analysis_comparison.json: real model stats under "model" key
+        model_stats = cmp.get("model") or {}
+        real_lle = (model_stats.get("mean_lyapunov")
+                    or model_stats.get("mean_lyapunov_rosenstein"))
+
+    if rand_lle is None:
+        # Collect random_sr* entries; prefer ρ>1 (near-chaotic) for a fair
+        # comparison: we want to know if the trained model is MORE ordered than
+        # random networks in the same dynamic regime (chaotic baseline).
+        # If no ρ>1 entries exist, fall back to all entries.
+        def _sr_value(k: str) -> float:
+            """Extract the spectral-radius float from a 'random_sr{X.XX}' key."""
+            try:
+                return float(k[len("random_sr"):])
+            except (ValueError, IndexError):
+                return 0.0
+
+        chaotic_lles = [
+            v["mean_lyapunov"]
+            for k, v in cmp.items()
+            if k.startswith("random_sr") and isinstance(v, dict)
+            and v.get("mean_lyapunov") is not None
+            and _sr_value(k) > 1.0
+        ]
+        all_sr_lles = [
+            v["mean_lyapunov"]
+            for k, v in cmp.items()
+            if k.startswith("random_sr") and isinstance(v, dict)
+            and v.get("mean_lyapunov") is not None
+        ]
+        if chaotic_lles:
+            rand_lle = float(np.mean(chaotic_lles))
+        elif all_sr_lles:
+            rand_lle = float(np.mean(all_sr_lles))
+
+    if rand_lle is None:
+        # Legacy: pipeline_report random_entries list
         rand_entries = cmp.get("random_entries") or []
         if rand_entries:
-            rand_lles = [e.get("mean_lyapunov_mean", np.nan) for e in rand_entries
-                         if e.get("mean_lyapunov_mean") is not None]
-            rand_lle = float(np.mean(rand_lles)) if rand_lles else None
+            rand_lles_legacy = [e.get("mean_lyapunov_mean", np.nan) for e in rand_entries
+                                 if e.get("mean_lyapunov_mean") is not None]
+            rand_lle = float(np.mean(rand_lles_legacy)) if rand_lles_legacy else None
 
     if real_lle is None:
         table.append({
@@ -786,18 +861,27 @@ def _add_input_control_evidence(
         })
         return
 
+    # Phase 1 run_input_dimension_control() returns a flat dict keyed by condition
+    # name (not a list):
+    #   {"no_input":       {"condition": "A: No input",       "d2": float, "lle": float},
+    #    "high_dim_noise": {"condition": "B: High-dim noise", "d2": float, "lle": float},
+    #    "low_dim_drive":  {"condition": "C: 3-D low-dim drive", ...}}
+    # Also support legacy list-of-dicts under "results" / "conditions".
     rows = idc.get("results") or idc.get("conditions") or []
     cond_map: Dict[str, Any] = {}
     for r in rows:
         if isinstance(r, dict):
             cond_map[r.get("condition", "")] = r
 
-    no_input = cond_map.get("no_input") or cond_map.get("A: No input") or {}
-    hi_dim   = cond_map.get("high_dim_noise") or cond_map.get("B: High-dim noise") or {}
-    lo_dim   = cond_map.get("low_dim_drive") or cond_map.get("C: 3-D low-dim drive") or {}
+    # Primary: direct dict access (Phase 1 actual format)
+    no_input = (idc.get("no_input")
+                or cond_map.get("no_input") or cond_map.get("A: No input") or {})
+    hi_dim   = (idc.get("high_dim_noise")
+                or cond_map.get("high_dim_noise") or cond_map.get("B: High-dim noise") or {})
 
-    d2_no   = no_input.get("D2")
-    d2_hi   = hi_dim.get("D2")
+    # Phase 1 uses lowercase "d2" and "lle"; also accept uppercase for forward compat.
+    d2_no   = no_input.get("d2") if no_input.get("d2") is not None else no_input.get("D2")
+    d2_hi   = hi_dim.get("d2")   if hi_dim.get("d2")   is not None else hi_dim.get("D2")
 
     if d2_no is not None and d2_hi is not None:
         if d2_hi > d2_no * 1.2:
@@ -815,9 +899,9 @@ def _add_input_control_evidence(
                 "adding high-dim noise does not substantially change D₂."
             )
     else:
-        # Fall back to LLE
-        lle_no = no_input.get("LLE") or no_input.get("lle")
-        lle_hi = hi_dim.get("LLE") or hi_dim.get("lle")
+        # Fall back to LLE (Phase 1 uses lowercase "lle")
+        lle_no = no_input.get("lle") or no_input.get("LLE")
+        lle_hi = hi_dim.get("lle") or hi_dim.get("LLE")
         if lle_no is not None:
             verdict = "supports"
             detail  = (
@@ -845,15 +929,31 @@ def _add_node_ablation_evidence(
         })
         return
 
-    top_nodes = na.get("top_nodes") or na.get("ablation_results") or []
+    # Phase 1 run_node_ablation() returns:
+    #   {"baseline": {...},
+    #    "ablation": [{"node": int, "delta_lle": float, "delta_d2": float, ...}],
+    #    "top_nodes": [int, ...],   ← list of ints, NOT dicts
+    #    "n_tested": int}
+    # Compute mean |ΔLLE| from the ablation list.
     delta_lle_mean = na.get("mean_delta_lle") or na.get("delta_lle_mean")
 
-    # Try individual ablation records
     if not isinstance(delta_lle_mean, (int, float)):
-        if isinstance(top_nodes, list) and top_nodes:
-            first = top_nodes[0]
-            if isinstance(first, dict):
-                delta_lle_mean = first.get("delta_lle")
+        # Try ablation list (Phase 1 actual format)
+        ablation_rows = na.get("ablation") or []
+        if isinstance(ablation_rows, list) and ablation_rows:
+            delta_lles = [r.get("delta_lle") for r in ablation_rows
+                          if isinstance(r, dict) and r.get("delta_lle") is not None]
+            if delta_lles:
+                # Mean of top-5 (already sorted by |ΔLLE| desc by Phase 1)
+                delta_lle_mean = float(np.mean([abs(v) for v in delta_lles[:5]]))
+
+        # Legacy: top_nodes as list-of-dicts fallback
+        if not isinstance(delta_lle_mean, (int, float)):
+            top_nodes = na.get("top_nodes") or na.get("ablation_results") or []
+            if isinstance(top_nodes, list) and top_nodes:
+                first = top_nodes[0]
+                if isinstance(first, dict):
+                    delta_lle_mean = first.get("delta_lle")
 
     if delta_lle_mean is not None and abs(delta_lle_mean) > 0.001:
         verdict = "supports"
@@ -889,10 +989,28 @@ def _add_random_network_evidence(
         })
         return
 
-    # Keys may differ between random_comparison and graph_structure_comparison outputs
+    # Phase 1 run_graph_structure_comparison() returns:
+    #   {"brain_graph":        {"lle": float, "lle_gnn": float, ...},
+    #    "degree_preserving":  {"lle": float, ...},
+    #    "fully_random":       {"lle": float, ...},
+    #    "low_rank": ..., "community_structure": ..., "hub_dominated": ..., ...}
+    # Also accept legacy flat keys for run_random_model_comparison() output.
     brain_lle   = rn.get("brain_lle_mean") or rn.get("brain_tanh_lle")
     random_lle  = rn.get("fully_random_lle_mean") or rn.get("random_lle_mean")
     deg_lle     = rn.get("degree_preserved_lle_mean")
+
+    if brain_lle is None:
+        # graph_structure_comparison format: nested entry dicts
+        bg = rn.get("brain_graph") or {}
+        brain_lle = bg.get("lle_gnn") or bg.get("lle")   # prefer GNN LLE over tanh
+
+    if random_lle is None:
+        fr = rn.get("fully_random") or {}
+        random_lle = fr.get("lle")
+
+    if deg_lle is None:
+        dp = rn.get("degree_preserving") or {}
+        deg_lle = dp.get("lle")
 
     if brain_lle is not None and random_lle is not None:
         if brain_lle < random_lle:
