@@ -894,3 +894,27 @@ PCA 轨迹图显示所有轨迹沿 PC1（占 86%+ 方差）作单向漂移（右
   - DBSCAN 联合判据同步收紧为 `K>=4 && silhouette>0.92`。
   - `_score_hypotheses`：`kmeans_uniform_suspect` 对 CA 加分降到 `+0.8`，移除 `LLE>0` 对 CA 的加分；新增 CA guard（独立证据 <2 时限制 CA 分数上限）。
 - **规则**: Continuous-attractor 结论必须基于至少 2 条独立证据（如中性方向+低维流形+LLE≈0+均匀分簇等），单一线索不得主导最终分类。
+
+### [2026-03-12] Cross-Task PCA 高维流形更新（10D+ 感知）
+
+#### 背景：2D 环形评分不可信
+- **问题**: 旧版 `cross_task_pca.py` 以 PC1-PC2 上的**环形评分**（ring score）和**相位偏移**作为主要流形判据。但最新研究（Stringer et al. 2019 Science; Saxena & Cunningham 2019 Nature Neuroscience; Gallego et al. 2020）表明神经动力学流形通常为 **10–20 维**。一个真正的高维吸引子在 PC1-PC2 投影中会呈现弥散分布，而非清晰的环形——即使吸引子在高维空间是圆形或环面。因此旧的环形评分对于 PR > 3 的流形完全不可信。
+- **修复**: 将主要判据替换为四个**维度感知**（dimension-aware）指标：
+  1. **参与率 PR**（Participation Ratio）= (Σλ_i)²/Σλ_i²：直接从 PCA 特征值估计内在维度，PR≈10 确认流形为 ~10D。
+  2. **Grassmannian 距离**（主角度）：对每对任务分别拟合 PCA 子空间，用 SVD 计算主角度（principal angles）——小角度说明任务共享同一高维流形，大角度说明任务各有独立子空间。
+  3. **高维 k-NN 任务纯度**：在 n90 维 PCA 空间（而非 PC1-PC2）中计算 k=15 最近邻中同任务比例，与随机基准（1/n_tasks）比较。比值 < 1.5 → 共享流形；> 2.5 → 独立流形。
+  4. **高维组间/组内方差比**：ANOVA 式指标，同在 n90 维空间计算。
+- **判决逻辑变更**（旧 vs 新）:
+  - 旧：`global_ring_score < 0.25` → "RING/TORUS"; `> 0.45` → "DIFFUSE"（只看 PC1-PC2）
+  - 新：`knn_ratio < 1.5 AND mean_pa < 30°` → "SHARED HIGH-D MANIFOLD"; `knn_ratio > 2.5 OR mean_pa > 60°` → "DISTINCT HIGH-D MANIFOLDS"
+- **其他改动**:
+  - `_fit_joint_pca` 默认 `n_components` 从 10 改为 20（覆盖 ~10D 流形）
+  - 新增 `--n-components` CLI 参数（默认 20）
+  - 新增 `_plot_pc_grid()`：2×4 方格图，分别显示 PC1-2, PC3-4, PC5-6, PC7-8，揭示高维结构
+  - `_plot_joint_pca()` 新增 PC3-PC4 散点面板（第 4 个 panel）
+  - `_plot_variance_curve()` 新增 PR 垂直线标注
+  - 旧的环形评分和相位偏移指标以 `_pc12_legacy` 后缀保留在 JSON 中，供向后兼容参考
+- **新输出文件**: `pc_grid.png`（多 PC 对方格图）
+- **规则**: Cross-task PCA 的流形判决必须基于 k-NN 纯度比和 Grassmannian 主角度；PC1-PC2 环形评分只作参考，当 PR > 3 时绝不作为主要结论依据。
+
+*Last updated: 2026-03-12*
