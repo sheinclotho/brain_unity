@@ -917,4 +917,49 @@ PCA 轨迹图显示所有轨迹沿 PC1（占 86%+ 方差）作单向漂移（右
 - **新输出文件**: `pc_grid.png`（多 PC 对方格图）
 - **规则**: Cross-task PCA 的流形判决必须基于 k-NN 纯度比和 Grassmannian 主角度；PC1-PC2 环形评分只作参考，当 PR > 3 时绝不作为主要结论依据。
 
+### [2026-03-12] 生理约束合成脑数据生成器（`physiological_synth.py`）
+
+#### 设计背景
+研究表明 GNN 模型的流形是十几维度（PR≈10），需要在可控条件下探索模型动力学。
+合成数据允许独立控制每个生理参数，消除真实数据中被试特异性噪声的干扰。
+
+#### 新文件 `brain_dynamics/analysis/physiological_synth.py`
+- **主函数** `generate_physiologically_constrained_data(graph_folder, output_dir, ...)`:
+  - Step 1: 从真实图缓存提取参考统计（n_regions、FC 矩阵）
+  - Step 2: 构建低秩生成基 U（FC 主成分方向）+ 方差权重 λ
+  - Step 3: AR(1) 时域潜变量 + 观测模型 x=U@(√λ⊙h)+noise + 带通滤波 + z-score 归一化
+  - Step 4: 质量指标（FC相似度 r、MP信号维度估计）
+  - Step 5: 真实 vs 合成 PCA 对比图（3行×2列）
+  - 输出: `synth_NNNNN.pt`（V5 HeteroData 格式，可直接输入 GNN）+ JSON + PNG
+- **五层生理约束**: (1) 低维流形（manifold_dim 设置生成维度）(2) AR(1) 时域自相关（autocorr_rho）(3) 真实 FC 空间结构（U 来自 FC 特征分解）(4) BOLD 带通滤波 0.01–0.1 Hz（scipy.signal.butter + filtfilt，有 fallback）(5) Z-score 归一化（匹配 V5 格式）
+
+#### 关键技术细节
+- **manifold_dim vs 观测 PR 的关系**: `manifold_dim` 控制*生成结构*维度（哪些 FC 特征向量作为信号基），但 z-score 后噪声底层使观测 PR 高于 manifold_dim。使用 Marchenko-Pastur 阈值 `n_signal_dimensions_mp` 作为经验信号维度估计（更接近 manifold_dim，但在低 SNR 时分辨率有限）。FC 相似度 r 是主要质量指标。
+- **MP 阈值**: λ_max_noise = (1 + √(N/T))²（z-score 数据 σ²=1），高于此阈值的特征值为显著结构信号
+- **`_find_graph_pts` 独立内联**: physiological_synth.py 不从 cross_task_pca.py 导入私有函数，独立内联了相同的 checkpoint 排除逻辑（`_CHECKPOINT_STEMS`, `_CHECKPOINT_PREFIX`）
+- **CLI**: `--manifold-dim`, `--autocorr-rho`, `--network-snr`, `--no-hrf-filter`, `--n-subjects`, `--n-timepoints`, `--seed`
+
+#### 消融实验用法
+```bash
+# 流形维度扫描
+for dim in 3 5 8 10 15 20; do
+    python -m analysis.physiological_synth \
+        --graphs outputs/graph_cache/ --output outputs/synth_dim${dim}/ \
+        --manifold-dim $dim --n-subjects 10
+done
+
+# SNR 扫描  
+for snr in 0.5 1.0 2.0 5.0 10.0; do
+    python -m analysis.physiological_synth \
+        --graphs outputs/graph_cache/ --output outputs/synth_snr${snr}/ \
+        --network-snr $snr
+done
+```
+
+#### 规则
+- 合成数据文件命名必须为 `synth_NNNNN.pt`（5位数字），不得使用被试 ID 前缀（以区分真实 vs 合成数据）
+- `manifold_dim` 应与真实数据的经验 PR 一致（通常 8–15），过高（>20）会使流形与噪声混淆
+- `network_snr ≥ 3` 时 MP 信号维度估计趋于稳定；低 SNR 时以 FC 相似度 r 为主要质量指标
+- 生成的 `.pt` 文件可直接通过 `load_graph_for_inference()` 加载（边在加载时动态重建）
+
 *Last updated: 2026-03-12*

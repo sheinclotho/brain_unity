@@ -338,12 +338,17 @@ def _task_pca_basis(trajs: np.ndarray, burnin: int, n_components: int) -> Option
 
     Returns
     -------
-    basis : ndarray of shape ``(n_comp, N)`` or ``None`` on failure.
+    basis : ndarray of shape ``(n_comp, N)`` or ``None``.
+        Returns ``None`` when ``T - burnin <= 0`` (no frames remain after burnin).
+        When effective samples < ``n_components + 1``, returns a basis with
+        fewer components than requested (capped at ``min(samples-1, N-1)``).
     """
     from sklearn.decomposition import PCA as SkPCA
 
     n_traj, T, N = trajs.shape
     data = trajs[:, burnin:, :].reshape(-1, N).astype(np.float64)
+    if data.shape[0] == 0:
+        return None
     data -= data.mean(axis=0)
     nc = min(n_components, data.shape[0] - 1, data.shape[1] - 1)
     if nc < 1:
@@ -1050,6 +1055,10 @@ def run_cross_task_pca(
     # eigenvalue spectrum is not perfectly flat within the manifold; (c) n90
     # always satisfies n90 >= PR in practice, so it is a conservative upper
     # bound that includes all informative dimensions without adding pure noise.
+    # The 90% threshold (vs 80% or 95%) is chosen as the standard "elbow" in
+    # scree-plot analysis; it captures most signal directions while excluding
+    # the long tail of noise PCs.  It is configurable via the data indirectly
+    # (larger n_components covers more of the spectrum, shifting n90 up).
     hd_dims = min(n90, X_pca.shape[1])
 
     # k-NN task purity in high-D PCA space
