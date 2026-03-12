@@ -167,6 +167,17 @@ def _fit_joint_pca(
     X -= X.mean(axis=0)                       # centre once across all tasks
 
     n_comp = min(n_components, X.shape[0] - 1, X.shape[1] - 1)
+    if n_comp < 2:
+        n_samples = X.shape[0]
+        n_features = X.shape[1]
+        raise ValueError(
+            f"PCA 拟合失败：可用主成分数 n_comp={n_comp} < 2。\n"
+            f"  n_samples = n_traj({n_traj}) × (T({T}) - burnin({burnin})) = {n_samples}\n"
+            f"  n_features = n_regions = {n_features}\n"
+            f"  n_comp = min(n_components={n_components}, n_samples-1={n_samples-1}, "
+            f"n_features-1={n_features-1}) = {n_comp}\n"
+            "请增加 n_init 或减少 pca_burnin，以确保 PCA 可用至少 2 个主成分。"
+        )
     pca = SkPCA(n_components=n_comp, random_state=42)
     X_pca = pca.fit_transform(X)             # (n_traj*T_after, n_comp)
 
@@ -205,6 +216,11 @@ def _phase_offset(X2d_a: np.ndarray, X2d_b: np.ndarray) -> float:
     -------
     float: mean angular difference in degrees ∈ [0, 180].
     """
+    # Require at least 2 dimensions for angle calculation.
+    if X2d_a.ndim < 2 or X2d_a.shape[1] < 2 or X2d_b.ndim < 2 or X2d_b.shape[1] < 2:
+        return float("nan")
+    if len(X2d_a) == 0 or len(X2d_b) == 0:
+        return float("nan")
     joint = np.vstack([X2d_a, X2d_b])
     c = joint.mean(axis=0)
     # Compute mean direction vector for each task cloud (relative to joint centroid).
@@ -296,11 +312,12 @@ def _plot_joint_pca(
 
     # ── Panel 1: time-coloured scatter (single task or mean trajectory) ────────
     # Show all tasks, each trajectory coloured by time to reveal orbits
+    sc = None  # initialise before loop so the colorbar reference is always valid
     for task_i in range(min(n_tasks, 5)):  # limit to first 5 to keep legible
         mask = traj_idx == task_i
         pts = X_pca[mask, :2]
         T_pts = len(pts)
-        if T_pts == 0:
+        if T_pts == 0 or pts.shape[1] < 2:
             continue
         sc = ax_time.scatter(
             pts[:, 0], pts[:, 1],
@@ -308,7 +325,7 @@ def _plot_joint_pca(
             cmap="viridis", s=3, alpha=0.25,
             rasterized=True,
         )
-    if n_tasks > 0:
+    if n_tasks > 0 and sc is not None:
         plt.colorbar(sc, ax=ax_time, label="Time (0=start, 1=end)")
     ax_time.set_xlabel(f"PC1 ({pc1_var:.1f}%)")
     ax_time.set_ylabel(f"PC2 ({pc2_var:.1f}%)")
@@ -472,6 +489,31 @@ def run_cross_task_pca(
 
     logger.info("成功生成轨迹的任务数: %d / %d", len(task_trajs), len(graph_paths))
 
+    # ── n_regions consistency check ───────────────────────────────────────────
+    # Different graph files may have different numbers of nodes (e.g. some
+    # subjects have fewer parcellated regions after QC).  Trajectories with
+    # mismatched n_regions cannot be concatenated; filter them out here so that
+    # np.concatenate below never raises a shape-mismatch ValueError.
+    if len(task_trajs) > 1:
+        ref_label = task_labels[0]
+        ref_n = task_trajs[ref_label].shape[2]
+        mismatched = [lbl for lbl in task_labels if task_trajs[lbl].shape[2] != ref_n]
+        if mismatched:
+            mismatch_info = {lbl: task_trajs[lbl].shape[2] for lbl in mismatched}
+            logger.warning(
+                "%d 个任务的 n_regions 与参考任务 '%s'（n_regions=%d）不一致，已跳过：%s",
+                len(mismatched), ref_label, ref_n,
+                mismatch_info,
+            )
+            for lbl in mismatched:
+                task_trajs.pop(lbl)
+                task_labels.remove(lbl)
+            if not task_trajs:
+                raise RuntimeError(
+                    "过滤 n_regions 不一致的任务后无任务剩余。"
+                    "请检查图缓存文件是否使用了同一套脑区图谱（atlas）。"
+                )
+
     # ── Joint PCA ─────────────────────────────────────────────────────────────
     # Stack all trajectories into a single pool for joint PCA fitting.
     # Order: task_labels[0] traj 0..n_init-1, task_labels[1] traj 0..n_init-1, …
@@ -525,12 +567,12 @@ def run_cross_task_pca(
             continue
         pts = X_pca[mask_t, :2]
         ring_s = _ring_score(pts)
-        # Centroid in PC space
+        # Centroid in PC space (guard against < 2 components)
         centroid = pts.mean(axis=0).tolist()
         task_analysis[lbl] = {
             "ring_score": float(ring_s),
-            "centroid_pc1": float(centroid[0]),
-            "centroid_pc2": float(centroid[1]),
+            "centroid_pc1": float(centroid[0]) if len(centroid) > 0 else float("nan"),
+            "centroid_pc2": float(centroid[1]) if len(centroid) > 1 else float("nan"),
             "n_samples": int(mask_t.sum()),
         }
 
