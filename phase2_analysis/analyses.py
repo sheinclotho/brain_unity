@@ -293,19 +293,25 @@ def _plot_mode_node_heatmap(
         _write_fallback_png(path)
         return
 
-    # Only show top-30 nodes for readability
+    # Only show top-30 nodes for readability.
+    # n_actual may be < n_show when global_top has fewer entries than n_show
+    # (e.g. n_top_nodes=15 passed to mode_node_coupling while n_show=30).
+    # Using n_show for set_xticks while top_idx has fewer elements causes:
+    #   ValueError: The number of FixedLocator locations (30) does not match
+    #               the number of labels (15).
     n_show = min(30, N)
     top_idx = np.array(global_top[:n_show], dtype=int)
-    sub = coupling_matrix[:, top_idx]  # (n_modes, n_show)
+    n_actual = len(top_idx)  # ≤ n_show; must match tick/label counts
+    sub = coupling_matrix[:, top_idx]  # (n_modes, n_actual)
 
     # Normalise each mode row to [0, 1]
     row_max = sub.max(axis=1, keepdims=True)
     row_max = np.where(row_max < 1e-12, 1.0, row_max)
     sub_norm = sub / row_max
 
-    fig, ax = plt.subplots(figsize=(max(6, n_show * 0.35), max(3, len(labels) * 0.55 + 1)))
+    fig, ax = plt.subplots(figsize=(max(6, n_actual * 0.35), max(3, len(labels) * 0.55 + 1)))
     im = ax.imshow(sub_norm, aspect="auto", cmap="hot", vmin=0, vmax=1)
-    ax.set_xticks(range(n_show))
+    ax.set_xticks(range(n_actual))
     ax.set_xticklabels([f"N{i}" for i in top_idx], rotation=45, ha="right", fontsize=7)
     ax.set_yticks(range(len(labels)))
     ax.set_yticklabels(labels, fontsize=7)
