@@ -127,6 +127,15 @@ _DEFAULTS = {
             "enabled": True, "fnn_max_dim": 8, "corr_dim": True,
             "check_leakage": True, "train_fraction": 0.7,
         },
+        "graph_structure_comparison": {
+            "enabled": True, "n_random": 5,
+        },
+        "input_dimension_control": {
+            "enabled": True, "noise_sigma": 0.5, "low_dim_k": 3,
+        },
+        "node_ablation": {
+            "enabled": True, "n_top_variance": 50, "n_random_sample": 50,
+        },
         "perturbation": {"enabled": False},
     },
     "advanced": {

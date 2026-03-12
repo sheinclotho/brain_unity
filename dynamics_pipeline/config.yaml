@@ -243,30 +243,30 @@ validation:
     enabled: false
     n_random: 5                 # Number of random realisations
 
-  # ── TASK 1: Graph Structure Comparison (OPTIONAL) ─────────────────────────
+  # ── TASK 1: Graph Structure Comparison ────────────────────────────────────
   # Compares brain graph vs degree-preserving-rewired and fully-random baselines
   # using analytical spectral metrics + GNN-derived LLE/D2 (no extra model calls).
   # Outputs: random_graph_comparison.csv, random_graph_dynamics.png
   graph_structure_comparison:
-    enabled: false
+    enabled: true
     n_random: 5                 # Realisations of each random baseline to average
 
-  # ── TASK 2: Input Dimension Control (OPTIONAL) ────────────────────────────
+  # ── TASK 2: Input Dimension Control ──────────────────────────────────────
   # Tests whether low-dimensional dynamics come from network structure vs input.
   # Three conditions on GNN trajectories: no input / high-dim noise / 3-D drive.
   # No extra model calls.
   # Outputs: input_dimension_results.csv, input_dimension_plot.png
   input_dimension_control:
-    enabled: false
+    enabled: true
     noise_sigma: 0.5            # Noise amplitude for condition B
     low_dim_k: 3                # Dimensionality of structured drive in condition C
 
-  # ── TASK 4: Node Ablation (OPTIONAL) ──────────────────────────────────────
+  # ── TASK 4: Node Ablation ──────────────────────────────────────────────────
   # Ranks nodes by manifold-deformation impact (trajectory-space masking).
   # No extra model calls.
   # Outputs: node_importance.csv, node_importance_hist.png
   node_ablation:
-    enabled: false
+    enabled: true
     n_top_variance: 50          # High-variance nodes to always include
     n_random_sample: 50         # Random control nodes
 
