@@ -894,3 +894,72 @@ PCA 轨迹图显示所有轨迹沿 PC1（占 86%+ 方差）作单向漂移（右
   - DBSCAN 联合判据同步收紧为 `K>=4 && silhouette>0.92`。
   - `_score_hypotheses`：`kmeans_uniform_suspect` 对 CA 加分降到 `+0.8`，移除 `LLE>0` 对 CA 的加分；新增 CA guard（独立证据 <2 时限制 CA 分数上限）。
 - **规则**: Continuous-attractor 结论必须基于至少 2 条独立证据（如中性方向+低维流形+LLE≈0+均匀分簇等），单一线索不得主导最终分类。
+
+### [2026-03-12] Cross-Task PCA 高维流形更新（10D+ 感知）
+
+#### 背景：2D 环形评分不可信
+- **问题**: 旧版 `cross_task_pca.py` 以 PC1-PC2 上的**环形评分**（ring score）和**相位偏移**作为主要流形判据。但最新研究（Stringer et al. 2019 Science; Saxena & Cunningham 2019 Nature Neuroscience; Gallego et al. 2020）表明神经动力学流形通常为 **10–20 维**。一个真正的高维吸引子在 PC1-PC2 投影中会呈现弥散分布，而非清晰的环形——即使吸引子在高维空间是圆形或环面。因此旧的环形评分对于 PR > 3 的流形完全不可信。
+- **修复**: 将主要判据替换为四个**维度感知**（dimension-aware）指标：
+  1. **参与率 PR**（Participation Ratio）= (Σλ_i)²/Σλ_i²：直接从 PCA 特征值估计内在维度，PR≈10 确认流形为 ~10D。
+  2. **Grassmannian 距离**（主角度）：对每对任务分别拟合 PCA 子空间，用 SVD 计算主角度（principal angles）——小角度说明任务共享同一高维流形，大角度说明任务各有独立子空间。
+  3. **高维 k-NN 任务纯度**：在 n90 维 PCA 空间（而非 PC1-PC2）中计算 k=15 最近邻中同任务比例，与随机基准（1/n_tasks）比较。比值 < 1.5 → 共享流形；> 2.5 → 独立流形。
+  4. **高维组间/组内方差比**：ANOVA 式指标，同在 n90 维空间计算。
+- **判决逻辑变更**（旧 vs 新）:
+  - 旧：`global_ring_score < 0.25` → "RING/TORUS"; `> 0.45` → "DIFFUSE"（只看 PC1-PC2）
+  - 新：`knn_ratio < 1.5 AND mean_pa < 30°` → "SHARED HIGH-D MANIFOLD"; `knn_ratio > 2.5 OR mean_pa > 60°` → "DISTINCT HIGH-D MANIFOLDS"
+- **其他改动**:
+  - `_fit_joint_pca` 默认 `n_components` 从 10 改为 20（覆盖 ~10D 流形）
+  - 新增 `--n-components` CLI 参数（默认 20）
+  - 新增 `_plot_pc_grid()`：2×4 方格图，分别显示 PC1-2, PC3-4, PC5-6, PC7-8，揭示高维结构
+  - `_plot_joint_pca()` 新增 PC3-PC4 散点面板（第 4 个 panel）
+  - `_plot_variance_curve()` 新增 PR 垂直线标注
+  - 旧的环形评分和相位偏移指标以 `_pc12_legacy` 后缀保留在 JSON 中，供向后兼容参考
+- **新输出文件**: `pc_grid.png`（多 PC 对方格图）
+- **规则**: Cross-task PCA 的流形判决必须基于 k-NN 纯度比和 Grassmannian 主角度；PC1-PC2 环形评分只作参考，当 PR > 3 时绝不作为主要结论依据。
+
+### [2026-03-12] 生理约束合成脑数据生成器（`physiological_synth.py`）
+
+#### 设计背景
+研究表明 GNN 模型的流形是十几维度（PR≈10），需要在可控条件下探索模型动力学。
+合成数据允许独立控制每个生理参数，消除真实数据中被试特异性噪声的干扰。
+
+#### 新文件 `brain_dynamics/analysis/physiological_synth.py`
+- **主函数** `generate_physiologically_constrained_data(graph_folder, output_dir, ...)`:
+  - Step 1: 从真实图缓存提取参考统计（n_regions、FC 矩阵）
+  - Step 2: 构建低秩生成基 U（FC 主成分方向）+ 方差权重 λ
+  - Step 3: AR(1) 时域潜变量 + 观测模型 x=U@(√λ⊙h)+noise + 带通滤波 + z-score 归一化
+  - Step 4: 质量指标（FC相似度 r、MP信号维度估计）
+  - Step 5: 真实 vs 合成 PCA 对比图（3行×2列）
+  - 输出: `synth_NNNNN.pt`（V5 HeteroData 格式，可直接输入 GNN）+ JSON + PNG
+- **五层生理约束**: (1) 低维流形（manifold_dim 设置生成维度）(2) AR(1) 时域自相关（autocorr_rho）(3) 真实 FC 空间结构（U 来自 FC 特征分解）(4) BOLD 带通滤波 0.01–0.1 Hz（scipy.signal.butter + filtfilt，有 fallback）(5) Z-score 归一化（匹配 V5 格式）
+
+#### 关键技术细节
+- **manifold_dim vs 观测 PR 的关系**: `manifold_dim` 控制*生成结构*维度（哪些 FC 特征向量作为信号基），但 z-score 后噪声底层使观测 PR 高于 manifold_dim。使用 Marchenko-Pastur 阈值 `n_signal_dimensions_mp` 作为经验信号维度估计（更接近 manifold_dim，但在低 SNR 时分辨率有限）。FC 相似度 r 是主要质量指标。
+- **MP 阈值**: λ_max_noise = (1 + √(N/T))²（z-score 数据 σ²=1），高于此阈值的特征值为显著结构信号
+- **`_find_graph_pts` 独立内联**: physiological_synth.py 不从 cross_task_pca.py 导入私有函数，独立内联了相同的 checkpoint 排除逻辑（`_CHECKPOINT_STEMS`, `_CHECKPOINT_PREFIX`）
+- **CLI**: `--manifold-dim`, `--autocorr-rho`, `--network-snr`, `--no-hrf-filter`, `--n-subjects`, `--n-timepoints`, `--seed`
+
+#### 消融实验用法
+```bash
+# 流形维度扫描
+for dim in 3 5 8 10 15 20; do
+    python -m analysis.physiological_synth \
+        --graphs outputs/graph_cache/ --output outputs/synth_dim${dim}/ \
+        --manifold-dim $dim --n-subjects 10
+done
+
+# SNR 扫描  
+for snr in 0.5 1.0 2.0 5.0 10.0; do
+    python -m analysis.physiological_synth \
+        --graphs outputs/graph_cache/ --output outputs/synth_snr${snr}/ \
+        --network-snr $snr
+done
+```
+
+#### 规则
+- 合成数据文件命名必须为 `synth_NNNNN.pt`（5位数字），不得使用被试 ID 前缀（以区分真实 vs 合成数据）
+- `manifold_dim` 应与真实数据的经验 PR 一致（通常 8–15），过高（>20）会使流形与噪声混淆
+- `network_snr ≥ 3` 时 MP 信号维度估计趋于稳定；低 SNR 时以 FC 相似度 r 为主要质量指标
+- 生成的 `.pt` 文件可直接通过 `load_graph_for_inference()` 加载（边在加载时动态重建）
+
+*Last updated: 2026-03-12*
