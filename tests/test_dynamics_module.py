@@ -3117,5 +3117,151 @@ class TestGraphStructureComparison(unittest.TestCase):
                               f"{key} must have '{metric}' key")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Multi-graph pool node-count validation (CUDA srcIndex < srcSelectDimSize fix)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestMultiGraphPoolNodeCountValidation(unittest.TestCase):
+    """Regression tests for CUDA index-out-of-bounds in multi-graph context pool.
+
+    Root cause: _load_graph_x_only previously only validated the PRIMARY
+    modality (e.g. 'fmri') node count.  When a secondary modality ('eeg')
+    in a pool graph had a different N than the primary graph's edge_index
+    was built for, the swapped .x tensor caused edge indices to exceed the
+    feature-tensor dimension, triggering the CUDA assertion
+    ``srcIndex < srcSelectDimSize`` during GNN message passing.
+    """
+
+    def _make_heterodata(self, n_fmri: int, n_eeg: int, T: int = 50):
+        """Return a minimal HeteroData with fmri and eeg nodes."""
+        try:
+            from torch_geometric.data import HeteroData
+        except ImportError:
+            self.skipTest("torch_geometric not available")
+        g = HeteroData()
+        g["fmri"].x = torch.zeros(n_fmri, T, 1)
+        g["eeg"].x  = torch.zeros(n_eeg,  T, 1)
+        # Add minimal edge indices so the graph passes HeteroData sanity checks.
+        g["fmri", "connects", "fmri"].edge_index = torch.zeros(2, 0, dtype=torch.long)
+        g["eeg",  "connects", "eeg" ].edge_index = torch.zeros(2, 0, dtype=torch.long)
+        return g
+
+    def test_load_graph_x_only_accepts_matching_secondary(self):
+        """_load_graph_x_only accepts a graph whose secondary modality N matches."""
+        import tempfile
+        from experiments.free_dynamics import _load_graph_x_only
+        # Build and save a graph with n_fmri=10, n_eeg=5 (both matching primary).
+        g = self._make_heterodata(n_fmri=10, n_eeg=5)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ok.pt"
+            torch.save(g, path)
+            result = _load_graph_x_only(
+                path=path,
+                required_nts=["fmri", "eeg"],
+                n_regions_primary=10,
+                nt_primary="fmri",
+                n_nodes_per_nt={"fmri": 10, "eeg": 5},
+            )
+            self.assertIsNotNone(result, "Should accept matching N for both modalities")
+            self.assertIn("fmri", result)
+            self.assertIn("eeg",  result)
+            self.assertEqual(result["fmri"].shape[0], 10)
+            self.assertEqual(result["eeg"].shape[0],  5)
+
+    def test_load_graph_x_only_rejects_mismatched_secondary(self):
+        """_load_graph_x_only rejects a graph whose secondary modality N mismatches.
+
+        This is the key regression guard: previously, only the primary (fmri)
+        was checked, so a pool graph with n_eeg=3 (when primary has n_eeg=5)
+        would be accepted and later cause CUDA srcIndex < srcSelectDimSize.
+        """
+        import tempfile
+        from experiments.free_dynamics import _load_graph_x_only
+        # Build a graph with n_fmri=10 (matches primary), n_eeg=3 (mismatches primary 5).
+        g = self._make_heterodata(n_fmri=10, n_eeg=3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "bad_eeg.pt"
+            torch.save(g, path)
+            result = _load_graph_x_only(
+                path=path,
+                required_nts=["fmri", "eeg"],
+                n_regions_primary=10,
+                nt_primary="fmri",
+                n_nodes_per_nt={"fmri": 10, "eeg": 5},  # primary expects n_eeg=5
+            )
+            self.assertIsNone(
+                result,
+                "Must return None when secondary modality N mismatches primary graph — "
+                "accepting it would cause CUDA srcIndex < srcSelectDimSize"
+            )
+
+    def test_load_graph_x_only_no_n_nodes_per_nt_still_accepts(self):
+        """Backward compat: without n_nodes_per_nt, secondary validation is skipped."""
+        import tempfile
+        from experiments.free_dynamics import _load_graph_x_only
+        # A graph whose eeg N mismatches primary — but no n_nodes_per_nt is passed.
+        g = self._make_heterodata(n_fmri=10, n_eeg=3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "mismatch_no_check.pt"
+            torch.save(g, path)
+            result = _load_graph_x_only(
+                path=path,
+                required_nts=["fmri", "eeg"],
+                n_regions_primary=10,
+                nt_primary="fmri",
+                n_nodes_per_nt=None,  # old-style call — no secondary validation
+            )
+            # Without n_nodes_per_nt the function falls back to old behaviour:
+            # secondary mismatch is NOT detected (this is acceptable for single-modal use).
+            # The important thing is it doesn't crash.
+            self.assertIsNotNone(result, "Without n_nodes_per_nt, the call should not crash")
+
+    def test_build_graph_pool_skips_mismatched_eeg(self):
+        """_build_graph_pool skips a pool file with mismatched n_eeg.
+
+        Validates that the n_nodes_per_nt dict is correctly built from the
+        base_graph and passed to _load_graph_x_only.
+        """
+        import tempfile, os
+        from experiments.free_dynamics import _build_graph_pool
+
+        # ── Build a fake twin-mode simulator (no real model needed) ────────────
+        # We use object() + attribute injection to avoid the full model stack.
+        class _FakeSim:
+            pass
+
+        sim = _FakeSim()
+        try:
+            from torch_geometric.data import HeteroData
+        except ImportError:
+            self.skipTest("torch_geometric not available")
+
+        g_primary = self._make_heterodata(n_fmri=10, n_eeg=5)
+        sim.base_graph = g_primary
+        sim.n_regions = 15  # joint: n_fmri + n_eeg
+
+        # Pool file 1: matching (n_fmri=10, n_eeg=5) → should be accepted.
+        # Pool file 2: mismatched EEG (n_fmri=10, n_eeg=3) → should be rejected.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path1 = Path(tmpdir) / "ok.pt"
+            path2 = Path(tmpdir) / "bad_eeg.pt"
+            torch.save(self._make_heterodata(n_fmri=10, n_eeg=5), path1)
+            torch.save(self._make_heterodata(n_fmri=10, n_eeg=3), path2)
+
+            pool = _build_graph_pool(
+                graph_paths=[None, path1, path2],  # index 0 is always None
+                simulator=sim,
+                nt_primary="fmri",
+            )
+
+        # Pool: index 0 = None (primary), index 1 = ok.pt, bad_eeg.pt skipped.
+        self.assertEqual(len(pool), 2,
+                         "Pool should have 2 entries: primary + 1 accepted file; "
+                         "mismatched EEG file must be rejected")
+        self.assertIsNone(pool[0])
+        self.assertIsNotNone(pool[1])
+        self.assertEqual(pool[1]["eeg"].shape[0], 5)
+
+
 if __name__ == "__main__":
     unittest.main()

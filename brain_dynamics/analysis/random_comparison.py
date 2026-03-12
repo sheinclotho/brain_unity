@@ -767,6 +767,139 @@ def _spectral_metrics_rc(W: np.ndarray) -> Dict:
                 "spectral_gap_ratio": float("nan")}
 
 
+
+def _build_low_rank_matrix(W: np.ndarray, rank: Optional[int] = None) -> np.ndarray:
+    """Reconstruct W retaining only its top-``rank`` singular value components.
+
+    This isolates the "low-rank structure" hypothesis: does the brain's
+    dynamics arise because W has a low-rank information-compressing structure
+    (like a principal component filter)?  If low-rank W produces dynamics
+    indistinguishable from the full W, low-rank structure suffices to explain
+    the observations.  If not, higher-rank geometry matters.
+
+    Parameters
+    ----------
+    W:
+        ``(N, N)`` connectivity matrix.
+    rank:
+        Number of singular values to keep (default: max(5, N // 20) = ~5%).
+
+    Returns
+    -------
+    W_lr: Rank-``rank`` approximation of W, shape ``(N, N)``.
+    """
+    N = W.shape[0]
+    if rank is None:
+        rank = max(5, N // 20)
+    rank = min(rank, N)
+    try:
+        U, s, Vt = np.linalg.svd(W, full_matrices=False)
+        s_trunc = np.zeros_like(s)
+        s_trunc[:rank] = s[:rank]
+        W_lr = (U * s_trunc) @ Vt
+    except np.linalg.LinAlgError:
+        W_lr = W.copy()
+    return W_lr
+
+
+def _build_community_matrix(
+    W: np.ndarray,
+    n_communities: int = 5,
+    within_strength: float = 0.8,
+    between_strength: float = 0.1,
+    seed: int = 0,
+) -> np.ndarray:
+    """Construct a random block-diagonal (community-structured) matrix.
+
+    This isolates the "community structure" hypothesis: does brain dynamics
+    arise purely because of modular community organisation?  The constructed
+    matrix has the same spectral radius as ``W`` (set externally by the
+    caller's ``_normalise_w``), random community assignments, random intra-
+    and inter-community weights scaled to ``within_strength`` and
+    ``between_strength``.
+
+    Parameters
+    ----------
+    W:
+        Original connectivity matrix (used only for N).
+    n_communities:
+        Number of communities.
+    within_strength:
+        Mean absolute weight for intra-community edges.
+    between_strength:
+        Mean absolute weight for inter-community edges.
+    seed:
+        Random seed.
+
+    Returns
+    -------
+    W_comm: ``(N, N)`` community-structured matrix.
+    """
+    N = W.shape[0]
+    rng = np.random.default_rng(seed)
+    # Random community assignment
+    labels = rng.integers(0, n_communities, size=N)
+    same_comm = (labels[:, None] == labels[None, :]).astype(np.float64)  # [N, N]
+    # Scale and add noise
+    noise = rng.standard_normal((N, N)) * 0.05
+    W_comm = same_comm * within_strength + (1.0 - same_comm) * between_strength + noise
+    # Remove self-loops
+    np.fill_diagonal(W_comm, 0.0)
+    return W_comm
+
+
+def _build_hub_matrix(
+    W: np.ndarray,
+    n_hubs: Optional[int] = None,
+    hub_strength: float = 3.0,
+    nonhub_strength: float = 0.1,
+    seed: int = 0,
+) -> np.ndarray:
+    """Construct a hub-dominated connectivity matrix.
+
+    This isolates the "hub topology" hypothesis: does brain dynamics arise
+    because W is dominated by a few highly-connected hub nodes (star-like
+    topology)?  Hub identity is preserved from the real W (top ``n_hubs``
+    nodes by row-sum absolute weight), but inter-hub and hub→non-hub weights
+    are randomised so only the TOPOLOGY (which nodes are hubs) is kept,
+    not the specific learned weight values.
+
+    Parameters
+    ----------
+    W:
+        Original connectivity matrix.  Hub nodes are identified from it.
+    n_hubs:
+        Number of hub nodes (default: max(5, N // 20) = ~5%).
+    hub_strength:
+        Mean weight for connections involving hub nodes.
+    nonhub_strength:
+        Mean weight for connections between non-hub nodes.
+    seed:
+        Random seed.
+
+    Returns
+    -------
+    W_hub: ``(N, N)`` hub-dominated matrix.
+    """
+    N = W.shape[0]
+    if n_hubs is None:
+        n_hubs = max(5, N // 20)
+    n_hubs = min(n_hubs, N)
+    rng = np.random.default_rng(seed)
+    # Identify hub nodes by row-sum absolute weight
+    row_sums = np.abs(W).sum(axis=1)
+    hub_idx = set(np.argsort(row_sums)[-n_hubs:].tolist())
+    # Build weight matrix: is_hub[i] or is_hub[j] → hub_strength, else nonhub_strength
+    is_hub = np.array([1.0 if i in hub_idx else 0.0 for i in range(N)])
+    hub_mask = np.maximum(is_hub[:, None], is_hub[None, :])  # 1 if either is hub
+    base = hub_mask * hub_strength + (1.0 - hub_mask) * nonhub_strength
+    noise = rng.standard_normal((N, N)) * 0.05
+    W_hub = base + noise
+    np.fill_diagonal(W_hub, 0.0)
+    return W_hub
+
+
+
 def run_graph_structure_comparison(
     W: np.ndarray,
     trajectories: np.ndarray,
@@ -990,28 +1123,114 @@ def run_graph_structure_comparison(
         **fr_spectral,
     }
 
+    # ── 5. Low-rank matrix ───────────────────────────────────────────────────
+    # Reconstruct W from its top-rank singular values (≈5% of N).
+    # Hypothesis: brain dynamics arise because W is approximately low-rank
+    # (information compression / dominant modes hypothesis).
+    # Result: if LLE/PCA-dim/D2 of W_lr ≈ brain, low-rank structure suffices.
+    # Otherwise, full-rank geometry is essential — low-rank alone is NOT enough.
+    _lr_rank = max(5, N // 20)
+    lr_matrices = []
+    for i in range(n_random):
+        W_lr = _build_low_rank_matrix(W, rank=_lr_rank)
+        # Perturb slightly per replicate to measure sensitivity
+        noise_scale = 0.02 * float(np.abs(W_lr).mean())
+        W_lr_i = W_lr + rng.standard_normal((N, N)) * noise_scale
+        lr_matrices.append(W_lr_i)
+    lr_tanh = _avg_tanh_metrics(lr_matrices)
+    lr_spectral = _avg_spectral(lr_matrices)
+    lr_entry = {
+        "network": f"Low-rank (rank={_lr_rank})",
+        "n_attractors": float("nan"),
+        **lr_tanh,
+        **lr_spectral,
+    }
+
+    # ── 6. Community-structured matrix ──────────────────────────────────────
+    # Random block-diagonal matrix with strong within-community weights and
+    # weak between-community weights (5 communities by default for N~190).
+    # Hypothesis: brain dynamics arise from modular community organisation.
+    _n_comm = max(3, min(10, N // 20))
+    comm_matrices = [
+        _build_community_matrix(W, n_communities=_n_comm, seed=seed + i)
+        for i in range(n_random)
+    ]
+    comm_tanh = _avg_tanh_metrics(comm_matrices)
+    comm_spectral = _avg_spectral(comm_matrices)
+    comm_entry = {
+        "network": f"Community structure (k={_n_comm})",
+        "n_attractors": float("nan"),
+        **comm_tanh,
+        **comm_spectral,
+    }
+
+    # ── 7. Hub-dominated matrix ──────────────────────────────────────────────
+    # Matrix where hub nodes (identified from real W) have high weight but
+    # all specific weight values are randomised.  Tests whether the brain's
+    # dynamics are explained merely by having a few highly-connected hubs.
+    _n_hubs = max(5, N // 20)
+    hub_matrices = [
+        _build_hub_matrix(W, n_hubs=_n_hubs, seed=seed + i)
+        for i in range(n_random)
+    ]
+    hub_tanh = _avg_tanh_metrics(hub_matrices)
+    hub_spectral = _avg_spectral(hub_matrices)
+    hub_entry = {
+        "network": f"Hub-dominated (n_hubs={_n_hubs})",
+        "n_attractors": float("nan"),
+        **hub_tanh,
+        **hub_spectral,
+    }
+
     logger.info(
-        "  Brain tanh(W@x) LLE=%.4f [analytical surrogate at ρ=%.1f, NOT GNN model; "
-        "see brain_graph['lle_gnn'] for the GNN Rosenstein LLE] | "
-        "Degree-preserving LLE=%.4f±%.4f | Fully-random LLE=%.4f±%.4f",
-        brain_tanh["lle"],
-        _TANH_COMPARE_SR,
+        "  Brain tanh(W@x) LLE=%.4f [analytical surrogate at ρ=%.1f; "
+        "lle_gnn is in brain_graph entry]",
+        brain_tanh["lle"], _TANH_COMPARE_SR,
+    )
+    logger.info(
+        "  Degree-preserving LLE=%.4f±%.4f | Fully-random LLE=%.4f±%.4f",
         dp_tanh["lle"], dp_tanh["lle_std"],
         fr_tanh["lle"], fr_tanh["lle_std"],
     )
+    logger.info(
+        "  [Structured] Low-rank LLE=%.4f±%.4f | Community LLE=%.4f±%.4f | Hub LLE=%.4f±%.4f",
+        lr_tanh["lle"], lr_tanh["lle_std"],
+        comm_tanh["lle"], comm_tanh["lle_std"],
+        hub_tanh["lle"], hub_tanh["lle_std"],
+    )
+
+    all_entries = [brain_entry, dp_entry, fr_entry, lr_entry, comm_entry, hub_entry]
 
     results = {
         "brain_graph": brain_entry,
         "degree_preserving": dp_entry,
         "fully_random": fr_entry,
+        "low_rank": lr_entry,
+        "community_structure": comm_entry,
+        "hub_dominated": hub_entry,
         "tanh_compare_sr": _TANH_COMPARE_SR,
+        "structured_comparison_note": (
+            "Three ARTIFICIALLY CONSTRUCTED structured matrices were compared against "
+            "the real brain graph and random baselines, under the SAME tanh dynamics rule. "
+            f"Low-rank (rank={_lr_rank}): retains only the top-{_lr_rank} singular vectors "
+            "of W — tests whether information-compression structure alone drives dynamics. "
+            f"Community (k={_n_comm}): random block-diagonal matrix — tests whether modular "
+            "community organisation alone drives dynamics. "
+            f"Hub-dominated (n_hubs={_n_hubs}): random matrix with hub topology preserved "
+            "from real W — tests whether hub-star architecture alone drives dynamics. "
+            "KEY FINDING: if all three structured surrogates produce dynamics that differ "
+            "substantially from the real model's GNN metrics (lle_gnn, d2_gnn, pca_dim_gnn), "
+            "it proves that low-rank structure, community organisation, AND hub topology "
+            "are individually INSUFFICIENT to explain the model's behaviour — the real "
+            "explanation lies in their specific combination and the trained temporal dynamics."
+        ),
         "note": (
-            f"All three network types are compared under the SAME dynamics rule "
+            f"All network types are compared under the SAME dynamics rule "
             f"x(t+1)=clip(tanh(W_norm@x),0,1) where W_norm is each matrix scaled "
             f"to spectral radius {_TANH_COMPARE_SR} (near-chaotic regime for N={N}). "
             f"Spectral-radius normalisation is required because the brain FC matrix "
             f"has ρ >> 1, which would otherwise trivially saturate tanh for all "
-            f"three networks, making the comparison uninformative. "
+            f"networks, making the comparison uninformative. "
             f"Original spectral radii are preserved in each entry. "
             f"GNN dynamics metrics (lle_gnn, d2_gnn, pca_dim_gnn) are "
             f"additionally reported for the brain graph from Phase 1 trajectories."
@@ -1021,12 +1240,11 @@ def run_graph_structure_comparison(
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        _save_rg_csv([brain_entry, dp_entry, fr_entry],
-                     output_dir / "random_graph_comparison.csv")
-        _save_rg_plot([brain_entry, dp_entry, fr_entry],
-                      output_dir / "random_graph_dynamics.png")
+        _save_rg_csv(all_entries, output_dir / "random_graph_comparison.csv")
+        _save_rg_plot(all_entries, output_dir / "random_graph_dynamics.png")
 
     return results
+
 
 
 def _save_rg_csv(rows: List[Dict], path: Path) -> None:
@@ -1061,43 +1279,57 @@ def _save_rg_plot(rows: List[Dict], path: Path) -> None:
         return
 
     labels = [r["network"] for r in rows]
-    x = np.arange(len(labels))
-    colors = ["steelblue", "salmon", "orange"]
+    n = len(rows)
+    x = np.arange(n)
+    # Use a qualitative colormap that works for up to ~10 entries
+    _cmap = plt.get_cmap("tab10")
+    colors = [_cmap(i % 10) for i in range(n)]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle("Graph Structure Comparison (brain vs random baselines)", fontsize=11)
+    fig, axes = plt.subplots(1, 3, figsize=(max(15, 3 * n), 6))
+    fig.suptitle("Graph Structure Comparison (brain vs random & structured baselines)", fontsize=11)
 
-    # Panel 1: LLE comparison (all three under same tanh dynamics)
+    # Panel 1: LLE comparison (all under same tanh dynamics)
     lle_vals = [r.get("lle", float("nan")) for r in rows]
-    lle_stds = [r.get("lle_std", 0.0) for r in rows]
+    lle_stds = [r.get("lle_std", 0.0) or 0.0 for r in rows]
     valid = [not np.isnan(v) for v in lle_vals]
     bar_vals = [v if not np.isnan(v) else 0.0 for v in lle_vals]
-    bars = axes[0].bar(x, bar_vals, color=colors, width=0.5,
-                       yerr=[s if v else 0.0 for s, v in zip(lle_stds, valid)],
-                       capsize=4)
+    axes[0].bar(x, bar_vals, color=colors, width=0.6,
+                yerr=[s if v else 0.0 for s, v in zip(lle_stds, valid)],
+                capsize=4)
+    # Also show GNN LLE where available
+    gnn_lles = [r.get("lle_gnn") for r in rows]
+    for xi, gv in enumerate(gnn_lles):
+        if gv is not None and not np.isnan(float(gv)):
+            axes[0].scatter(xi, float(gv), marker="*", s=120, color="black", zorder=5,
+                            label="GNN LLE" if xi == 0 else "")
     axes[0].set_xticks(x)
-    axes[0].set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
+    axes[0].set_xticklabels(labels, rotation=25, ha="right", fontsize=8)
     axes[0].set_ylabel("LLE (tanh dynamics)")
-    axes[0].set_title("LLE: brain vs degree-preserving vs random")
+    axes[0].set_title("Largest Lyapunov Exponent\n(* = GNN model LLE)")
     axes[0].axhline(0, color="k", linestyle="--", alpha=0.5)
     axes[0].grid(True, axis="y", alpha=0.3)
 
     # Panel 2: Participation ratio (spectral dimensionality proxy)
-    pr_vals = [r["participation_ratio"] for r in rows]
-    axes[1].bar(x, pr_vals, color=colors, width=0.5)
+    pr_vals = [r.get("participation_ratio", 0.0) or 0.0 for r in rows]
+    axes[1].bar(x, pr_vals, color=colors, width=0.6)
     axes[1].set_xticks(x)
-    axes[1].set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
-    axes[1].set_ylabel("Participation ratio (dimensionality proxy)")
-    axes[1].set_title("Participation ratio")
+    axes[1].set_xticklabels(labels, rotation=25, ha="right", fontsize=8)
+    axes[1].set_ylabel("Participation ratio")
+    axes[1].set_title("Spectral participation ratio\n(eigenvalue dimensionality proxy)")
     axes[1].grid(True, axis="y", alpha=0.3)
 
-    # Panel 3: PCA dim (tanh dynamics)
-    pca_vals = [max(r.get("pca_dim_90pct", -1), 0) for r in rows]
-    axes[2].bar(x, pca_vals, color=colors, width=0.5)
+    # Panel 3: PCA intrinsic dim (tanh dynamics trajectories)
+    pca_vals = [max(r.get("pca_dim_90pct", -1) or -1, 0) for r in rows]
+    axes[2].bar(x, pca_vals, color=colors, width=0.6)
+    # Also show GNN pca dim where available
+    gnn_pcas = [r.get("pca_dim_gnn") for r in rows]
+    for xi, gv in enumerate(gnn_pcas):
+        if gv is not None and float(gv) > 0:
+            axes[2].scatter(xi, float(gv), marker="*", s=120, color="black", zorder=5)
     axes[2].set_xticks(x)
-    axes[2].set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
+    axes[2].set_xticklabels(labels, rotation=25, ha="right", fontsize=8)
     axes[2].set_ylabel("PCA intrinsic dim (90% variance)")
-    axes[2].set_title("Intrinsic dimensionality")
+    axes[2].set_title("Intrinsic dimensionality\n(* = GNN model dim)")
     axes[2].grid(True, axis="y", alpha=0.3)
 
     plt.tight_layout()

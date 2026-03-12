@@ -341,6 +341,33 @@ class SpatialTemporalGraphConv(MessagePassing):
         #    row n*T+t, causing a systematic node/time transposition in the gathered
         #    source features (only invisible when T==N, e.g. for fMRI ROIs ≈ 190).
         E = edge_index.shape[1]
+
+        # ── CPU-side edge-index bounds guard ─────────────────────────────────
+        # The GPU kernel 'indexSelectLargeIndex' (Indexing.cu) fires:
+        #   "Assertion `srcIndex < srcSelectDimSize` failed"
+        # when edge_index[0] ≥ N_src or edge_index[1] ≥ N_dst, aborting the
+        # Python process with no traceback.  Check here on CPU (or synchronise
+        # with a cheap GPU reduction in eval mode) before dispatching any CUDA
+        # kernel so that the mismatch is surfaced as a readable RuntimeError.
+        #
+        # We guard on E > 0 to skip the check for empty edge sets, and we only
+        # check in *eval* mode (no_grad context) to avoid the synchronisation
+        # cost during training where the multi-GPU throughput matters more.
+        if E > 0 and not self.training:
+            _ei_check = edge_index.cpu()  # cheap O(E) CPU sync, only in eval
+            max_s = int(_ei_check[0].max().item())
+            max_d = int(_ei_check[1].max().item())
+            if max_s >= N_src or max_d >= N_dst:
+                raise RuntimeError(
+                    f"SpatialTemporalGraphConv: edge_index 越界！\n"
+                    f"  max(edge_index[0])={max_s} vs N_src={N_src}\n"
+                    f"  max(edge_index[1])={max_d} vs N_dst={N_dst}\n"
+                    f"  edge_index.shape={tuple(edge_index.shape)}\n"
+                    "根本原因：图的边索引与节点特征的 N 不匹配。\n"
+                    "请检查 load_graph_for_inference() 构建的边是否与节点数一致，\n"
+                    "以及多图池 _build_graph_pool() 中的节点数验证是否通过。"
+                )
+
         # Smart chunk-size selection:
         #
         # Without gradient checkpointing, chunking does NOT reduce total activation

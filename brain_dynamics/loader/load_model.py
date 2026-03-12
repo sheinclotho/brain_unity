@@ -304,6 +304,7 @@ def load_graph_for_inference(
         try:
             # graph[nt].x shape: [N, T, 1]  →  timeseries: [N, T] numpy
             ts = graph[nt].x.squeeze(-1).cpu().numpy()  # [N, T]
+            N_nodes = ts.shape[0]
             if nt == "fmri":
                 conn = mapper._compute_correlation_gpu(ts)
             else:
@@ -311,11 +312,27 @@ def load_graph_for_inference(
             ei, ea = mapper.build_graph_structure(
                 conn, threshold=thresh, k_nearest=k_nn
             )
+            # ── CPU-side bounds guard ────────────────────────────────────────
+            # Validate BEFORE storing edges.  If edge_index[0] or [1] contains
+            # a value ≥ N the GPU kernel will throw:
+            #   "Assertion `srcIndex < srcSelectDimSize` failed"
+            # which aborts the Python process with no traceback.  Catching it
+            # here (on CPU) converts that silent crash into a clear RuntimeError.
+            ei_cpu = ei.cpu()
+            if ei_cpu.shape[1] > 0:
+                max_src = int(ei_cpu[0].max().item())
+                max_dst = int(ei_cpu[1].max().item())
+                if max_src >= N_nodes or max_dst >= N_nodes:
+                    raise RuntimeError(
+                        f"{label} 边索引越界: max(src)={max_src}, "
+                        f"max(dst)={max_dst}, N={N_nodes}。"
+                        f"边重建返回了超出节点数范围的索引。"
+                    )
             graph[edge_type].edge_index = ei
             graph[edge_type].edge_attr  = ea
             logger.info(
                 "  ✓ %s 同模态边重建完成 (N=%d, E=%d, avg_degree=%.1f)",
-                label, ts.shape[0], ei.shape[1], ei.shape[1] / max(ts.shape[0], 1),
+                label, N_nodes, ei.shape[1], ei.shape[1] / max(N_nodes, 1),
             )
         except (RuntimeError, ValueError, TypeError) as exc:
             logger.warning(
@@ -329,11 +346,34 @@ def load_graph_for_inference(
         cross_ei, cross_ea = mapper.create_simple_cross_modal_edges(
             graph, k_cross_modal=k_cross_modal
         )
-        graph["eeg", "projects_to", "fmri"].edge_index = cross_ei
-        graph["eeg", "projects_to", "fmri"].edge_attr = cross_ea
-        logger.info(
-            "  ✓ 跨模态边重建完成 (k=%d, E_cross=%d)", k_cross_modal, cross_ei.shape[1]
-        )
+        # ── CPU-side bounds guard for cross-modal edges ──────────────────────
+        N_eeg  = graph["eeg"].x.shape[0]
+        N_fmri = graph["fmri"].x.shape[0]
+        cross_ei_cpu = cross_ei.cpu()
+        if cross_ei_cpu.shape[1] > 0:
+            max_eeg  = int(cross_ei_cpu[0].max().item())
+            max_fmri = int(cross_ei_cpu[1].max().item())
+            if max_eeg >= N_eeg or max_fmri >= N_fmri:
+                logger.warning(
+                    "  ⚠ 跨模态边索引越界: max(eeg)=%d≥%d 或 max(fmri)=%d≥%d。"
+                    "跳过跨模态边重建，仅使用同模态边。",
+                    max_eeg, N_eeg, max_fmri, N_fmri,
+                )
+            else:
+                graph["eeg", "projects_to", "fmri"].edge_index = cross_ei
+                graph["eeg", "projects_to", "fmri"].edge_attr = cross_ea
+                logger.info(
+                    "  ✓ 跨模态边重建完成 (k=%d, E_cross=%d, "
+                    "eeg_max=%d<%d, fmri_max=%d<%d)",
+                    k_cross_modal, cross_ei.shape[1],
+                    max_eeg, N_eeg, max_fmri, N_fmri,
+                )
+        else:
+            graph["eeg", "projects_to", "fmri"].edge_index = cross_ei
+            graph["eeg", "projects_to", "fmri"].edge_attr = cross_ea
+            logger.info(
+                "  ✓ 跨模态边重建完成 (k=%d, E_cross=0)", k_cross_modal
+            )
     elif "eeg" not in graph.node_types:
         logger.info("  缓存中无 EEG 节点，跳过跨模态边重建。")
 

@@ -1,0 +1,29 @@
+# phase2_analysis/config.yaml
+# ============================
+# Configuration for Phase 2 Scientific Narrative Synthesis.
+#
+# All parameters can be overridden on the command line:
+#   python -m phase2_analysis.run --phase1-dir <dir> [--n-components 5] ...
+
+# Which analyses to enable
+analyses:
+  mode_node_coupling:    true   # DMD slow/Hopf mode × brain-node loading matrix
+  attractor_fingerprint: true   # PCA subspace angle stability across splits
+  causal_chain:          true   # Causal evidence chain synthesis
+
+# DMD Mode–Node Coupling
+mode_node_coupling:
+  slow_re_thresh: 0.05   # |Re(λ_ct)| < this → classified as slow mode
+  n_top_nodes:    15     # Top-ranked nodes to include in output
+  burnin:         0      # Steps to skip at start of each trajectory
+
+# Attractor Fingerprint Stability
+attractor_fingerprint:
+  n_components: 5   # PCA components to compare between splits
+  n_splits:     4   # Number of temporal windows to split trajectories into
+  burnin:       0   # Steps to discard before splitting
+
+# Quick mode overrides (applied when --quick flag is used)
+quick:
+  n_splits:    2
+  n_top_nodes: 8
