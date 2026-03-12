@@ -105,8 +105,22 @@ def _trajectories_for_graph(
     steps: int,
     seed: int,
     device: str,
+    all_graph_paths: Optional[List[Path]] = None,
 ) -> Optional[np.ndarray]:
     """Load one graph, build a simulator, run free dynamics.
+
+    Parameters
+    ----------
+    graph_path:
+        Path to the primary graph cache file.  Its connectivity structure is
+        used for all rollouts.
+    all_graph_paths:
+        Optional list of *all* graph-cache paths (including ``graph_path``).
+        When provided and ``len > 1``, the multi-graph context pool is
+        activated: each of the ``n_init`` trajectories cycles through a
+        different recording's BOLD history as its initial context, providing
+        genuine context diversity even when each individual file has
+        ``T ≤ context_length``.
 
     Returns ``trajectories`` of shape ``(n_init, steps, n_regions)`` or
     ``None`` if loading / simulation failed.
@@ -118,7 +132,17 @@ def _trajectories_for_graph(
 
         graph = load_graph_for_inference(graph_path, device=device)
         sim = BrainDynamicsSimulator(model, graph, modality=modality, device=device)
-        trajs = run_free_dynamics(sim, n_init=n_init, steps=steps, seed=seed)
+
+        # Build the multi-graph pool: primary graph first, then all others.
+        # _build_graph_pool (inside run_free_dynamics) uses graph_paths[0] as the
+        # primary (already loaded) and graph_paths[1:] as extra context sources.
+        pool: Optional[List[Path]] = None
+        if all_graph_paths and len(all_graph_paths) > 1:
+            others = [p for p in all_graph_paths if Path(p) != Path(graph_path)]
+            pool = [graph_path] + others
+
+        trajs = run_free_dynamics(sim, n_init=n_init, steps=steps, seed=seed,
+                                  graph_paths=pool)
         logger.info(
             "  [%s] shape=%s, init_std=%.4f, final_std=%.4f",
             graph_path.name, trajs.shape,
@@ -475,7 +499,8 @@ def run_cross_task_pca(
     for gp in graph_paths:
         label = gp.stem
         trajs = _trajectories_for_graph(
-            gp, model, modality, n_init, steps, seed, device
+            gp, model, modality, n_init, steps, seed, device,
+            all_graph_paths=graph_paths,
         )
         if trajs is None:
             continue
