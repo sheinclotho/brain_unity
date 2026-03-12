@@ -2170,6 +2170,23 @@ def run_phase6_synthesis(cfg: dict, results: Dict[str, Any],
         logger.info("    %s Q%d: %s — %s",
                     status, row["question_id"], row["question_short"], row["verdict"])
 
+    # ── Sub-results for causal chain analysis (E3/E4/E5) ────────────────────
+    # phase2_analysis/loader.py extracts `pipeline_report["results"]` and
+    # passes it to causal_chain(), which looks for input_dimension_control
+    # (E3), node_ablation (E4), and graph_structure_comparison (E5).
+    # Without this block the keys are absent and all three evidence items are
+    # reported as "missing" even when Phase 4 ran them successfully.
+    report["results"] = {
+        k: results.get(k)
+        for k in (
+            "input_dimension_control",
+            "node_ablation",
+            "graph_structure_comparison",
+            "random_comparison",
+        )
+        if results.get(k) is not None
+    }
+
     # Save report
     report_path = output_dir / "pipeline_report.json"
     with open(report_path, "w", encoding="utf-8") as f:
