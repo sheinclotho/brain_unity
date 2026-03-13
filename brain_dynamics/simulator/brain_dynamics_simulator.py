@@ -1268,7 +1268,22 @@ class BrainDynamicsSimulator:
                     interventions=interventions,
                     num_prediction_steps=req_steps,
                 )
-                pred_dict = result["perturbed"]
+            
+                # Prefer the model-provided net causal effect. If unavailable, construct it
+                # from perturbed - baseline. As a last resort (legacy models) use perturbed.
+                if isinstance(result, dict):
+                    if "causal_effect" in result and result["causal_effect"] is not None:
+                        pred_dict = result["causal_effect"]
+                    elif "perturbed" in result and "baseline" in result:
+                        pert = result["perturbed"]
+                        base = result["baseline"]
+                        # Build dict of net effects for modalities present in both pert & base
+                        pred_dict = {k: (pert[k] - base[k]) for k in pert.keys() if k in base}
+                    else:
+                        pred_dict = result.get("perturbed", {})
+                else:
+                    # Unexpected return type — fall back to predict_future
+                    pred_dict = self.model.predict_future(context, num_steps=req_steps)
             else:
                 pred_dict = self.model.predict_future(context, num_steps=req_steps)
 
