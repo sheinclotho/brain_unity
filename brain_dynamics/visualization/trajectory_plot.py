@@ -340,11 +340,10 @@ def plot_region_heatmap(
     """
     绘制单条轨迹的逐脑区活动热图（时间 × 脑区）。
 
-    Args:
-        trajectory: shape (steps, n_regions)。
-        times:      shape (steps,)，时间轴。
-        title:      图标题。
-        save_path:  保存路径。
+    改进点：
+      - 自动根据数据计算 vmin/vmax（使用 1%/99% 百分位以抗极端值）
+      - 处理 NaN（记录警告并用最小/最大替代）
+      - 在日志输出所用的 vmin/vmax，便于排查
     """
     if not _MPL_AVAILABLE:
         return
@@ -353,17 +352,59 @@ def plot_region_heatmap(
     if times is None:
         times = np.arange(steps, dtype=np.float32)
 
+    data = trajectory.T.astype(np.float64)  # shape (n_regions, steps)
+
+    # NaN handling
+    if np.isnan(data).any():
+        logger.warning("plot_region_heatmap: %d NaN values found in trajectory; they will be ignored for autoscaling.",
+                       int(np.isnan(data).sum()))
+
+    # Compute robust vmin/vmax using percentiles to avoid extreme outliers dominating the scale
+    finite_vals = data[np.isfinite(data)]
+    if finite_vals.size == 0:
+        vmin, vmax = 0.0, 1.0
+    else:
+        p1, p99 = np.percentile(finite_vals, [1.0, 99.0])
+        # If p1 == p99 (almost-constant signal), expand a small range around the median
+        if abs(p99 - p1) < 1e-8:
+            med = float(np.median(finite_vals))
+            delta = max(0.1 * (abs(med) if abs(med) > 1e-6 else 1.0), 1e-3)
+            vmin, vmax = med - delta, med + delta
+        else:
+            vmin, vmax = float(p1), float(p99)
+
+    # If data contains values outside [vmin, vmax], we'll still plot but log how many were clipped
+    n_below = int(np.sum(finite_vals < vmin))
+    n_above = int(np.sum(finite_vals > vmax))
+    if n_below or n_above:
+        logger.info(
+            "plot_region_heatmap: color scale vmin=%.4g vmax=%.4g (clipping: below=%d above=%d, total=%d)",
+            vmin, vmax, n_below, n_above, finite_vals.size
+        )
+    else:
+        logger.info("plot_region_heatmap: color scale vmin=%.4g vmax=%.4g (no clipping)", vmin, vmax)
+
     fig, ax = plt.subplots(figsize=(12, 5))
+    # use interpolation='nearest' to avoid blurring artifacts and ensure each time step visible
     im = ax.imshow(
-        trajectory.T,
+        data,
         aspect="auto",
         origin="lower",
         cmap="hot",
         extent=[times[0], times[-1], 0, n_regions],
-        vmin=0.0,
-        vmax=1.0,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="nearest",
     )
-    plt.colorbar(im, ax=ax, label="Activity (normalised)")
+
+    # If there are NaNs, set a distinct color (e.g., gray) for masked values
+    if np.isnan(data).any():
+        from matplotlib import cm
+        cmap = cm.get_cmap("hot").copy()
+        cmap.set_bad(color="0.15")  # dark gray for NaNs
+        im.set_cmap(cmap)
+
+    cb = plt.colorbar(im, ax=ax, label="Activity (autoscaled)")
     ax.set_xlabel("Time (s)" if times[1] < 1.0 else "Step")
     ax.set_ylabel("Region index")
     ax.set_title(title)
